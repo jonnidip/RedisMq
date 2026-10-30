@@ -18,6 +18,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Canonical AMQP 0-9-1 codegen fixture read by MethodRegistryTests (stays offline). -->
+    <None Include="fixtures\**\*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\RedisMQ.Broker\RedisMQ.Broker.csproj" />
   </ItemGroup>
 
