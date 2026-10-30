@@ -1,0 +1,6 @@
+bin/
+obj/
+.superpowers/
+.idea/
+*.user
+TestResults/
