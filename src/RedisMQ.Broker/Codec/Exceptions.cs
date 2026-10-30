@@ -36,3 +36,24 @@ public sealed class AmqpEncodeException : Exception
     {
     }
 }
+
+/// <summary>
+/// Hard protocol error: the connection-closing class of AMQP wire failures
+/// (frame-end byte mismatch, frame larger than the negotiated frame-max,
+/// unknown frame type). Per the AMQP 0-9-1 hard-error rules such failures
+/// make the connection state unrecoverable; the frame layer is the only
+/// place that decides them, and it surfaces them as this exception instead
+/// of a recoverable decode failure.
+/// </summary>
+public sealed class AmqpProtocolException : Exception
+{
+    public AmqpProtocolException(string message)
+        : base(message)
+    {
+    }
+
+    public AmqpProtocolException(string message, Exception? innerException)
+        : base(message, innerException)
+    {
+    }
+}

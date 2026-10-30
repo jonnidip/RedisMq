@@ -842,6 +842,36 @@ public sealed class ByteCodecTests
     }
 
     [Fact]
+    public void Decimal_value_crossing_declared_table_length_throws()
+    {
+        byte[] wire = Encode(w =>
+        {
+            // name(2) + 'D'(1) = 3 real bytes inside the declared 4 content bytes,
+            // but a decimal value needs a scale octet plus a 4-byte mantissa.
+            w.WriteLong(4);
+            w.WriteShortstr("k");
+            w.WriteOctet((byte)'D');
+            w.WriteOctet(0x02);
+        });
+        Assert.Throws<AmqpDecodeException>(() => new ByteReader(wire).TryReadFieldTable(out _));
+    }
+
+    [Fact]
+    public void Nested_array_declared_length_shorter_than_its_items_throws()
+    {
+        byte[] wire = Encode(w =>
+        {
+            // name(2) + 'A'(1) + array length word(4) = 7 real bytes declared,
+            // but the array content declares 16 bytes of items it does not contain.
+            w.WriteLong(7);
+            w.WriteShortstr("k");
+            w.WriteOctet((byte)'A');
+            w.WriteLong(16);
+        });
+        Assert.Throws<AmqpDecodeException>(() => new ByteReader(wire).TryReadFieldTable(out _));
+    }
+
+    [Fact]
     public void Trailing_bytes_beyond_declared_table_length_throw()
     {
         byte[] wire = Encode(w =>

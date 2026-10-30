@@ -102,6 +102,20 @@ public sealed class ByteWriter
         _length += value.Length;
     }
 
+    /// <summary>Writes raw bytes with no length prefix: for pre-encoded payloads that the
+    /// caller sizes explicitly (frame payloads are framed by their own size field).</summary>
+    public void WriteRaw(ReadOnlySpan<byte> value)
+    {
+        if (value.Length == 0)
+        {
+            return;
+        }
+
+        Reserve(value.Length);
+        value.CopyTo(_buffer.AsSpan(_length));
+        _length += value.Length;
+    }
+
     /// <summary>
     /// Writes an AMQP bit-field group, LSB-first into whole octets; a group shorter than
     /// 8 bits is padded with zero bits to the octet boundary.
