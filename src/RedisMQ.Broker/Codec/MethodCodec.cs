@@ -130,7 +130,7 @@ public static class MethodCodec
             case WireType.LongLong:
                 return reader.ReadLongLong();
             case WireType.Shortstr:
-                return reader.ReadShortStr();
+                return reader.ReadShortstr();
             case WireType.Longstr:
                 return reader.ReadLongstr();
             case WireType.Table:
@@ -167,10 +167,10 @@ public static class MethodCodec
                 writer.WriteLongLong(AsLong(field, value));
                 break;
             case WireType.Shortstr:
-                writer.WriteShortStr(AsString(field, value));
+                writer.WriteShortstr(AsString(field, value));
                 break;
             case WireType.Longstr:
-                writer.WriteLongStr(AsBlob(field, value));
+                writer.WriteLongstr(AsBlob(field, value));
                 break;
             case WireType.Table:
                 writer.WriteFieldTable(AsTable(field, value));
