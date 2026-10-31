@@ -18,6 +18,9 @@ public static class AmqpConstants
     // fixture: NOT-FOUND = 404
     public const ushort NotFound = 404;
 
+    // fixture: RESOURCE-LOCKED = 405
+    public const ushort ResourceLocked = 405;
+
     // fixture: PRECONDITION-FAILED = 406
     public const ushort PreconditionFailed = 406;
 
@@ -32,6 +35,9 @@ public static class AmqpConstants
 
     // fixture: SYNTAX-ERROR = 502
     public const ushort SyntaxError = 502;
+
+    // fixture: CHANNEL-ERROR = 504
+    public const ushort ChannelError = 504;
 
     // fixture: UNEXPECTED-FRAME = 505
     public const ushort UnexpectedFrame = 505;

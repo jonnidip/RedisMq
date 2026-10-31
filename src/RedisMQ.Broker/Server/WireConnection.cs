@@ -47,8 +47,13 @@ namespace RedisMQ.Broker.Server;
 /// frame — RabbitMQ-parity wire kill: the transport completes and the client sees
 /// EOF, no diagnostic bytes leave the socket.</item>
 /// </list>
-/// Channel-level dispatch (channel.open/exchange/queue/basic) lands with Task 5's
-/// ChannelContext; until then non-connection methods close with not-implemented.
+/// <item>Channel-level dispatch lives in <see cref="ChannelContext"/> (Task 5): each
+/// non-zero channel carries its own FSM — channel.open promotes the fresh
+/// Starting channel to Running, soft errors send channel.close on that channel and
+/// the channel mourns (traffic discarded, close-ok repeating, number retired on
+/// close-ok), and hard errors close the connection. Before the connection is serving,
+/// any frame on a non-zero channel is unexpected-frame with the reader's wording,
+/// as is a heartbeat on a non-zero channel at any stage.</item>
 /// </summary>
 public sealed class WireConnection : IAsyncDisposable
 {
@@ -78,6 +83,8 @@ public sealed class WireConnection : IAsyncDisposable
     private HeartbeatWatchdog? _watchdog;
     private ConnectionState _state = ConnectionState.AwaitStartOk;
     private uint _frameMax; // the negotiated frame-max; starts at the broker's offer
+    private string _vhost = string.Empty; // captured at connection.open for channel dispatch
+    private readonly Dictionary<ushort, ChannelContext> _channels = []; // Running and Mourning channels
     private bool _disposed;
 
     public WireConnection(BrokerServerOptions options, IRouteEngine routes, TransportSide transport)
@@ -89,13 +96,13 @@ public sealed class WireConnection : IAsyncDisposable
         _options = options;
         _transport = transport;
         _frameMax = options.FrameMax; // pre-TuneOk bound: the broker's own configured max
-        // The topology engine is kept for Task 5's channel dispatch (declared now to
-        // keep the constructor surface stable for the rest of the milestone).
+        // The topology engine backs Task 5's channel dispatch: every channel context
+        // hands its declare/bind calls to it.
         Routes = routes;
     }
 
-    /// <summary>The topology engine this connection was built against; Task 5's
-    /// channel dispatch consumes it.</summary>
+    /// <summary>The topology engine this connection was built against; channel
+    /// declarations and bindings flow into it.</summary>
     public IRouteEngine Routes { get; }
 
     /// <summary>
@@ -276,45 +283,137 @@ public sealed class WireConnection : IAsyncDisposable
         switch (frame.Type)
         {
             case AmqpFrame.FrameHeartbeat:
-                return true; // ignored; its arrival already reset the watchdog
+                // Channel 0 heartbeats are bookkeeping everywhere. A heartbeat on a
+                // non-zero channel is an unexpected_frame with the reader's own
+                // wording, in any state (rabbit_reader has no clause that accepts one).
+                return frame.Channel == 0
+                    ? true
+                    : await CloseConnectionAsync(
+                        AmqpConstants.UnexpectedFrame,
+                        UnexpectedFrameText(frame.Type, frame.Payload.Span),
+                        0, 0, ct);
             case AmqpFrame.FrameMethod:
                 return await HandleMethodFrameAsync(frame, ct);
             case AmqpFrame.FrameHeader:
             case AmqpFrame.FrameBody:
-                if (_state == ConnectionState.Serving)
-                {
-                    // Channel content belongs to Task 5's channel dispatch; M0 accepts
-                    // and ignores it rather than killing the connection (soft path).
-                    return true;
-                }
-
-                // Content frames during the handshake are out of sequence for sure.
-                return await CloseConnectionAsync(
-                    AmqpConstants.UnexpectedFrame,
-                    $"UNEXPECTED_FRAME - content frame on channel {frame.Channel} during the handshake",
-                    0, 0, ct);
+                return await HandleContentFrameAsync(frame, ct);
             default:
                 // Unreachable: FrameDecoder rejects unknown frame types earlier.
                 return false;
         }
     }
 
+    /// <summary>The reader-wording unexpected-frame text for a pre-serving or
+    /// stray frame: "type {N}, {all|first 16} octets = {~tp binary}".</summary>
+    private static string UnexpectedFrameText(byte frameType, ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length == 0)
+        {
+            return $"UNEXPECTED_FRAME - type {frameType}, all octets = <<>>";
+        }
+
+        int shown = Math.Min(payload.Length, 16);
+        var snippet = new StringBuilder(shown * 6 + 4);
+        snippet.Append("<<");
+        for (int index = 0; index < shown; index++)
+        {
+            if (index > 0)
+            {
+                snippet.Append(',');
+            }
+
+            snippet.Append(payload[index]);
+        }
+
+        snippet.Append(">>");
+        string phrase = payload.Length <= 16 ? "all octets" : "first 16 octets";
+        return $"UNEXPECTED_FRAME - type {frameType}, {phrase} = {snippet}";
+    }
+
+    /// <summary>Content frames: each non-zero channel assembles its own method-then-
+    /// content sequence; a content frame with no pending content-bearing method is a
+    /// hard unexpected-frame close (the rabbit_command_assembler wording). Mourning
+    /// channels discard traffic, and before the connection serves, any content frame
+    /// is unexpected-frame with the reader's wording.</summary>
+    private async Task<bool> HandleContentFrameAsync(AmqpFrame frame, CancellationToken ct)
+    {
+        if (_state != ConnectionState.Serving)
+        {
+            return await CloseConnectionAsync(
+                AmqpConstants.UnexpectedFrame,
+                UnexpectedFrameText(frame.Type, frame.Payload.Span),
+                0, 0, ct);
+        }
+
+        if (frame.Channel == 0)
+        {
+            // Content on the connection channel stays the accepted-and-ignored M0
+            // soft path (Task 6 revisits it with real publish dispatch).
+            return true;
+        }
+
+        ChannelContext? context = _channels.TryGetValue(frame.Channel, out ChannelContext? found) ? found : null;
+        if (context is not null && context.IsMourning)
+        {
+            return true; // the mourning catch-all discards content with no reply
+        }
+
+        if (context is null || context.PendingContentPhase == ChannelContext.ContentPhase.ExpectMethod)
+        {
+            return await CloseConnectionAsync(
+                AmqpConstants.UnexpectedFrame,
+                "UNEXPECTED_FRAME - expected method frame, got non method frame instead",
+                0, 0, ct);
+        }
+
+        return true; // deeper content assembly is Task 6 (not reachable in M0)
+    }
+
     // ---------- connection-class method dispatch ----------
 
     private async Task<bool> HandleMethodFrameAsync(AmqpFrame frame, CancellationToken ct)
     {
-        if (frame.Channel != 0)
-        {
-            // M0: the connection class speaks strictly on channel 0.
-            return await CloseConnectionAsync(
-                AmqpConstants.UnexpectedFrame,
-                $"UNEXPECTED_FRAME - connection method on channel {frame.Channel}, only channel 0 is valid",
-                0, 0, ct);
-        }
-
         var payload = new ByteReader(frame.Payload.Span);
         ushort classId = payload.ReadUShort();
         ushort methodId = payload.ReadUShort();
+
+        if (frame.Channel != 0)
+        {
+            if (_state != ConnectionState.Serving)
+            {
+                // rabbit_reader's catch-all: before the connection serves, any frame
+                // on a non-zero channel is unexpected_frame with the reader's wording.
+                return await CloseConnectionAsync(
+                    AmqpConstants.UnexpectedFrame,
+                    UnexpectedFrameText(frame.Type, frame.Payload.Span),
+                    0, 0, ct);
+            }
+
+            MethodSchema? channelSchema = MethodRegistry.Schema(classId, methodId);
+            if (channelSchema is null)
+            {
+                return await CloseConnectionAsync(
+                    AmqpConstants.SyntaxError,
+                    $"SYNTAX_ERROR - ({classId},{methodId}) is not a method of the AMQP 0-9-1 dialect",
+                    classId, methodId, ct);
+            }
+
+            AmqpMethod channelMethod;
+            try
+            {
+                channelMethod = MethodCodec.ReadMethod(ref payload, channelSchema);
+            }
+            catch (AmqpDecodeException ex)
+            {
+                return await CloseConnectionAsync(
+                    AmqpConstants.SyntaxError,
+                    $"SYNTAX_ERROR - malformed method payload for {channelSchema.Name}: {ex.Message}",
+                    classId, methodId, ct);
+            }
+
+            return await DispatchChannelMethodAsync(frame.Channel, channelMethod, ct);
+        }
+
         MethodSchema? schema = MethodRegistry.Schema(classId, methodId);
         if (schema is null)
         {
@@ -406,6 +505,85 @@ public sealed class WireConnection : IAsyncDisposable
             AmqpConstants.UnexpectedFrame,
             $"UNEXPECTED_FRAME - {schema.Name} is not expected in state {_state}",
             schema.ClassId, schema.MethodId, ct);
+
+    // ---------- channel-class method dispatch (Task 5) ----------
+
+    /// <summary>Runs one Serving-state method through the channel's FSM. The syntax /
+    /// codec checks were already applied by the caller; the per-channel semantics live
+    /// entirely in <see cref="ChannelContext"/>.</summary>
+    private async Task<bool> DispatchChannelMethodAsync(
+        ushort channel,
+        AmqpMethod method,
+        CancellationToken ct)
+    {
+        ChannelContext context = GetOrCreateChannel(channel);
+        switch (context.OnMethod(method))
+        {
+            case ChannelOutcomeReply reply:
+                await SendMethodAsync(reply.Reply, channel, ct);
+                if (reply.RetireAfter)
+                {
+                    _channels.Remove(channel); // the number is retired after its close-ok
+                }
+
+                return true;
+
+            case ChannelOutcomeSilent silent:
+                if (silent.RetireChannel)
+                {
+                    _channels.Remove(channel); // channel.close_ok performs channel_cleanup
+                }
+
+                return true;
+
+            case ChannelOutcomeSoftError soft:
+                context.Mourn(); // the channel.close went out on this channel
+                return await SendChannelCloseAsync(channel, soft.Code, soft.Text, soft.ClassId, soft.MethodId, ct);
+
+            case ChannelOutcomeHardError hard:
+                _channels.Remove(channel);
+                return await CloseConnectionAsync(hard.Code, hard.Text, hard.ClassId, hard.MethodId, ct);
+
+            default:
+                // Unreachable: every concrete ChannelOutcome shape is handled above.
+                return false;
+        }
+    }
+
+    /// <summary>Returns the channel's FSM, lazily creating the fresh Starting-state
+    /// context a never-opened channel number implies (so a stray method on one meets
+    /// the "expected 'channel.open'" guard).</summary>
+    private ChannelContext GetOrCreateChannel(ushort channel)
+    {
+        if (_channels.TryGetValue(channel, out ChannelContext? existing))
+        {
+            return existing;
+        }
+
+        var fresh = new ChannelContext(_vhost, Routes);
+        _channels[channel] = fresh;
+        return fresh;
+    }
+
+    /// <summary>Sends the server's channel.close for a soft error; the channel stays
+    /// mourning until close-ok arrives (discarding traffic in between).</summary>
+    private async Task<bool> SendChannelCloseAsync(
+        ushort channel,
+        ushort replyCode,
+        string replyText,
+        ushort classId,
+        ushort methodId,
+        CancellationToken ct)
+    {
+        await SendMethodAsync(Method(close =>
+        {
+            close.Set("reply-code", (short)replyCode);
+            close.Set("reply-text", replyText);
+            close.Set("class-id", (short)classId);
+            close.Set("method-id", (short)methodId);
+        }, "channel.close"), channel, ct);
+        return true; // the connection lives on; the channel mourns
+    }
 
     // ---------- handshake steps ----------
 
@@ -526,7 +704,8 @@ public sealed class WireConnection : IAsyncDisposable
         await SendMethodAsync(Method(openOk =>
         {
             openOk.Set("known-hosts", "");
-        }, "connection.open-ok"), ct);
+        }, "connection.open-ok"), 0, ct);
+        _vhost = vhost; // channel dispatch binds declarations to the connection's vhost
         _state = ConnectionState.Serving;
         return true;
     }
@@ -693,7 +872,11 @@ public sealed class WireConnection : IAsyncDisposable
     }
 
     /// <summary>Encodes and writes one method frame on channel 0 and flushes.</summary>
-    private async ValueTask SendMethodAsync(AmqpMethod method, CancellationToken ct)
+    private ValueTask SendMethodAsync(AmqpMethod method, CancellationToken ct) =>
+        SendMethodAsync(method, 0, ct);
+
+    /// <summary>Encodes and writes one method frame on the given channel and flushes.</summary>
+    private async ValueTask SendMethodAsync(AmqpMethod method, ushort channel, CancellationToken ct)
     {
         // MethodCodec writes class-id + method-id + arguments; FrameWriter rebuilds the
         // frame from those parts, so the id prefix is sliced off once here.
@@ -702,7 +885,7 @@ public sealed class WireConnection : IAsyncDisposable
         byte[] payload = payloadWriter.ToArray();
 
         var frameWriter = new ByteWriter();
-        FrameWriter.WriteMethod(ref frameWriter, 0, method.ClassId, method.MethodId, payload.AsSpan(4));
+        FrameWriter.WriteMethod(ref frameWriter, channel, method.ClassId, method.MethodId, payload.AsSpan(4));
         await WriteAsync(frameWriter.ToArray(), ct);
     }
 

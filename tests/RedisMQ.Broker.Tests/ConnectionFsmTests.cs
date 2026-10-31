@@ -511,21 +511,6 @@ public sealed class ConnectionFsmTests
 
     // ---------- test-local pieces (the brief's injected surface) ----------
 
-    /// <summary>Placeholder engine (ledger ruling): Task 5 fills the semantics and may
-    /// finalize these signatures; Task 4 only needs the type for the server ctor.</summary>
-    private sealed class TestRouteEngine : IRouteEngine
-    {
-        public ExchangeInfo? FindExchange(string vhost, string name) => null;
-
-        public void DeclareExchange(ExchangeInfo exchange) => throw new NotImplementedException("Task 5");
-
-        public void DeclareQueue(string vhost, string name) => throw new NotImplementedException("Task 5");
-
-        public void Bind(string vhost, string exchange, string queue, string routingKey) => throw new NotImplementedException("Task 5");
-
-        public IEnumerable<string> Route(ExchangeInfo exchange, string routingKey) => throw new NotImplementedException("Task 5");
-    }
-
     private sealed class TransportPairConnectionListener(params TransportPair[] pairs) : IListenerTransport
     {
         private int _index;
@@ -544,7 +529,7 @@ public sealed class ConnectionFsmTests
     private static (AmqpBrokerServer Server, WireClient Client) SpawnServer(BrokerServerOptions options)
     {
         var pair = TransportPair.Create();
-        var server = new AmqpBrokerServer(options, new TestRouteEngine(), new TransportPairConnectionListener(pair));
+        var server = new AmqpBrokerServer(options, new InMemoryEngine(options.Vhosts), new TransportPairConnectionListener(pair));
         server.StartAsync();
         return (server, new WireClient(pair.TransportClient));
     }
