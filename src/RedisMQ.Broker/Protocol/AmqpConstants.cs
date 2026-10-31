@@ -12,6 +12,9 @@ public static class AmqpConstants
     // fixture: CONTENT-TOO-LARGE = 311
     public const ushort ContentTooLarge = 311;
 
+    // fixture: NO-ROUTE = 312 (the basic.return reply-code for mandatory unroutables)
+    public const ushort NoRoute = 312;
+
     // fixture: ACCESS-REFUSED = 403
     public const ushort AccessRefused = 403;
 

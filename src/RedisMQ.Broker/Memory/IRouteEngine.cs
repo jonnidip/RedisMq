@@ -67,4 +67,15 @@ public interface IRouteEngine
     /// binding-insertion order. The content properties parameter is the seam M1's
     /// topic routing needs; the direct engine ignores it.</summary>
     IReadOnlyList<string> RouteTo(ExchangeInfo exchange, in ContentProperties properties, string routingKey);
+
+    /// <summary>
+    /// Lands one completed publish's content in the named queue: the only way the
+    /// channel (ChannelContext) writes through to storage. The body argument is the
+    /// fully-assembled content body; the engine stores its own copy per target, so a
+    /// fan-out to N queues never aliases one byte array across messages, and callers
+    /// owning the assembled bytes are free to hand them over as-is. The engine
+    /// assigns the 1-based monotonic <see cref="InMemoryMessage.EnvelopeId"/>
+    /// (queue deletes do not exist in M0, so ids never recycle).
+    /// </summary>
+    void Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey);
 }

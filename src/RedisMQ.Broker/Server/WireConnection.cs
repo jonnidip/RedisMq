@@ -330,11 +330,13 @@ public sealed class WireConnection : IAsyncDisposable
         return $"UNEXPECTED_FRAME - type {frameType}, {phrase} = {snippet}";
     }
 
-    /// <summary>Content frames: each non-zero channel assembles its own method-then-
-    /// content sequence; a content frame with no pending content-bearing method is a
-    /// hard unexpected-frame close (the rabbit_command_assembler wording). Mourning
-    /// channels discard traffic, and before the connection serves, any content frame
-    /// is unexpected-frame with the reader's wording.</summary>
+    /// <summary>Content frames: before the connection serves, any content frame is
+    /// unexpected-frame with the reader's wording; content on the connection channel
+    /// stays the accepted-and-ignored M0 ruling; every other non-zero channel runs
+    /// its own assembler via <see cref="ChannelContext.OnContent"/> — a stray content
+    /// frame or wrong-phase sequence dies with the assembler's wording, a soft
+    /// unexpected-frame channel close (see the Task 6 report's D1 divergence note),
+    /// and mourning channels discard their traffic.</summary>
     private async Task<bool> HandleContentFrameAsync(AmqpFrame frame, CancellationToken ct)
     {
         if (_state != ConnectionState.Serving)
@@ -348,25 +350,21 @@ public sealed class WireConnection : IAsyncDisposable
         if (frame.Channel == 0)
         {
             // Content on the connection channel stays the accepted-and-ignored M0
-            // soft path (Task 6 revisits it with real publish dispatch).
+            // soft path (a ruling from the earlier tasks' FSM review).
             return true;
         }
 
-        ChannelContext? context = _channels.TryGetValue(frame.Channel, out ChannelContext? found) ? found : null;
-        if (context is not null && context.IsMourning)
+        ChannelContext? known = _channels.TryGetValue(frame.Channel, out ChannelContext? found) ? found : null;
+        if (known is not null && known.IsMourning)
         {
             return true; // the mourning catch-all discards content with no reply
         }
 
-        if (context is null || context.PendingContentPhase == ChannelContext.ContentPhase.ExpectMethod)
-        {
-            return await CloseConnectionAsync(
-                AmqpConstants.UnexpectedFrame,
-                "UNEXPECTED_FRAME - expected method frame, got non method frame instead",
-                0, 0, ct);
-        }
-
-        return true; // deeper content assembly is Task 6 (not reachable in M0)
+        // The number exists on the connection (fresh Starting channels included):
+        // the assembler is owned entirely by the context — this is Task 6's content
+        // dispatch seam (publish assembly, cap violations, and the routing finishes).
+        ChannelContext context = GetOrCreateChannel(frame.Channel);
+        return await DispatchChannelOutcomeAsync(frame.Channel, context, context.OnContent(frame), ct);
     }
 
     // ---------- connection-class method dispatch ----------
@@ -511,13 +509,28 @@ public sealed class WireConnection : IAsyncDisposable
     /// <summary>Runs one Serving-state method through the channel's FSM. The syntax /
     /// codec checks were already applied by the caller; the per-channel semantics live
     /// entirely in <see cref="ChannelContext"/>.</summary>
-    private async Task<bool> DispatchChannelMethodAsync(
+    private Task<bool> DispatchChannelMethodAsync(
         ushort channel,
         AmqpMethod method,
         CancellationToken ct)
     {
         ChannelContext context = GetOrCreateChannel(channel);
-        switch (context.OnMethod(method))
+        return DispatchChannelOutcomeAsync(channel, context, context.OnMethod(method), ct);
+    }
+
+    /// <summary>Carries one channel decision (from a method or a content frame) to the
+    /// wire: replies and silences keep the pump alive, soft errors close AND mourn the
+    /// channel, hard errors drop the number and close the connection, and a mandatory
+    /// unroutable leaves the channel alive after writing the basic.return with its
+    /// content back out (rabbit_channel's basic_return/5, re-chunked per frame-max
+    /// exactly like the writer sends any other content).</summary>
+    private async Task<bool> DispatchChannelOutcomeAsync(
+        ushort channel,
+        ChannelContext context,
+        ChannelOutcome outcome,
+        CancellationToken ct)
+    {
+        switch (outcome)
         {
             case ChannelOutcomeReply reply:
                 await SendMethodAsync(reply.Reply, channel, ct);
@@ -543,6 +556,17 @@ public sealed class WireConnection : IAsyncDisposable
             case ChannelOutcomeHardError hard:
                 _channels.Remove(channel);
                 return await CloseConnectionAsync(hard.Code, hard.Text, hard.ClassId, hard.MethodId, ct);
+
+            case ChannelOutcomeBasicReturn returned:
+                await SendMethodAsync(returned.ReturnMethod, channel, ct);
+                var returnHeader = new ByteWriter();
+                FrameWriter.WriteContentHeader(
+                    ref returnHeader, channel, classId: 60, returned.Body.LongLength, returned.Properties);
+                await WriteAsync(returnHeader.ToArray(), ct);
+                var returnBody = new ByteWriter();
+                FrameWriter.WriteBody(ref returnBody, channel, returned.Body, _frameMax);
+                await WriteAsync(returnBody.ToArray(), ct);
+                return true;
 
             default:
                 // Unreachable: every concrete ChannelOutcome shape is handled above.

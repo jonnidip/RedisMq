@@ -716,8 +716,10 @@ public sealed class ChannelTopologyTests
     public async Task Stray_content_header_on_an_idle_running_channel_closes_with_unexpected_frame()
     {
         // With no content-bearing method pending, the per-channel command
-        // assembler is in "expect method" state: any content frame is a hard
-        // UNEXPECTED_FRAME close (rabbit_command_assembler wording).
+        // assembler is in "expect method" state: any content frame is an
+        // UNEXPECTED_FRAME close with the rabbit_command_assembler wording. Task 6
+        // moved this to a CHANNEL-level soft close (the M0 pin; RabbitMQ 4.4's own
+        // error classes actually make it a hard connection close — report note D1).
         (AmqpBrokerServer server, WireClient client, _) = SpawnServer(NewOptions());
         try
         {
@@ -728,7 +730,7 @@ public sealed class ChannelTopologyTests
 
             await client.SendAsync(ContentHeaderFrameOn(1));
 
-            (ushort code, string text) close = await ReadConnectionCloseCodeTextAsync(client);
+            (ushort code, string text) close = await ReadChannelCloseAsync(client, 1);
             Assert.Equal(AmqpConstants.UnexpectedFrame, close.code);
             Assert.Equal(
                 "UNEXPECTED_FRAME - expected method frame, got non method frame instead",

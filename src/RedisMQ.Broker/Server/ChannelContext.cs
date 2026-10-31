@@ -1,6 +1,7 @@
 namespace RedisMQ.Broker.Server;
 
 using System;
+using System.IO;
 using RedisMQ.Broker.Codec;
 using RedisMQ.Broker.Memory;
 using RedisMQ.Broker.Protocol;
@@ -19,18 +20,30 @@ public abstract record ChannelOutcome;
 /// performs the channel-number cleanup (close-ok accounting) after the reply.</summary>
 public sealed record ChannelOutcomeReply(AmqpMethod Reply, bool RetireAfter = false) : ChannelOutcome;
 
-/// <summary>No bytes on the wire at all — the mourning catch-all's discard and the
-/// close-ok of a completed server-initiated close; <paramref name="retireChannel"/>
-/// frees the channel number for a fresh channel.open.</summary>
+/// <summary>No bytes on the wire at all — the silent completions (a landed publish, a
+/// dropped unroutable, the mourning catch-all's discard and the close-ok of a completed
+/// close); <paramref name="retireChannel"/> frees the channel number for a fresh
+/// channel.open.</summary>
 public sealed record ChannelOutcomeSilent(bool RetireChannel = false) : ChannelOutcome;
 
-/// <summary>Soft error (311/403/404/405/406): channel.close carrying the fields on the
-/// offending channel; the channel lives on in the mourning state.</summary>
+/// <summary>Soft error: channel.close carrying the fields on the offending channel;
+/// the channel lives on in the mourning state. The M0 soft codes are 403/404/405/406
+/// plus the assembler's 505 sequence violations — the map_exception decision (soft ⇒
+/// channel close) is RabbitMQ's rabbit_binary_generator.erl.</summary>
 public sealed record ChannelOutcomeSoftError(ushort Code, string Text, ushort ClassId, ushort MethodId) : ChannelOutcome;
 
-/// <summary>Hard error (501/502/503/504/505/540): connection.close on channel 0, reply
-/// class/method of the failed method for method-bodied errors (0,0 for FSM/reader ones).</summary>
+/// <summary>Hard error: connection.close on channel 0, reply class/method of the failed
+/// method for method-bodied errors (0,0 for FSM/reader ones). The M0 hard codes are
+/// 501/502/503/504/540, the assembler 505 pin (report deviation D1), and the oversize
+/// body's 311 (report deviation D2 — the committed fixture actually classifies both
+/// 505 and 311 differently, see the Task 6 report).</summary>
 public sealed record ChannelOutcomeHardError(ushort Code, string Text, ushort ClassId, ushort MethodId) : ChannelOutcome;
+
+/// <summary>A mandatory publish routed to nothing: basic.return (reply-code 312
+/// NO_ROUTE, carrying the publishing exchange and routing key) followed by the full
+/// returned content — the rabbit_channel basic_return/5 shape, re-chunked by the
+/// writer per the negotiated frame-max (WireConnection writes it out).</summary>
+public sealed record ChannelOutcomeBasicReturn(AmqpMethod ReturnMethod, ContentProperties Properties, byte[] Body) : ChannelOutcome;
 
 /// <summary>
 /// One AMQP channel's finite state machine, following rabbit_channel.erl: a fresh
@@ -68,9 +81,32 @@ public sealed record ChannelOutcomeHardError(ushort Code, string Text, ushort Cl
 /// nowait; queue.unbind has no nowait and always replies.</item>
 /// <item>M0 refuses non-empty declare/bind arguments outright with not-implemented
 /// (RabbitMQ validates and accepts arguments — deviation recorded in the report).</item>
+/// <item>basic.publish opens the channel's content assembly (rabbit_command_assembler):
+/// header → N body frames per channel; a method frame or wrong-kind content frame
+/// mid-assembly closes the CHANNEL with unexpected-frame carrying the assembler's
+/// wording (the pending basic.publish (60,40) ids, or (0,0) with none). THE PIN
+/// DIVERGENCE: RabbitMQ's own frame-error classification makes UNEXPECTED-FRAME 505
+/// hard (connection close); the M0 plan pins channel-level (report deviation D1) —
+/// but the wording strings are the 4.x assembler's, verbatim.</item>
+/// <item>Declared bodies over the 134,217,728-byte cap close the CONNECTION at header
+/// arrival with content-too-large (the M0 brief's hard 311 pin; report deviation D2 —
+/// the committed fixture classifies 311 as soft, and RabbitMQ 4.4 actually runs a
+/// two-tier rule: a soft 406 at the configured cap with body discard, a hard 501
+/// frame_error above its 536,870,912-byte absolute ceiling). Overshooting one frame's
+/// remaining declared bytes, or an empty body frame with bytes still owed, are the
+/// assembler's hard frame_error closes with its wordings.</item>
+/// <item>Assembly completion dispatches the publish in rabbit_channel's order:
+/// immediate=true → hard not_implemented "immediate=true"; then the exchange
+/// lookup_or_die (not-found 404 when absent — the content must be complete before
+/// this runs); the default exchange routes to the queue NAMED by the routing key
+/// (rabbit_exchange's special clause — no binding table, absent queue = unroutable,
+/// never a not-found); every routed queue is enqueued (`IRouteEngine.Enqueue`) under
+/// one insertion order; unroutable + mandatory → basic.return 312 NO_ROUTE with the
+/// full content back on the channel, else a silent drop. basic.publish itself never
+/// replies on success.</item>
 /// </list>
-/// Activity such as publish, consume, acks, and actual storage is Task 6+; M0
-/// carries only the pending-content phase hook a content dispatch decides with.
+/// Activity such as consume, acks, confirms, and tx is Task 7+; publishing rides the
+/// assembler above and the engine hand-off.
 /// </summary>
 public sealed class ChannelContext
 {
@@ -83,15 +119,24 @@ public sealed class ChannelContext
         Mourning, // the server sent channel.close; traffic is discarded until close-ok
     }
 
-    /// <summary>The per-channel content assembly phase (rabbit_command_assembler).
-    /// M0 channels never open a content sequence, so it is always ExpectMethod; the
-    /// enum exists so Task 6's assembler fits in without reshaping the dispatch.</summary>
+    /// <summary>The per-channel content assembly phase (rabbit_command_assembler):
+    /// a content-bearing method parks the channel in ExpectHeader, body frames run
+    /// ExpectBody, and completion — or a violation — returns everything to
+    /// ExpectMethod.</summary>
     internal enum ContentPhase
     {
         ExpectMethod,
         ExpectHeader,
         ExpectBody,
     }
+
+    /// <summary>
+    /// The M0 hard body cap — RabbitMQ's configured per-message maximum (the server's
+    /// default 134217728). A declared body above it dead-ends the publish at header
+    /// arrival with the hard content-too-large close the brief pins (see the Task 6
+    /// report deviation D2 for what RabbitMQ 4.4 really does).
+    /// </summary>
+    public const long MaxBodySize = 134_217_728;
 
     private readonly IRouteEngine _engine;
     private readonly string _vhost;
@@ -102,6 +147,12 @@ public sealed class ChannelContext
     private string _mostRecentlyDeclaredQueue = string.Empty;
     private ContentPhase _pendingContentPhase = ContentPhase.ExpectMethod;
 
+    // The open content sequence (rabbit_command_assembler state): the pending
+    // content-bearing method, its declared header, and the body bytes arrived so far.
+    private AmqpMethod? _pendingPublish;
+    private ContentHeader? _pendingHeader;
+    private MemoryStream? _pendingBody;
+
     internal ChannelContext(string vhost, IRouteEngine engine)
     {
         _vhost = vhost;
@@ -110,8 +161,8 @@ public sealed class ChannelContext
 
     public bool IsMourning => _state == ChannelState.Mourning;
 
-    /// <summary>The channel's content assembler phase; M0 keeps it parked at
-    /// ExpectMethod, which is what content dispatch actually consults.</summary>
+    /// <summary>The channel's content assembler phase; content dispatch consults it,
+    /// and a method frame arriving out of phase dies with the assembler's wording.</summary>
     internal ContentPhase PendingContentPhase => _pendingContentPhase;
 
     /// <summary>Enters the mourning state after a soft error's channel.close is (or is
@@ -164,6 +215,23 @@ public sealed class ChannelContext
 
     private ChannelOutcome OnRunning(AmqpMethod method)
     {
+        // rabbit_command_assembler: while content is owed (header or body), ANY method
+        // frame is an unexpected_frame with the pending publish's ids. The intercept
+        // runs before state dispatch so not-implemented or declare logic can hijack it.
+        if (_pendingContentPhase != ContentPhase.ExpectMethod)
+        {
+            return _pendingContentPhase switch
+            {
+                ContentPhase.ExpectBody => UnexpectedFrame(
+                    "UNEXPECTED_FRAME - expected content body, got non content body frame instead",
+                    _pendingPublish!.ClassId, _pendingPublish.MethodId),
+                _ => UnexpectedFrame(
+                    $"UNEXPECTED_FRAME - expected content header for class {_pendingPublish!.ClassId}, " +
+                    "got non content header frame instead",
+                    _pendingPublish.ClassId, _pendingPublish.MethodId),
+            };
+        }
+
         ushort classId = method.ClassId;
         ushort methodId = method.MethodId;
         return (classId, methodId) switch
@@ -179,12 +247,201 @@ public sealed class ChannelContext
             (50, 10) => OnQueueDeclare(method),
             (50, 20) => OnQueueBind(method),
             (50, 50) => OnQueueUnbind(method),
+            (60, 40) => OnBasicPublish(method),
             _ => new ChannelOutcomeHardError(
                 AmqpConstants.NotImplemented,
                 $"NOT_IMPLEMENTED - {method.Schema.Name} ({classId},{methodId}) is not part of the M0 channel method set",
                 classId, methodId),
         };
     }
+
+    // ---------- content assembly (basic.publish per rabbit_command_assembler) ----------
+
+    /// <summary>Dispatches one content frame through the channel's open content
+    /// sequence (or the idle assembler, where any content frame is the error).</summary>
+    public ChannelOutcome OnContent(AmqpFrame frame) => _pendingContentPhase switch
+    {
+        ContentPhase.ExpectHeader => OnExpectedHeader(frame),
+        ContentPhase.ExpectBody => OnExpectedBody(frame),
+        _ => UnexpectedFrame(
+            "UNEXPECTED_FRAME - expected method frame, got non method frame instead", 0, 0),
+    };
+
+    /// <summary>A content-bearing method opens the sequence: no bytes leave the wire;
+    /// the header owes next, then the declared body bytes (rabbit's assembler parks
+    /// the channel in the header phase — the method itself is still "in flight").</summary>
+    private ChannelOutcome OnBasicPublish(AmqpMethod method)
+    {
+        _pendingPublish = method;
+        _pendingContentPhase = ContentPhase.ExpectHeader;
+        return new ChannelOutcomeSilent();
+    }
+
+    private ChannelOutcome OnExpectedHeader(AmqpFrame frame)
+    {
+        if (frame.Type != AmqpFrame.FrameHeader)
+        {
+            return UnexpectedFrame(
+                $"UNEXPECTED_FRAME - expected content header for class {_pendingPublish!.ClassId}, " +
+                "got non content header frame instead",
+                _pendingPublish.ClassId, _pendingPublish.MethodId);
+        }
+
+        // The codec throws AmqpDecodeException for a non-basic class header — the
+        // Task 2 codec ruling — which surfaces as the connection's syntax-error
+        // close (conceptually the assembler's "expected content header for class 60,
+        // got one for class N instead" path; M0 leaves it at the codec boundary).
+        var reader = new ByteReader(frame.Payload.Span);
+        ContentHeader header = ContentHeaderCodec.Read(ref reader);
+
+        // The declared-size cap rides at header arrival — the assembler checks the
+        if (header.BodySize > MaxBodySize)
+        {
+            // RabbitMQ 4.4 splits this into a soft 406 at its configured max plus a
+            // hard 501 above the 512MiB ceiling; the M0 brief pins the single hard
+            // content-too-large connection close instead (report deviation D2).
+            return new ChannelOutcomeHardError(
+                AmqpConstants.ContentTooLarge,
+                $"CONTENT_TOO_LARGE - content body size {header.BodySize} " +
+                $"exceeds maximum allowed size {MaxBodySize}",
+                _pendingPublish!.ClassId, _pendingPublish.MethodId);
+        }
+
+        _pendingHeader = header;
+        _pendingBody = new MemoryStream();
+        if (header.BodySize == 0)
+        {
+            return FinishPublish(); // an empty declared body completes with the header
+        }
+
+        _pendingContentPhase = ContentPhase.ExpectBody;
+        return new ChannelOutcomeSilent();
+    }
+
+    private ChannelOutcome OnExpectedBody(AmqpFrame frame)
+    {
+        if (frame.Type != AmqpFrame.FrameBody)
+        {
+            return UnexpectedFrame(
+                "UNEXPECTED_FRAME - expected content body, got non content body frame instead",
+                _pendingPublish!.ClassId, _pendingPublish.MethodId);
+        }
+
+        long declared = _pendingHeader!.BodySize;
+        long accumulated = _pendingBody!.Length;
+
+        // The assembler's own eagle-eye clauses — both hard frame_error closes, and
+        // both with the source's wordings: an empty fragment while bytes are owed, or
+        // a fragment that would overshoot the declared total.
+        if (frame.Payload.Length == 0 && accumulated < declared)
+        {
+            return new ChannelOutcomeHardError(
+                AmqpConstants.FrameError,
+                "FRAME_ERROR - empty content body frame while content body is incomplete",
+                _pendingPublish!.ClassId, _pendingPublish.MethodId);
+        }
+
+        if (accumulated + frame.Payload.Length > declared)
+        {
+            return new ChannelOutcomeHardError(
+                AmqpConstants.FrameError,
+                "FRAME_ERROR - content body frame exceeds remaining content size",
+                _pendingPublish!.ClassId, _pendingPublish.MethodId);
+        }
+
+        _pendingBody!.Write(frame.Payload.Span);
+        if (_pendingBody!.Length < declared)
+        {
+            return new ChannelOutcomeSilent();
+        }
+
+        return FinishPublish();
+    }
+
+    /// <summary>The content is whole: rabbit_channel's publish dispatch in order —
+    /// immediate first, then lookup_or_die, then routing and the engine hand-off (or
+    /// the mandatory/unroutable return). The pending sequence is already back in the
+    /// expect-method state when any reply frame of this decision leaves the wire.</summary>
+    private ChannelOutcome FinishPublish()
+    {
+        AmqpMethod method = _pendingPublish!;
+        ContentHeader header = _pendingHeader!;
+        byte[] body = _pendingBody!.ToArray();
+        ResetPendingContent();
+
+        // rabbit_channel: handle_method(#'basic.publish'{immediate = true}, ...)
+        // exits protocol_error(not_implemented, "immediate=true") — hard, and it
+        // receives the already-assembled content, before any exchange lookup.
+        if (method.Get("immediate") is true)
+        {
+            return new ChannelOutcomeHardError(
+                AmqpConstants.NotImplemented,
+                "NOT_IMPLEMENTED - immediate=true",
+                method.ClassId, method.MethodId);
+        }
+
+        string exchangeName = method.Get("exchange") as string ?? string.Empty;
+        string routingKey = method.Get("routing-key") as string ?? string.Empty;
+
+        // lookup_or_die happens after the full content assembly (it receives the
+        // content), not-found being the ordinary soft 404.
+        ExchangeInfo? exchange = _engine.GetExchange(_vhost, exchangeName);
+        if (exchange is null)
+        {
+            return NotFound(kind: "exchange", exchangeName, method);
+        }
+
+        // rabbit_exchange's default-exchange clause: the queue resource NAMED by the
+        // routing key, no binding table — an absent queue is unroutable, NOT a
+        // not-found (verified in the source; see the Task 6 report).
+        IReadOnlyList<string> targets = exchangeName.Length == 0
+            ? (_engine.GetQueue(_vhost, routingKey) is null ? [] : [routingKey])
+            : _engine.RouteTo(exchange, header.Properties, routingKey);
+
+        if (targets.Count == 0)
+        {
+            // process_routing_mandatory: mandatory + nothing routed → basic_return
+            // (no_route) carrying the publishing origin and the full content back;
+            // non-mandatory → messages_unroutable_dropped, silence.
+            if (method.Get("mandatory") is true)
+            {
+                return new ChannelOutcomeBasicReturn(
+                    NewMethod("basic.return", basicReturn =>
+                    {
+                        basicReturn.Set("reply-code", (short)AmqpConstants.NoRoute); // NO_ROUTE
+                        basicReturn.Set("reply-text", "NO_ROUTE");
+                        basicReturn.Set("exchange", exchangeName);
+                        basicReturn.Set("routing-key", routingKey);
+                    }),
+                    header.Properties,
+                    body);
+            }
+
+            return new ChannelOutcomeSilent();
+        }
+
+        foreach (string queue in targets)
+        {
+            // One engine entry per routed queue, in binding-insertion order; the body
+            // ownership may move because the engine stores its own defensive copy.
+            _engine.Enqueue(_vhost, queue, header.Properties, body, exchangeName, routingKey);
+        }
+
+        return new ChannelOutcomeSilent(); // basic.publish never replies on success
+    }
+
+    private void ResetPendingContent()
+    {
+        _pendingPublish = null;
+        _pendingHeader = null;
+        _pendingBody = null;
+        _pendingContentPhase = ContentPhase.ExpectMethod;
+    }
+
+    /// <summary>The assembler's unexpected_frame shape: soft 505 on this channel (the
+    /// M0 pin — see the class doc's D1 note for RabbitMQ's hard reality).</summary>
+    private static ChannelOutcome UnexpectedFrame(string text, ushort classId, ushort methodId) =>
+        new ChannelOutcomeSoftError(AmqpConstants.UnexpectedFrame, text, classId, methodId);
 
     private ChannelOutcome OnChannelFlow(AmqpMethod method)
     {
