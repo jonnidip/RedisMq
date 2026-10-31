@@ -14,11 +14,20 @@ namespace RedisMQ.Broker.Tests;
 // in-proc TransportPair wired into AmqpBrokerServer. Frames are asserted after decoding
 // the bytes the server actually wrote, so every test pins concrete wire semantics:
 // handshake sequencing (Start/StartOk/PLAIN, Tune/TuneOk, Open/OpenOk), fold-back
-// negotiation (min of offer and client, floor at frame_min_size), the M0 close codes
-// (access-refused, invalid-path, frame-error, syntax-error, not-implemented), client
-// close + close-ok, and the heartbeat watchdog silence window (2x interval) with a
-// fake clock. No mocks beyond the transport itself — the codec under test produces
-// and consumes the same bytes on both ends, as pinned by Tasks 1-3.
+// negotiation (min of offer and client, refused below the 4096 frame-min-size with
+// not_allowed — never clamped up), the M0 close codes (access-refused, invalid-path,
+// frame-error, syntax-error, not-allowed, not-implemented), client close + close-ok,
+// and the heartbeat watchdog silence window (2x interval) with a fake clock.
+//
+// Per-batch decode-abort rule (the wire-order contract for injected hard errors): the
+// server decodes each read batch BEFORE dispatching any of its frames, and a hard
+// decode error anywhere in the batch aborts the whole batch — so a legal method
+// sharing the batch is never answered. Whether a legal frame and an illegal one share
+// a batch is wire scheduling, not protocol: same batch → the close is the first
+// server method; separate batches → the legal method is answered (e.g. Tune) then the
+// close arrives. The evil-client helpers therefore drain such replies.
+// No mocks beyond the transport itself — the codec under test produces and consumes
+// the same bytes on both ends, as pinned by Tasks 1-3.
 public sealed class ConnectionFsmTests
 {
     // ---------- (a) happy handshake: Start → StartOk-PLAIN → Tune/TuneOk → Open/OpenOk ----------
@@ -120,7 +129,11 @@ public sealed class ConnectionFsmTests
             evil[^1] = 0x2E; // corrupt the frame-end octet (must be 0xCE)
             await client.SendAsync(evil);
 
-            (ushort code, string text) close = await ReadConnectionCloseAsync(client);
+            // Per-batch decode-abort (see the file header and the helper below):
+            // the close arrives as the first server method when the corrupt frame
+            // shares the start-ok's decode batch, or after the answered Tune when
+            // the batches are separate. The close itself is the asserted contract.
+            (ushort code, string text) close = await ReadCloseAllowingPriorTuneAsync(client);
             Assert.Equal(AmqpConstants.FrameError, close.code);
             Assert.StartsWith("FRAME_ERROR", close.text);
         }
@@ -152,7 +165,10 @@ public sealed class ConnectionFsmTests
             header.WriteOctet(AmqpFrame.FrameEnd);
             await client.SendAsync(header.ToArray());
 
-            (ushort code, string text) close = await ReadConnectionCloseAsync(client);
+            // Same per-batch decode-abort tolerance as scenario (d): the oversized
+            // frame and the start-ok may share a decode batch (close first) or not
+            // (tune-then-close).
+            (ushort code, string text) close = await ReadCloseAllowingPriorTuneAsync(client);
             Assert.Equal(AmqpConstants.FrameError, close.code);
             Assert.StartsWith("FRAME_ERROR", close.text);
         }
@@ -210,6 +226,54 @@ public sealed class ConnectionFsmTests
         }
     }
 
+    // ---------- TuneOk frame-max below the 4096 minimum → not_allowed (review ruling) ----------
+
+    [Fact]
+    public async Task TuneOk_frame_max_below_the_minimum_closes_with_not_allowed()
+    {
+        (AmqpBrokerServer server, WireClient client) = SpawnServer(NewOptions());
+        try
+        {
+            await SendHeaderAsync(client);
+            _ = await client.ReadMethodAsync(10, 10);
+            await client.SendAsync(StartOkFrame(PlainResponse("guest", "guest")));
+            _ = await client.ReadMethodAsync(10, 30);
+            await client.SendAsync(TuneOkFrame(2047, 2048, 60)); // declared 2048 < 4096
+
+            (ushort code, string text) close = await ReadConnectionCloseAsync(client);
+            Assert.Equal(AmqpConstants.NotAllowed, close.code);
+            Assert.StartsWith("NOT_ALLOWED", close.text);
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
+    [Fact]
+    public async Task TuneOk_frame_max_exactly_the_minimum_is_accepted()
+    {
+        (AmqpBrokerServer server, WireClient client) = SpawnServer(NewOptions());
+        try
+        {
+            await SendHeaderAsync(client);
+            _ = await client.ReadMethodAsync(10, 10);
+            await client.SendAsync(StartOkFrame(PlainResponse("guest", "guest")));
+            _ = await client.ReadMethodAsync(10, 30);
+
+            // The boundary value itself is legal: min(131072 offer, 4096 client) is
+            // adopted (nothing clamped, nothing refused); heartbeat 0 keeps the test
+            // free of watchdog timing entirely.
+            await client.SendAsync(TuneOkFrame(2047, (uint)AmqpFrame.FrameMinSize, 0));
+            await client.SendAsync(OpenFrame("/"));
+            _ = await client.ReadMethodAsync(10, 41); // connection.open-ok
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
     // ---------- (h) client connection.close → close-ok and drain ----------
 
     [Fact]
@@ -259,6 +323,33 @@ public sealed class ConnectionFsmTests
         finally
         {
             await ShakeDownAsync(server, client);
+        }
+    }
+
+    // ---------- server shutdown ends live connections promptly (review ruling) ----------
+
+    [Fact]
+    public async Task StopAsync_completes_promptly_and_the_client_sees_Eof()
+    {
+        (AmqpBrokerServer server, WireClient client) = SpawnServer(NewOptions());
+        try
+        {
+            await SendHeaderAsync(client);
+            _ = await client.ReadMethodAsync(10, 10); // live connection mid-handshake
+
+            // A heartbeat-0 idle connection used to make this hang forever (the stop
+            // token was not threaded into the connection); WaitAsync bounds it.
+            await server.StopAsync().WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+            // The wire-kill parity: the transport ends quietly, no close frame —
+            // the client's read drains to EOF instead of hanging.
+            Assert.True(
+                await client.WaitForEofAsync(TimeSpan.FromSeconds(5)),
+                "the transport must end with EOF once the server stops");
+        }
+        finally
+        {
+            await client.DisposeAsync(); // server already stopped; ShakeDown would no-op it
         }
     }
 
@@ -385,6 +476,28 @@ public sealed class ConnectionFsmTests
         AmqpMethod close = await client.ReadMethodAsync(10, 50);
         return (
             (ushort)(short)close.Get("reply-code")!, // wire type is short-int, always positive here
+            (string)close.Get("reply-text")!);
+    }
+
+    /// <summary>The connection.close for an injected hard error, draining at most one
+    /// interleaved connection.tune: when the illegal frame is injected right after a
+    /// legal method, the per-batch decode-abort rule (see the file header) lets wire
+    /// scheduling — not protocol — decide whether that legal method is answered
+    /// (tune, then close) or swallowed by the aborted batch (close as the first
+    /// method). Used by the frame-error scenarios; sequences where the close is the
+    /// direct reply keep the strict <see cref="ReadConnectionCloseAsync"/>.</summary>
+    private static async Task<(ushort Code, string Text)> ReadCloseAllowingPriorTuneAsync(WireClient client)
+    {
+        AmqpMethod close = await client.ReadMethodAsync();
+        if (close.ClassId == 10 && close.MethodId == 30)
+        {
+            close = await client.ReadMethodAsync(); // the schedule-coupled Tune; now expect the close
+        }
+
+        Assert.Equal((ushort)10, close.ClassId);
+        Assert.Equal((ushort)50, close.MethodId);
+        return (
+            (ushort)(short)close.Get("reply-code")!,
             (string)close.Get("reply-text")!);
     }
 
@@ -598,6 +711,32 @@ public sealed class ConnectionFsmTests
 
             side.Reader.AdvanceTo(read.Buffer.Start);
             return !read.Buffer.IsEmpty; // at least a byte arrived within the window
+        }
+
+        /// <summary>True when the transport drains to EOF inside the window: the
+        /// server-completion (wire kill) assertion — on shutdown nothing further is
+        /// written to the connection, so a quiet end is the only right outcome.</summary>
+        public async Task<bool> WaitForEofAsync(TimeSpan window)
+        {
+            using var cts = new CancellationTokenSource(window);
+            try
+            {
+                while (true)
+                {
+                    ReadResult read = await side.Reader.ReadAsync(cts.Token);
+                    if (read.Buffer.IsEmpty && read.IsCompleted)
+                    {
+                        side.Reader.AdvanceTo(read.Buffer.Start, read.Buffer.End);
+                        return true;
+                    }
+
+                    side.Reader.AdvanceTo(read.Buffer.End);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return false; // EOF never arrived within the window
+            }
         }
     }
 }

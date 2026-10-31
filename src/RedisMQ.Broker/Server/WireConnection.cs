@@ -21,9 +21,11 @@ namespace RedisMQ.Broker.Server;
 /// <item>StartOk speaks SASL PLAIN only: the longstr response is "authzid NUL authcid
 /// NUL password"; anything else closes with an access-refused reply carrying
 /// RabbitMQ's wire wording.</item>
-/// <item>TuneOk negotiation adopts the client's values: frame-max is min(offer,
-/// client) floored at <see cref="AmqpFrame.FrameMinSize"/> (a TuneOk of 0 keeps the
-/// offer), channel-max is min(offer, client) but unenforced in M0, and the heartbeat
+/// <item>TuneOk negotiation: frame-max is min(offer, client) with a TuneOk of 0
+/// keeping the offer, but a TuneOk below <see cref="AmqpFrame.FrameMinSize"/> is
+/// refused with not_allowed (RabbitMQ's rabbit_reader.erl semantics — never clamped
+/// up, because a clamp could push the negotiated max above the client's own declared
+/// value), channel-max is min(offer, client) but unenforced in M0, and the heartbeat
 /// is adopted verbatim — 0 disables it entirely. Like the RabbitMQ server, no second
 /// Tune is sent after TuneOk.</item>
 /// <item>Open names the vhost; an unknown one closes with invalid-path.</item>
@@ -35,6 +37,15 @@ namespace RedisMQ.Broker.Server;
 /// not-implemented, and a handshake method out of state with unexpected-frame.</item>
 /// <item>Every inbound frame of any type resets the heartbeat watchdog, per the
 /// plan's heartbeat stewardship rule.</item>
+/// <item>Per-batch decode-abort rule: each <c>ReadAsync</c> batch is fully decoded
+/// before any of its frames is dispatched, and a hard decode error anywhere in the
+/// batch aborts the whole batch — even an otherwise-legal method sharing the batch
+/// is never answered. Whether a legal method and an illegal one share a batch is wire
+/// scheduling, not protocol, so both outcomes are legal: the close as the first
+/// server method (same batch) or tune-then-close (separate batches).</item>
+/// <item>The caller's cancellation (server shutdown) ends the run without a close
+/// frame — RabbitMQ-parity wire kill: the transport completes and the client sees
+/// EOF, no diagnostic bytes leave the socket.</item>
 /// </list>
 /// Channel-level dispatch (channel.open/exchange/queue/basic) lands with Task 5's
 /// ChannelContext; until then non-connection methods close with not-implemented.
@@ -468,15 +479,23 @@ public sealed class WireConnection : IAsyncDisposable
                 schema.ClassId, schema.MethodId, ct);
         }
 
-        // Frame-max: adopt min(offer, client), with 0 keeping the offer, and the AMQP
-        // frame-min-size as the floor so the decoder can never see a 0 frame-max. This
-        // floor-clamp follows the task brief; plain RabbitMQ protocol-errors instead
-        // (not_allowed) for a tune-ok below 4096 —— flagged in the Task 4 report.
+        // Frame-max: adopt min(offer, client), with 0 keeping the offer. A TuneOk
+        // below the 4096 frame-min-size is refused outright — RabbitMQ's
+        // rabbit_reader.erl semantics (protocol-error not_allowed). It is never
+        // clamped UP: a clamp would push the negotiated max above the client's own
+        // declared cap (a buffer-overflow hazard for a conforming client), the
+        // post-review ruling that replaced the brief's floor-clamp (Task 4 report).
+        if (frameMax != 0 && frameMax < AmqpFrame.FrameMinSize)
+        {
+            return await CloseConnectionAsync(
+                AmqpConstants.NotAllowed,
+                "NOT_ALLOWED - frame_max value specified in TuneOk < 4096",
+                schema.ClassId, schema.MethodId, ct);
+        }
+
         _frameMax = frameMax == 0
             ? _options.FrameMax
-            : Math.Max(
-                Math.Min((uint)_options.FrameMax, (uint)frameMax),
-                (uint)AmqpFrame.FrameMinSize);
+            : Math.Min((uint)_options.FrameMax, (uint)frameMax);
 
         // Heartbeat: the TuneOk value is the negotiated one, verbatim (the RabbitMQ
         // server adopts the client's TuneOk heartbeat without re-sending Tune). 0

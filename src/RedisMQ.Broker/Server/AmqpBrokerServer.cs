@@ -105,14 +105,17 @@ public sealed class AmqpBrokerServer
                 return; // listener closed: no more connections
             }
 
-            TrackConnection(side);
+            TrackConnection(side, ct);
         }
     }
 
-    /// <summary>Runs one connection and keeps its task shelved until StopAsync.</summary>
-    private void TrackConnection(TransportSide side)
+    /// <summary>Runs one connection and keeps its task shelved until StopAsync. The
+    /// stopping token flows into the connection, so a server with live (even idle,
+    /// heartbeat-0) connections can stop promptly: the run ends without a close frame
+    /// and the transport completes (RabbitMQ-parity wire kill; the client sees EOF).</summary>
+    private void TrackConnection(TransportSide side, CancellationToken ct)
     {
-        Task task = RunConnectionAsync(side);
+        Task task = RunConnectionAsync(side, ct);
         bool added;
         lock (_gate)
         {
@@ -139,12 +142,12 @@ public sealed class AmqpBrokerServer
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    private async Task RunConnectionAsync(TransportSide side)
+    private async Task RunConnectionAsync(TransportSide side, CancellationToken ct)
     {
         try
         {
             var connection = new WireConnection(_options, _engine, side);
-            await connection.RunAsync();
+            await connection.RunAsync(ct); // server shutdown cancels this token
         }
         catch
         {
