@@ -332,9 +332,11 @@ public sealed class WireConnection : IAsyncDisposable
 
     /// <summary>Content frames: before the connection serves, any content frame is
     /// unexpected-frame with the reader's wording; content on the connection channel
-    /// stays the accepted-and-ignored M0 ruling; every other non-zero channel runs
-    /// its own assembler via <see cref="ChannelContext.OnContent"/> — a stray content
-    /// frame or wrong-phase sequence dies with the assembler's wording, a soft
+    /// stays the accepted-and-ignored M0 ruling; a content frame on a channel number
+    /// with no context (never opened, or retired) closes the CONNECTION hard — no
+    /// context is born for stray content; every other non-zero channel runs its own
+    /// assembler via <see cref="ChannelContext.OnContent"/> — a stray content frame
+    /// or wrong-phase sequence dies with the assembler's wording, a soft
     /// unexpected-frame channel close (see the Task 6 report's D1 divergence note),
     /// and mourning channels discard their traffic.</summary>
     private async Task<bool> HandleContentFrameAsync(AmqpFrame frame, CancellationToken ct)
@@ -360,11 +362,24 @@ public sealed class WireConnection : IAsyncDisposable
             return true; // the mourning catch-all discards content with no reply
         }
 
-        // The number exists on the connection (fresh Starting channels included):
-        // the assembler is owned entirely by the context — this is Task 6's content
-        // dispatch seam (publish assembly, cap violations, and the routing finishes).
-        ChannelContext context = GetOrCreateChannel(frame.Channel);
-        return await DispatchChannelOutcomeAsync(frame.Channel, context, context.OnContent(frame), ct);
+        if (known is null)
+        {
+            // A channel number with no context — never opened, or retired after a
+            // completed channel lifecycle — gets NO context born for a stray content
+            // frame: the connection itself closes hard, the Task 4/5 wire truth this
+            // edge always carried (the assembler's no-assembly wording, pending
+            // method ids none: 0,0). The run-aware partition pinned in the Task 6
+            // fix report: only an OPEN RUNNING channel strays channel-level (D1).
+            return await CloseConnectionAsync(
+                AmqpConstants.UnexpectedFrame,
+                "UNEXPECTED_FRAME - expected method frame, got non method frame instead",
+                0, 0, ct);
+        }
+
+        // The context exists: the assembler is owned entirely by the channel —
+        // running-idle stray content and mid-assembly intrusions go out as the
+        // channel-level soft 505s pinned for Task 6 (see the Task 6 report's D1).
+        return await DispatchChannelOutcomeAsync(frame.Channel, known, known.OnContent(frame), ct);
     }
 
     // ---------- connection-class method dispatch ----------

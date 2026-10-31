@@ -743,6 +743,74 @@ public sealed class ChannelTopologyTests
     }
 
     [Fact]
+    public async Task Content_frame_on_a_never_opened_channel_number_closes_the_connection()
+    {
+        // The Task 6 fix restoration of the Task 4/5 wire truth: a channel number
+        // that never saw channel.open gets NO context born for a stray content
+        // frame — the connection itself closes hard (no channel.close, no mourning,
+        // no Starting channel created from content). Note the partition pinned in
+        // the Task 6 fix report: an OPENED RUNNING channel's stray content stays
+        // the channel-level soft close (the test above).
+        (AmqpBrokerServer server, WireClient client, _) = SpawnServer(NewOptions());
+        try
+        {
+            await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41);
+            // Channel 7 was never opened:
+
+            await client.SendAsync(ContentHeaderFrameOn(7));
+
+            (ushort code, string text, ushort classId, ushort methodId) close =
+                await ReadConnectionCloseAsync(client);
+            Assert.Equal(AmqpConstants.UnexpectedFrame, close.code);
+            Assert.Equal(
+                "UNEXPECTED_FRAME - expected method frame, got non method frame instead",
+                close.text);
+            Assert.Equal(0, close.classId);
+            Assert.Equal(0, close.methodId);
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
+    [Fact]
+    public async Task Content_frame_on_a_retired_channel_number_closes_the_connection()
+    {
+        // Same partition, one lifecycle later: a completed close-ok churns the
+        // channel list entry (channel 1 is retired), so a stray content frame on
+        // that number is context-free again and closes the connection exactly like
+        // a never-opened number would.
+        (AmqpBrokerServer server, WireClient client, _) = SpawnServer(NewOptions());
+        try
+        {
+            await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41);
+            await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
+
+            await client.SendAsync(MethodFrameOn(1, ClientChannelCloseFrame(1)));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 41); // close-ok = retired
+
+            await client.SendAsync(ContentHeaderFrameOn(1));
+
+            (ushort code, string text, ushort classId, ushort methodId) close =
+                await ReadConnectionCloseAsync(client);
+            Assert.Equal(AmqpConstants.UnexpectedFrame, close.code);
+            Assert.Equal(
+                "UNEXPECTED_FRAME - expected method frame, got non method frame instead",
+                close.text);
+            Assert.Equal(0, close.classId);
+            Assert.Equal(0, close.methodId);
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
+    [Fact]
     public async Task Heartbeat_on_a_nonzero_channel_is_a_hard_unexpected_frame()
     {
         // rabbit_reader: a heartbeat on any non-zero channel is an
