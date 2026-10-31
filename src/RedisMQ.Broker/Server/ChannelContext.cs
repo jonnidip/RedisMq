@@ -252,28 +252,7 @@ public sealed class ChannelContext
         ExchangeInfo? declared = _engine.GetExchange(_vhost, name);
         if (declared is not null)
         {
-            // assert_equivalence order: type, durable, auto-delete, internal.
-            if (declared.Type != type)
-            {
-                return InequivalentExchange(method, name, "type", type, declared.Type);
-            }
-
-            if (declared.Durable != durable)
-            {
-                return InequivalentExchange(method, name, "durable", durable, declared.Durable);
-            }
-
-            if (declared.AutoDelete != autoDelete)
-            {
-                return InequivalentExchange(method, name, "auto-delete", autoDelete, declared.AutoDelete);
-            }
-
-            if (declared.Internal != internalExchange)
-            {
-                return InequivalentExchange(method, name, "internal", internalExchange, declared.Internal);
-            }
-
-            return DeclareOk(nowait, "exchange.declare-ok", name);
+            return DeclaredExchangeOutcome(method, name, declared, type, durable, autoDelete, internalExchange, nowait);
         }
 
         // amq.* is reserved, but only on actual creation (predeclared amq.* is exempt).
@@ -285,7 +264,52 @@ public sealed class ChannelContext
                 $"ACCESS_REFUSED - exchange name '{name}' contains reserved prefix 'amq.*'");
         }
 
-        _engine.DeclareExchange(new ExchangeInfo(_vhost, name, type, durable, autoDelete, internalExchange));
+        // Creation-only compare-and-set: on the miss path the insert happens under the
+        // engine's single lock, so a racing creator with different flags cannot
+        // overwrite it — the loser sees the winner's record and re-runs the equivalence
+        // ladder against it (last-write-wins is unreachable).
+        ExchangeInfo? prior = _engine.DeclareExchange(new ExchangeInfo(_vhost, name, type, durable, autoDelete, internalExchange));
+        if (prior is not null)
+        {
+            return DeclaredExchangeOutcome(method, name, prior, type, durable, autoDelete, internalExchange, nowait);
+        }
+
+        return DeclareOk(nowait, "exchange.declare-ok", name);
+    }
+
+    /// <summary>The assert-equivalence ladder for a stored exchange, shared by the
+    /// early-exists path and the declare race's loser: type → durable → auto-delete →
+    /// internal (rabbit_exchange's assert_equivalence order), then declare-ok.</summary>
+    private ChannelOutcome DeclaredExchangeOutcome(
+        AmqpMethod method,
+        string name,
+        ExchangeInfo declared,
+        string type,
+        bool durable,
+        bool autoDelete,
+        bool internalExchange,
+        bool nowait)
+    {
+        if (declared.Type != type)
+        {
+            return InequivalentExchange(method, name, "type", type, declared.Type);
+        }
+
+        if (declared.Durable != durable)
+        {
+            return InequivalentExchange(method, name, "durable", durable, declared.Durable);
+        }
+
+        if (declared.AutoDelete != autoDelete)
+        {
+            return InequivalentExchange(method, name, "auto-delete", autoDelete, declared.AutoDelete);
+        }
+
+        if (declared.Internal != internalExchange)
+        {
+            return InequivalentExchange(method, name, "internal", internalExchange, declared.Internal);
+        }
+
         return DeclareOk(nowait, "exchange.declare-ok", name);
     }
 
@@ -347,35 +371,56 @@ public sealed class ChannelContext
         QueueInfo? declared = _engine.GetQueue(_vhost, actual);
         if (declared is not null)
         {
-            // assert_equivalence order: exclusive-access first (resource_locked in
-            // RabbitMQ), then durable, then auto-delete. M0 compares flags verbatim —
-            // no exclusive-owner tracking — so a same-connection exclusive redeclare
-            // is refused the same way (deviation recorded in the report).
-            if (declared.Exclusive != exclusive)
-            {
-                return Soft(
-                    method,
-                    AmqpConstants.ResourceLocked,
-                    $"RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '{actual}' in vhost '{_vhost}'. " +
-                    "It could be originally declared on another connection or the exclusive property " +
-                    "value does not match that of the original declaration.");
-            }
-
-            if (declared.Durable != durable)
-            {
-                return InequivalentQueue(method, actual, "durable", durable, declared.Durable);
-            }
-
-            if (declared.AutoDelete != autoDelete)
-            {
-                return InequivalentQueue(method, actual, "auto-delete", autoDelete, declared.AutoDelete);
-            }
-
-            return DeclareOk(nowait, "queue.declare-ok", actual, updateMrdq: actual);
+            return DeclaredQueueOutcome(method, actual, declared, durable, exclusive, autoDelete, nowait);
         }
 
-        _engine.DeclareQueue(new QueueInfo(_vhost, actual, durable, exclusive, autoDelete));
+        // Creation-only compare-and-set (see the exchange arm): a racing creator's
+        // record is returned rather than overwritten, and the loser runs the same
+        // resource_locked-first ladder against the winner's record.
+        QueueInfo? prior = _engine.DeclareQueue(new QueueInfo(_vhost, actual, durable, exclusive, autoDelete));
+        if (prior is not null)
+        {
+            return DeclaredQueueOutcome(method, actual, prior, durable, exclusive, autoDelete, nowait);
+        }
+
         return DeclareOk(nowait, "queue.declare-ok", actual, updateMrdq: actual);
+    }
+
+    /// <summary>The assert-equivalence ladder for a stored queue, shared by the
+    /// early-exists path and the declare race's loser: exclusive-access first
+    /// (resource_locked in RabbitMQ), then durable, then auto-delete, then declare-ok.
+    /// M0 compares flags verbatim — no exclusive-owner tracking — so a same-connection
+    /// exclusive redeclare is refused the same way (deviation recorded in the report).</summary>
+    private ChannelOutcome DeclaredQueueOutcome(
+        AmqpMethod method,
+        string name,
+        QueueInfo declared,
+        bool durable,
+        bool exclusive,
+        bool autoDelete,
+        bool nowait)
+    {
+        if (declared.Exclusive != exclusive)
+        {
+            return Soft(
+                method,
+                AmqpConstants.ResourceLocked,
+                $"RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '{name}' in vhost '{_vhost}'. " +
+                "It could be originally declared on another connection or the exclusive property " +
+                "value does not match that of the original declaration.");
+        }
+
+        if (declared.Durable != durable)
+        {
+            return InequivalentQueue(method, name, "durable", durable, declared.Durable);
+        }
+
+        if (declared.AutoDelete != autoDelete)
+        {
+            return InequivalentQueue(method, name, "auto-delete", autoDelete, declared.AutoDelete);
+        }
+
+        return DeclareOk(nowait, "queue.declare-ok", name, updateMrdq: name);
     }
 
     private ChannelOutcome InequivalentQueue(AmqpMethod method, string name, string key, bool received, bool current) =>

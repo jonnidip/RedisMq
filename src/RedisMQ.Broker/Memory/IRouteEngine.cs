@@ -38,12 +38,24 @@ public interface IRouteEngine
     /// <summary>Returns the exchange, or null when it does not exist in the vhost.</summary>
     ExchangeInfo? GetExchange(string vhost, string name);
 
-    void DeclareExchange(ExchangeInfo exchange);
+    /// <summary>
+    /// Atomic creation-only declare of an exchange. When the (vhost, name) is absent the
+    /// request is stored and null is returned; when a record already exists it is
+    /// returned unchanged — an existing record is never replaced, so the acceptance of
+    /// an (equivalent) redeclare is the caller's equivalence check, not the engine's.
+    /// The compare-and-insert happens inside one engine lock, which makes concurrent
+    /// first-declares deterministic: exactly one caller observes null, the other
+    /// observes the winner's record.
+    /// </summary>
+    ExchangeInfo? DeclareExchange(ExchangeInfo exchange);
 
     /// <summary>Returns the queue, or null when it does not exist in the vhost.</summary>
     QueueInfo? GetQueue(string vhost, string name);
 
-    void DeclareQueue(QueueInfo queue);
+    /// <summary>Atomic creation-only declare of a queue, the same contract as
+    /// <see cref="DeclareExchange"/>: store-and-return-null on miss, return the prior
+    /// unchanged record on hit, never replace an existing record.</summary>
+    QueueInfo? DeclareQueue(QueueInfo queue);
 
     /// <summary>Records a binding; a duplicate is a no-op keeping the original order.</summary>
     void Bind(string vhost, string exchange, string queue, string routingKey);

@@ -19,7 +19,8 @@ public sealed class InMemoryEngine : IRouteEngine
 
     /// <summary>Creates the engine and predeclares, per vhost, the default exchange
     /// (empty name, direct type, durable) and <c>amq.direct</c> exactly as the real
-    /// broker's internal declarations do.</summary>
+    /// broker's internal declarations do. The declares run on empty dictionaries, so
+    /// their null returns are the creation contract of the compare-and-set.</summary>
     public InMemoryEngine(IReadOnlyList<string> vhosts)
     {
         ArgumentNullException.ThrowIfNull(vhosts);
@@ -38,11 +39,20 @@ public sealed class InMemoryEngine : IRouteEngine
         }
     }
 
-    public void DeclareExchange(ExchangeInfo exchange)
+    public ExchangeInfo? DeclareExchange(ExchangeInfo exchange)
     {
         lock (_lock)
         {
-            _exchanges[(exchange.Vhost, exchange.Name)] = exchange; // idempotent overwrite with the same record
+            // Creation-only compare-and-set: an existing record is returned and never
+            // replaced, so two racing first-declares cannot overwrite each other; the
+            // loser takes the winner's record into its channel-side equivalence check.
+            if (_exchanges.TryGetValue((exchange.Vhost, exchange.Name), out ExchangeInfo? prior))
+            {
+                return prior;
+            }
+
+            _exchanges[(exchange.Vhost, exchange.Name)] = exchange;
+            return null;
         }
     }
 
@@ -54,11 +64,19 @@ public sealed class InMemoryEngine : IRouteEngine
         }
     }
 
-    public void DeclareQueue(QueueInfo queue)
+    public QueueInfo? DeclareQueue(QueueInfo queue)
     {
         lock (_lock)
         {
-            _queues[(queue.Vhost, queue.Name)] = queue; // idempotent overwrite with the same record
+            // The same creation-only compare-and-set as DeclareExchange: the winner's
+            // record is returned to the loser, never overwritten.
+            if (_queues.TryGetValue((queue.Vhost, queue.Name), out QueueInfo? prior))
+            {
+                return prior;
+            }
+
+            _queues[(queue.Vhost, queue.Name)] = queue;
+            return null;
         }
     }
 

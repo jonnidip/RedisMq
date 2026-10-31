@@ -1570,4 +1570,115 @@ public sealed class InMemoryRouteEngineTests
         engine.Unbind(vhost, "x", "q1", "never-bound"); // a different key: no-op
         Assert.Equal(["q1"], engine.RouteTo(ex, empty, "a"));
     }
+
+    // Cross-connection first-declare race: DeclareExchange/DeclareQueue are an
+    // atomic creation-only compare-and-set under the engine's single lock, so of
+    // two racing first-declares of one (vhost, name) exactly one call creates the
+    // record (null return) and the other receives the winner's unchanged record
+    // for its channel-side equivalence check — last-write-wins is unreachable.
+
+    [Fact]
+    public async Task Racing_creates_of_the_same_exchange_with_different_flags_keep_the_winner()
+    {
+        const int rounds = 25;
+        for (int round = 0; round < rounds; round++)
+        {
+            var engine = new InMemoryEngine(TwoVhosts);
+            var first = new ExchangeInfo("/", "race-x", "direct", Durable: true, AutoDelete: false, Internal: false);
+            var second = new ExchangeInfo("/", "race-x", "direct", Durable: false, AutoDelete: false, Internal: false);
+
+            // Release both racers together; RunContinuationsAsynchronously keeps the
+            // release from running them inline one after the other.
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<ExchangeInfo?> a = Task.Run(async () => { await gate.Task; return engine.DeclareExchange(first); });
+            Task<ExchangeInfo?> b = Task.Run(async () => { await gate.Task; return engine.DeclareExchange(second); });
+            gate.SetResult();
+
+            // A faulted racing task surfaces here (no exceptions allowed).
+            ExchangeInfo?[] results = await Task.WhenAll(a, b);
+
+            int creations = (results[0] is null ? 1 : 0) + (results[1] is null ? 1 : 0);
+            Assert.Equal(1, creations);
+
+            // The loser's non-null return IS the winner's record, and the store
+            // still holds that same instance — the loser did not overwrite it.
+            ExchangeInfo winner = (results[0] ?? results[1])!;
+            Assert.Same(winner, engine.GetExchange("/", "race-x"));
+        }
+    }
+
+    [Fact]
+    public async Task Racing_creates_of_the_same_queue_with_different_flags_keep_the_winner()
+    {
+        const int rounds = 25;
+        for (int round = 0; round < rounds; round++)
+        {
+            var engine = new InMemoryEngine(TwoVhosts);
+            var first = new QueueInfo("/", "race-q", Durable: true, Exclusive: false, AutoDelete: false);
+            var second = new QueueInfo("/", "race-q", Durable: false, Exclusive: false, AutoDelete: false);
+
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<QueueInfo?> a = Task.Run(async () => { await gate.Task; return engine.DeclareQueue(first); });
+            Task<QueueInfo?> b = Task.Run(async () => { await gate.Task; return engine.DeclareQueue(second); });
+            gate.SetResult();
+
+            QueueInfo?[] results = await Task.WhenAll(a, b);
+
+            int creations = (results[0] is null ? 1 : 0) + (results[1] is null ? 1 : 0);
+            Assert.Equal(1, creations);
+
+            QueueInfo winner = (results[0] ?? results[1])!;
+            Assert.Same(winner, engine.GetQueue("/", "race-q"));
+        }
+    }
+
+    [Fact]
+    public async Task Racing_creates_with_identical_flags_create_exactly_once()
+    {
+        const int rounds = 25;
+
+        for (int round = 0; round < rounds; round++)
+        {
+            var engine = new InMemoryEngine(TwoVhosts);
+            var first = new ExchangeInfo("/", "race-x", "direct", Durable: true, AutoDelete: false, Internal: false);
+            var second = new ExchangeInfo("/", "race-x", "direct", Durable: true, AutoDelete: false, Internal: false);
+
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<ExchangeInfo?> a = Task.Run(async () => { await gate.Task; return engine.DeclareExchange(first); });
+            Task<ExchangeInfo?> b = Task.Run(async () => { await gate.Task; return engine.DeclareExchange(second); });
+            gate.SetResult();
+
+            ExchangeInfo?[] results = await Task.WhenAll(a, b);
+
+            Assert.Equal(1, (results[0] is null ? 1 : 0) + (results[1] is null ? 1 : 0));
+
+            // The single prior-return carries the created record, value-equal to
+            // both requests.
+            ExchangeInfo prior = (results[0] ?? results[1])!;
+            Assert.Equal(first, prior);
+            Assert.Equal(second, prior);
+            Assert.Equal(first, engine.GetExchange("/", "race-x"));
+        }
+
+        for (int round = 0; round < rounds; round++)
+        {
+            var engine = new InMemoryEngine(TwoVhosts);
+            var first = new QueueInfo("/", "race-q", Durable: true, Exclusive: false, AutoDelete: false);
+            var second = new QueueInfo("/", "race-q", Durable: true, Exclusive: false, AutoDelete: false);
+
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<QueueInfo?> a = Task.Run(async () => { await gate.Task; return engine.DeclareQueue(first); });
+            Task<QueueInfo?> b = Task.Run(async () => { await gate.Task; return engine.DeclareQueue(second); });
+            gate.SetResult();
+
+            QueueInfo?[] results = await Task.WhenAll(a, b);
+
+            Assert.Equal(1, (results[0] is null ? 1 : 0) + (results[1] is null ? 1 : 0));
+
+            QueueInfo prior = (results[0] ?? results[1])!;
+            Assert.Equal(first, prior);
+            Assert.Equal(second, prior);
+            Assert.Equal(first, engine.GetQueue("/", "race-q"));
+        }
+    }
 }
