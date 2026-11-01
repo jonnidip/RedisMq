@@ -55,7 +55,7 @@ namespace RedisMQ.Broker.Server;
 /// any frame on a non-zero channel is unexpected-frame with the reader's wording,
 /// as is a heartbeat on a non-zero channel at any stage.</item>
 /// </summary>
-public sealed class WireConnection : IAsyncDisposable
+public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 {
     /// <summary>The channel-max the broker offers at connection.tune in M0; channels
     /// are accepted but their count is not enforced (Task 5 territory).</summary>
@@ -158,6 +158,16 @@ public sealed class WireConnection : IAsyncDisposable
         }
         finally
         {
+            // Connection end sweeps the survivors: every live channel's consumers die
+            // and requeue their unacked deliveries (RabbitMQ's connection-cleanup).
+            if (!_disposed)
+            {
+                foreach (ChannelContext channel in _channels.Values)
+                {
+                    channel.TearDownActiveConsumers();
+                }
+            }
+
             await DisposeAsync();
         }
     }
@@ -174,6 +184,7 @@ public sealed class WireConnection : IAsyncDisposable
         _timer?.Dispose();
         _stopCts.Cancel();
         _heartbeatCts.Cancel();
+        _writeGate.Dispose();
         await _transport.CompleteAsync();
     }
 
@@ -551,7 +562,7 @@ public sealed class WireConnection : IAsyncDisposable
                 await SendMethodAsync(reply.Reply, channel, ct);
                 if (reply.RetireAfter)
                 {
-                    _channels.Remove(channel); // the number is retired after its close-ok
+                    await RetireChannelAsync(context, channel); // close-ok retire with the consumer sweep
                 }
 
                 return true;
@@ -559,16 +570,25 @@ public sealed class WireConnection : IAsyncDisposable
             case ChannelOutcomeSilent silent:
                 if (silent.RetireChannel)
                 {
-                    _channels.Remove(channel); // channel.close_ok performs channel_cleanup
+                    await RetireChannelAsync(context, channel); // channel.close_ok performs channel_cleanup
                 }
 
                 return true;
 
+            case ChannelOutcomeChain drain:
+                // Consumer-path writes were scheduled on the channel's chain; the
+                // connection runs the drain inline (the pump lifecycle continues
+                // after dispatch — the chain keeps every write in schedule order).
+                await context.RunWriterChainAsync(ct);
+                return true;
+
             case ChannelOutcomeSoftError soft:
                 context.Mourn(); // the channel.close went out on this channel
+                context.TearDownActiveConsumers(); // consumers die and requeue with the close
                 return await SendChannelCloseAsync(channel, soft.Code, soft.Text, soft.ClassId, soft.MethodId, ct);
 
             case ChannelOutcomeHardError hard:
+                context.TearDownActiveConsumers();
                 _channels.Remove(channel);
                 return await CloseConnectionAsync(hard.Code, hard.Text, hard.ClassId, hard.MethodId, ct);
 
@@ -589,6 +609,15 @@ public sealed class WireConnection : IAsyncDisposable
         }
     }
 
+    /// <summary>Retires a channel number after its close-ok (or a silent
+    /// retire-on-completion): the consumer sweep runs first, then the number frees.</summary>
+    private Task RetireChannelAsync(ChannelContext context, ushort channel)
+    {
+        context.TearDownActiveConsumers();
+        _channels.Remove(channel);
+        return Task.CompletedTask;
+    }
+
     /// <summary>Returns the channel's FSM, lazily creating the fresh Starting-state
     /// context a never-opened channel number implies (so a stray method on one meets
     /// the "expected 'channel.open'" guard).</summary>
@@ -599,7 +628,9 @@ public sealed class WireConnection : IAsyncDisposable
             return existing;
         }
 
-        var fresh = new ChannelContext(_vhost, Routes);
+        // The connection is the channel's delivery host: every consumer-path write
+        // (obligated by the queue pumps) funnels through this instance's gated writers.
+        var fresh = new ChannelContext(channel, _vhost, Routes, this);
         _channels[channel] = fresh;
         return fresh;
     }
@@ -928,10 +959,15 @@ public sealed class WireConnection : IAsyncDisposable
         await WriteAsync(frameWriter.ToArray(), ct);
     }
 
-    /// <summary>Writes bytes to the transport, absorbing the transport's own death so
-    /// shutdown paths never crash on a vanished peer.</summary>
+    /// <summary>Writes bytes to the transport, serializing behind the connection-wide
+    /// write gate (queue-pump deliveries and the frame pump write concurrently on
+    /// M0), absorbing the transport's own death so shutdown paths never crash on a
+    /// vanished peer.</summary>
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
+
     private async ValueTask WriteAsync(byte[] bytes, CancellationToken ct)
     {
+        await _writeGate.WaitAsync(ct);
         try
         {
             var writer = _transport.Writer;
@@ -949,5 +985,40 @@ public sealed class WireConnection : IAsyncDisposable
             // The peer is gone or the pipe was completed underneath us; the connection
             // is dead either way, and no further bytes need to get out.
         }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    // ---------- IChannelDeliveryHost: the queue pumps' write surface ----------
+
+    ValueTask IChannelDeliveryHost.WriteMethodToWireAsync(ushort channel, AmqpMethod method, CancellationToken ct) =>
+        SendMethodAsync(method, channel, ct);
+
+    /// <summary>Header + body re-chunked per the negotiated frame-max, one gated write.</summary>
+    async ValueTask IChannelDeliveryHost.WriteContentToWireAsync(
+        ushort channel, ContentProperties properties, byte[] body, CancellationToken ct)
+    {
+        var frame = new ByteWriter();
+        FrameWriter.WriteContentHeader(ref frame, channel, classId: 60, body.LongLength, properties);
+        FrameWriter.WriteBody(ref frame, channel, body, _frameMax);
+        await WriteAsync(frame.ToArray(), ct);
+    }
+
+    /// <summary>Method + header + body re-chunked per the negotiated frame-max, one
+    /// gated write: a deliver's frames never interleave with anything else.</summary>
+    async ValueTask IChannelDeliveryHost.WriteDeliveryToWireAsync(
+        ushort channel, AmqpMethod deliver, ContentProperties properties, byte[] body, CancellationToken ct)
+    {
+        var payloadWriter = new ByteWriter();
+        MethodCodec.WriteMethod(ref payloadWriter, deliver);
+        byte[] payload = payloadWriter.ToArray();
+
+        var frame = new ByteWriter();
+        FrameWriter.WriteMethod(ref frame, channel, deliver.ClassId, deliver.MethodId, payload.AsSpan(4));
+        FrameWriter.WriteContentHeader(ref frame, channel, classId: 60, body.LongLength, properties);
+        FrameWriter.WriteBody(ref frame, channel, body, _frameMax);
+        await WriteAsync(frame.ToArray(), ct);
     }
 }

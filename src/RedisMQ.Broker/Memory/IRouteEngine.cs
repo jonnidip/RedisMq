@@ -28,6 +28,45 @@ public sealed record QueueInfo(
     bool AutoDelete = false);
 
 /// <summary>
+/// What <c>RegisterConsumer</c> decided about a consume request the channel ran:
+/// registered-and-woken, or one of the two protocol refusals the channel maps to
+/// not-found (404) and resource-locked (405) closes.
+/// </summary>
+public enum ConsumeRegisterOutcome
+{
+    /// <summary>The consumer joined the queue's registry and its pump was armed.</summary>
+    Registered,
+
+    /// <summary>The queue does not exist in the vhost.</summary>
+    QueueNotFound,
+
+    /// <summary>Exclusive access is unavailable: an exclusive consumer holds the queue,
+    /// or the new consumer demanded exclusivity on an occupied one.</summary>
+    ExclusiveHeld,
+}
+
+/// <summary>
+/// What <c>TryClaimForGet</c> decided about a basic.get: the head was popped into the
+/// channel's hands, or one of the three refusals/absences the channel maps onto its
+/// wire replies.
+/// </summary>
+public enum GetClaimOutcome
+{
+    /// <summary>The head message was popped and handed to the caller.</summary>
+    Claimed,
+
+    /// <summary>The queue does not exist in the vhost.</summary>
+    QueueNotFound,
+
+    /// <summary>An exclusive consumer holds the queue; basic.get is refused like a
+    /// competing consume would be.</summary>
+    ExclusiveHeld,
+
+    /// <summary>No ready message — the get-empty path.</summary>
+    Empty,
+}
+
+/// <summary>
 /// The seam between the wire server (WireConnection/ChannelContext) and whatever
 /// backs topology and routing. The channel owns every protocol check (naming,
 /// equivalence, not-found, refused); the engine only stores declarations, holds
@@ -78,4 +117,41 @@ public interface IRouteEngine
     /// (queue deletes do not exist in M0, so ids never recycle).
     /// </summary>
     void Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey);
+
+    /// <summary>
+    /// Registers a consumer on the named queue (Task 7 consume seam). Every call is
+    /// atomic under the engine's structure lock: the exclusivity arbitration and the
+    /// pump arming (the consumer may immediately start delivering) complete inside
+    /// the call.
+    /// </summary>
+    ConsumeRegisterOutcome RegisterConsumer(string vhost, string queue, IQueueConsumer consumer);
+
+    /// <summary>
+    /// Removes a consumer by tag; an unknown tag is a no-op (basic.cancel echoes ok for
+    /// any tag). Remaining consumers are armed: a later-credit or fresh-message wake
+    /// can serve them.
+    /// </summary>
+    void UnregisterConsumer(string vhost, string queue, string consumerTag);
+
+    /// <summary>
+    /// Puts an unacked message back on its queue's ready tail with
+    /// <see cref="InMemoryMessage.Redelivered"/> set (the M0 stream-consonant
+    /// requeue-to-tail placement; RabbitMQ distinguishes placements and the M0
+    /// simplification is recorded in the Task 7 report). The pump is armed: a waiting
+    /// or returning consumer may claim it immediately.
+    /// </summary>
+    void Requeue(string vhost, string queue, InMemoryMessage message);
+
+    /// <summary>
+    /// The basic.get claim: atomically pops the queue head (and reports the messages
+    /// remaining after it) under the engine lock, after the same exclusive-consumer
+    /// arbitration a competing consume would face. <paramref name="message"/> is only
+    /// meaningful on <see cref="GetClaimOutcome.Claimed"/>.
+    /// </summary>
+    GetClaimOutcome TryClaimForGet(string vhost, string queue, out InMemoryMessage? message, out int remaining);
+
+    /// <summary>Arms the queue's delivery pump without changing storage: the re-check
+    /// a credit-freeing or prefetch-raising path on the channel needs (a pump that
+    /// idled out on a full gate must be re-spawned by whoever frees credit).</summary>
+    void Nudge(string vhost, string queue);
 }

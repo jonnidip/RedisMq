@@ -45,6 +45,21 @@ public sealed record ChannelOutcomeHardError(ushort Code, string Text, ushort Cl
 /// writer per the negotiated frame-max (WireConnection writes it out).</summary>
 public sealed record ChannelOutcomeBasicReturn(AmqpMethod ReturnMethod, ContentProperties Properties, byte[] Body) : ChannelOutcome;
 
+/// <summary>The channel decision scheduled consumer-path writes on its serialized
+/// writer chain (replies like consume-ok/qos-ok/cancel-ok/get-ok, recover's
+/// post-flush requeue plan, etc.) and the caller must drain it — WireConnection runs
+/// the chain right after dispatch, before reading more frames, so the chain's write
+/// order is the wire order.</summary>
+public sealed record ChannelOutcomeChain : ChannelOutcome
+{
+    /// <summary>The singleton shape: the drain target is the same channel's chain.</summary>
+    public static readonly ChannelOutcomeChain Instance = new();
+
+    private ChannelOutcomeChain()
+    {
+    }
+}
+
 /// <summary>
 /// One AMQP channel's finite state machine, following rabbit_channel.erl: a fresh
 /// channel number starts <c>Starting</c> where only channel.open is legal; open
@@ -139,6 +154,8 @@ public sealed class ChannelContext
     public const long MaxBodySize = 134_217_728;
 
     private readonly IRouteEngine _engine;
+    private readonly IChannelDeliveryHost _host;
+    private readonly ushort _channel;
     private readonly string _vhost;
     private ChannelState _state = ChannelState.Starting;
 
@@ -153,10 +170,34 @@ public sealed class ChannelContext
     private ContentHeader? _pendingHeader;
     private MemoryStream? _pendingBody;
 
-    internal ChannelContext(string vhost, IRouteEngine engine)
+    // Task 7 — the channel-level consume accounting. All of it mutates under
+    // _deliveryLock (the ladder: it is always INSIDE the engine's gate on the pump
+    // claim path, and the handler paths release it before they touch the engine).
+    private readonly object _deliveryLock = new();
+    private readonly Dictionary<long, Unacked> _unacked = []; // delivery-tag → unsettled entry
+    private long _nextDeliveryTag; // 0 = none assigned yet: tags ascend 1, 2, 3 per channel
+    private long _outstandingBytes; // Σ unacked body lengths for the bytes gate
+    private int _prefetchCount; // 0 = unlimited (basic.qos) — global=true is demoted per the ledger ruling
+    private long _prefetchSize; // 0 = unlimited; the RedisMQ bytes-gate extension
+    private readonly Dictionary<string, string> _consumerQueues = []; // tag → queue name
+    private readonly Dictionary<string, ConsumerEntry> _consumerEntries = []; // tag → the engine-registered consumer
+    private ulong _serverConsumerTags; // amq.ctag-N counter
+    private bool _consumersTornDown;
+
+    // Task 7 — the per-channel serialized writer chain: consumer-path replies and
+    // deliveries are scheduled here (never written inline), so a queue-pump claim can
+    // never put a deliver ahead of a reply the channel already promised. The single
+    // drainer (_writerGate) runs jobs strictly in schedule order.
+    private readonly SemaphoreSlim _writerGate = new(1, 1);
+    private readonly object _writerLock = new();
+    private readonly Queue<Func<ValueTask>> _writerJobs = [];
+
+    internal ChannelContext(ushort channel, string vhost, IRouteEngine engine, IChannelDeliveryHost host)
     {
+        _channel = channel;
         _vhost = vhost;
         _engine = engine;
+        _host = host;
     }
 
     public bool IsMourning => _state == ChannelState.Mourning;
@@ -247,7 +288,15 @@ public sealed class ChannelContext
             (50, 10) => OnQueueDeclare(method),
             (50, 20) => OnQueueBind(method),
             (50, 50) => OnQueueUnbind(method),
+            (60, 10) => OnBasicQos(method),
+            (60, 20) => OnBasicConsume(method),
+            (60, 30) => OnBasicCancel(method),
             (60, 40) => OnBasicPublish(method),
+            (60, 70) => OnBasicGet(method),
+            (60, 80) => OnBasicAck(method), // basic.ack: rabbit_channel collect_acks
+            (60, 90) => OnBasicReject(method),
+            (60, 120) => OnBasicNack(method), // (60,100) is recover-async: outside the M0 set
+            (60, 110) => OnBasicRecover(method),
             _ => new ChannelOutcomeHardError(
                 AmqpConstants.NotImplemented,
                 $"NOT_IMPLEMENTED - {method.Schema.Name} ({classId},{methodId}) is not part of the M0 channel method set",
@@ -766,7 +815,467 @@ public sealed class ChannelContext
         return new ChannelOutcomeReply(NewMethod(replyName));
     }
 
-    // ---------- shared shapes ----------
+    // ---------- basic.qos / basic.consume / basic.cancel / basic.get (Task 7) ----------
+
+    private ChannelOutcome OnBasicQos(AmqpMethod method)
+    {
+        // The schema fixes the boxed shapes: prefetch-size Long → int, prefetch-count
+        // Short → short. global=true is DEMOTED to the per-channel limit (RabbitMQ 4.4
+        // path with the global_qos flag off — ledger correction): the flag is read and
+        // ignored, and the limit is what actually gates.
+        int size = method.Get("prefetch-size") as int? ?? 0;
+        short count = method.Get("prefetch-count") as short? ?? (short)0;
+        lock (_deliveryLock)
+        {
+            _prefetchSize = size;
+            _prefetchCount = count;
+        }
+
+        // A raised (or cleared) limit frees credit the pump may have idled out on.
+        NudgeChannelQueues();
+        return ChainReply("basic.qos-ok");
+    }
+
+    /// <summary>The consume path: queue lookup (not-found), consumer-tag reuse
+    /// (not_allowed — per-channel registry, rabbit_channel 1482 wording), the
+    /// exclusive arbitration inside the engine's atomic RegisterConsumer, then the
+    /// consume-ok for BOTH tag flavors when nowait=false (rabbit 1817-1818; the
+    /// ledger correction of the plan-text quirk). Server-assigned tags are
+    /// amq.ctag-N (the counter form of rabbit_guid's token). no-local is accepted
+    /// and ignored (4.4's channel handler also pattern-drops it).</summary>
+    private ChannelOutcome OnBasicConsume(AmqpMethod method)
+    {
+        string queue = method.Get("queue") as string ?? string.Empty;
+        string requestedTag = method.Get("consumer-tag") as string ?? string.Empty;
+        bool noAck = method.Get("no-ack") is true;
+        bool exclusive = method.Get("exclusive") is true;
+        bool nowait = method.Get("nowait") is true;
+
+        // rabbit_channel's lookup_or_die runs before any consumer mapping work.
+        if (_engine.GetQueue(_vhost, queue) is null)
+        {
+            return NotFound(kind: "queue", queue, method);
+        }
+
+        // The per-channel tag-reuse refusal; the exclusive arbitration (a softer
+        // resource_locked) happens before it inside the engine only when both apply
+        // would RabbitMQ's order differ — an edge M0 records as implementation note.
+        if (requestedTag.Length > 0 && _consumerQueues.ContainsKey(requestedTag))
+        {
+            return Soft(
+                method,
+                AmqpConstants.NotAllowed,
+                $"NOT_ALLOWED - attempt to reuse consumer tag '{requestedTag}'");
+        }
+
+        string tag = requestedTag;
+        if (tag.Length == 0)
+        {
+            tag = $"amq.ctag-{++_serverConsumerTags:x}";
+        }
+
+        var entry = new ConsumerEntry(this, tag, queue, noAck, exclusive);
+        switch (_engine.RegisterConsumer(_vhost, queue, entry))
+        {
+            case ConsumeRegisterOutcome.QueueNotFound:
+                return NotFound(kind: "queue", queue, method);
+
+            case ConsumeRegisterOutcome.ExclusiveHeld:
+                return Soft(
+                    method,
+                    AmqpConstants.ResourceLocked,
+                    $"RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '{queue}' in vhost '{_vhost}'. " +
+                    "It could be originally declared on another connection or the exclusive property " +
+                    "value does not match that of the original declaration.");
+
+            default:
+                break;
+        }
+
+        _consumerQueues[tag] = queue;
+        _consumerEntries[tag] = entry;
+
+        if (nowait)
+        {
+            return new ChannelOutcomeSilent();
+        }
+
+        return ChainReply("basic.consume-ok", ok => ok.Set("consumer-tag", tag));
+    }
+
+    /// <summary>Cancel unregisters the consumer (unacked deliveries keep riding the
+    /// ledger until acked/settled) and echoes cancel-ok for ANY tag — known or not
+    /// (rabbit_channel 1541-1544 builds the OkMsg before the registry work). nowait
+    /// gets silence.</summary>
+    private ChannelOutcome OnBasicCancel(AmqpMethod method)
+    {
+        string tag = method.Get("consumer-tag") as string ?? string.Empty;
+        bool nowait = method.Get("nowait") is true;
+        if (_consumerQueues.TryGetValue(tag, out string? queue))
+        {
+            _consumerQueues.Remove(tag);
+            _consumerEntries.Remove(tag);
+            _engine.UnregisterConsumer(_vhost, queue, tag);
+        }
+
+        if (nowait)
+        {
+            return new ChannelOutcomeSilent();
+        }
+
+        return ChainReply("basic.cancel-ok", ok => ok.Set("consumer-tag", tag));
+    }
+
+    /// <summary>basic.get: the engine's atomic claim (existence → exclusive
+    /// arbitration → head pop with the remaining count); the empty answer and the
+    /// claimed get-ok + content both ride the writer chain. get is NEVER
+    /// prefetch-refused (rabbit TODO 1594-1595), but its unacked entry counts
+    /// toward the channel gate like any other delivery.</summary>
+    private ChannelOutcome OnBasicGet(AmqpMethod method)
+    {
+        string queue = method.Get("queue") as string ?? string.Empty;
+        bool noAck = method.Get("no-ack") is true;
+        GetClaimOutcome outcome = _engine.TryClaimForGet(_vhost, queue, out InMemoryMessage? message, out int remaining);
+        switch (outcome)
+        {
+            case GetClaimOutcome.QueueNotFound:
+                return NotFound(kind: "queue", queue, method);
+
+            case GetClaimOutcome.ExclusiveHeld:
+                return Soft(
+                    method,
+                    AmqpConstants.ResourceLocked,
+                    $"RESOURCE_LOCKED - cannot obtain exclusive access to locked queue '{queue}' in vhost '{_vhost}'. " +
+                    "It could be originally declared on another connection or the exclusive property " +
+                    "value does not match that of the original declaration.");
+
+            case GetClaimOutcome.Empty:
+                // cluster-id "" — M0 is not a cluster (the field is the legacy remnant).
+                return ChainReply("basic.get-empty", empty => empty.Set("cluster-id", string.Empty));
+
+            default:
+                break;
+        }
+
+        long tag;
+        lock (_deliveryLock)
+        {
+            tag = ++_nextDeliveryTag;
+            if (!noAck)
+            {
+                _unacked[tag] = new Unacked(tag, queue, message!);
+                _outstandingBytes += message!.Body.LongLength;
+            }
+        }
+
+        InMemoryMessage claimed = message!;
+        ScheduleWriterJob(() => _host.WriteMethodToWireAsync(_channel, NewMethod("basic.get-ok", ok =>
+        {
+            ok.Set("delivery-tag", tag);
+            ok.Set("redelivered", claimed.Redelivered);
+            ok.Set("message-count", remaining);
+            ok.Set("exchange", claimed.Exchange);
+            ok.Set("routing-key", claimed.RoutingKey);
+        }), default));
+        ScheduleWriterJob(() => _host.WriteContentToWireAsync(_channel, claimed.Props, claimed.Body, default));
+        return ChannelOutcomeChain.Instance;
+    }
+
+    /// <summary>The settlement triple (ack / reject / nack): collect the ledger
+    /// entries under _deliveryLock — and release it BEFORE touching the engine, per
+    /// the lock ladder (the pump takes _deliveryLock inside the engine gate) — then
+    /// ack's drop settles the bytes free, reject/nack's requeue returns entries to
+    /// their queues' ready tails. ack(0, multiple=true) acks everything outstanding
+    /// (collect_acks 2112-2115); a missing single tag is the soft
+    /// "PRECONDITION_FAILED - unknown delivery tag N" (collect_acks 2139, ids 60/80).
+    /// The requeued subset requeues in delivery-tag order so a multi-requeue keeps
+    /// the tail order stable. Credit freed → the channel's consumer queues are
+    /// nudged (a pump idled out on the gate re-spawns).</summary>
+    private ChannelOutcome OnBasicAck(AmqpMethod method) =>
+        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, method.Get("multiple") is true, requeue: false);
+
+    private ChannelOutcome OnBasicReject(AmqpMethod method) =>
+        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, multiple: false, requeue: method.Get("requeue") is true);
+
+    private ChannelOutcome OnBasicNack(AmqpMethod method) =>
+        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, method.Get("multiple") is true, requeue: method.Get("requeue") is true);
+
+    private ChannelOutcome SettleLedger(AmqpMethod method, long tag, bool multiple, bool requeue)
+    {
+        List<Unacked> settled = [];
+        lock (_deliveryLock)
+        {
+            if (multiple)
+            {
+                // collect_acks: tag 0 = the ledger's whole content; otherwise every
+                // entry at or below the tag (existence of the tag itself is not owed).
+                foreach ((long key, Unacked value) in _unacked)
+                {
+                    if (tag == 0 || key <= tag)
+                    {
+                        settled.Add(value);
+                    }
+                }
+
+                foreach (Unacked entry in settled)
+                {
+                    _unacked.Remove(entry.Tag);
+                }
+            }
+            else
+            {
+                if (!_unacked.TryGetValue(tag, out Unacked entry))
+                {
+                    return Soft(
+                        method,
+                        AmqpConstants.PreconditionFailed,
+                        $"PRECONDITION_FAILED - unknown delivery tag {tag}");
+                }
+
+                _unacked.Remove(tag);
+                settled.Add(entry);
+            }
+
+            foreach (Unacked entry in settled)
+            {
+                _outstandingBytes -= entry.Message.Body.LongLength;
+            }
+        }
+
+        // Requeues land tail-first in tag order; and both paths free credit.
+        settled.Sort((left, right) => left.Tag.CompareTo(right.Tag));
+        if (requeue)
+        {
+            foreach (Unacked entry in settled)
+            {
+                _engine.Requeue(_vhost, entry.Queue, entry.Message);
+            }
+        }
+
+        NudgeChannelQueues();
+        return new ChannelOutcomeSilent();
+    }
+
+    /// <summary>recover(requeue=true) requeues THIS channel's whole unacked set,
+    /// clearing the ledger at the handler (the client must not ack those tags
+    /// anymore — recover settles them), scheduling recover-ok's write and then the
+    /// requeue plan as a chain job so recover-ok leaves the wire first. requeue=false
+    /// is RabbitMQ's hard not_implemented "requeue=false" (rabbit 1635-1636; it
+    /// applies to recover-async too).</summary>
+    private ChannelOutcome OnBasicRecover(AmqpMethod method)
+    {
+        if (method.Get("requeue") is not true)
+        {
+            return new ChannelOutcomeHardError(
+                AmqpConstants.NotImplemented,
+                "NOT_IMPLEMENTED - requeue=false",
+                method.ClassId, method.MethodId);
+        }
+
+        List<Unacked> plan;
+        lock (_deliveryLock)
+        {
+            plan = [.. _unacked.Values];
+            plan.Sort(static (left, right) => left.Tag.CompareTo(right.Tag));
+            _unacked.Clear();
+            _outstandingBytes = 0;
+        }
+
+        // recover-ok's write goes first, the requeue plan second: the chain keeps the
+        // order, so the reply is on the wire before any redelivery of the requeued set.
+        ScheduleWriterJob(() => _host.WriteMethodToWireAsync(_channel, NewMethod("basic.recover-ok"), default));
+        ScheduleWriterJob(async () =>
+        {
+            foreach (Unacked entry in plan)
+            {
+                _engine.Requeue(_vhost, entry.Queue, entry.Message);
+            }
+
+            await Task.CompletedTask;
+        });
+
+        return ChannelOutcomeChain.Instance;
+    }
+
+    /// <summary>The close/retire sweep: every consumer leaves the engine and every
+    /// unacked delivery requeues with the redelivered flag (RabbitMQ's
+    /// channel-cleanup). Before-recovery call-site (mourn/hard close/retire/
+    /// connection end) — safe concurrently with the pump: the ledger snapshot is
+    /// taken under _deliveryLock, the engine calls run after it is released.</summary>
+    internal void TearDownActiveConsumers()
+    {
+        if (_consumersTornDown)
+        {
+            return;
+        }
+
+        _consumersTornDown = true;
+        List<(string Queue, string Tag)> consumers;
+        List<Unacked> plan;
+        lock (_deliveryLock)
+        {
+            consumers = _consumerQueues.Select(pair => (pair.Value, pair.Key)).ToList();
+            plan = _unacked.Values.ToList();
+        }
+
+        foreach ((string queue, string tag) in consumers)
+        {
+            _consumerQueues.Remove(tag);
+            _consumerEntries.Remove(tag);
+            _engine.UnregisterConsumer(_vhost, queue, tag);
+        }
+
+        plan.Sort((left, right) => left.Tag.CompareTo(right.Tag));
+        foreach (Unacked entry in plan)
+        {
+            _engine.Requeue(_vhost, entry.Queue, entry.Message);
+        }
+    }
+
+    // ---------- the serialized writer chain (Task 7) ----------
+
+    /// <summary>Schedules one job on the channel's writer chain: pure synchronous
+    /// enqueue, safe under the engine gate and _deliveryLock alike (the drains run
+    /// elsewhere, so nothing here ever awaits).</summary>
+    private void ScheduleWriterJob(Func<ValueTask> job)
+    {
+        lock (_writerLock)
+        {
+            _writerJobs.Enqueue(job);
+        }
+    }
+
+    /// <summary>Drains the chain under the single-writer gate: every scheduled job
+    /// runs, in schedule order, and late arrivals loop back in. Jobs are host writes
+    /// or requeue plans — they surface cancellation and absorb transport death
+    /// themselves, and the strict caller discipline (pump: gate released before the
+    /// drain; frame pump: no engine lock held) keeps the writer-gate → engine-gate
+    /// edge one-way.</summary>
+    internal async Task RunWriterChainAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            await _writerGate.WaitAsync(ct);
+            List<Func<ValueTask>> batch;
+            lock (_writerLock)
+            {
+                batch = [.. _writerJobs];
+                _writerJobs.Clear();
+            }
+
+            if (batch.Count == 0)
+            {
+                _writerGate.Release();
+                return;
+            }
+
+            try
+            {
+                foreach (Func<ValueTask> job in batch)
+                {
+                    await job();
+                }
+            }
+            finally
+            {
+                _writerGate.Release();
+            }
+        }
+    }
+
+    /// <summary>The consumer-family reply: scheduled on the chain (a pump claim can
+    /// never jump a promise the channel already made) with the drain marker that
+    /// dispatches it.</summary>
+    private ChannelOutcome ChainReply(string name, Action<AmqpMethod>? setFields = null)
+    {
+        AmqpMethod reply = NewMethod(name, setFields);
+        ScheduleWriterJob(() => _host.WriteMethodToWireAsync(_channel, reply, default));
+        return ChannelOutcomeChain.Instance;
+    }
+
+    /// <summary>Credit frees on this channel (ack/nack/reject settle, qos raise): the
+    /// queues this channel's consumers ride are nudged so an idled-out pump re-spawns.
+    /// Ladder-safe: the snapshot is taken under _deliveryLock, the engine calls run
+    /// after it is released.</summary>
+    private void NudgeChannelQueues()
+    {
+        string[] queues;
+        lock (_deliveryLock)
+        {
+            queues = [.. _consumerQueues.Values.Distinct()];
+        }
+
+        foreach (string queue in queues)
+        {
+            _engine.Nudge(_vhost, queue);
+        }
+    }
+
+    /// <summary>The unacked-ledger entry: what a delivery-tag settles back to.</summary>
+    private readonly record struct Unacked(long Tag, string Queue, InMemoryMessage Message);
+
+    /// <summary>
+    /// The channel-side consumer the engine's pump serves: the deliver admission
+    /// (credit gate → ledger → writer job) under _deliveryLock, synchronous by
+    /// contract because the pump holds the engine gate across the call.
+    /// </summary>
+    private sealed class ConsumerEntry(ChannelContext owner, string consumerTag, string queueName, bool noAck, bool exclusive) : IQueueConsumer
+    {
+        public string ConsumerTag => consumerTag;
+
+        public bool IsExclusive => exclusive;
+
+        public bool TryAdmitForDelivery(InMemoryMessage message)
+        {
+            long deliveryTag;
+            lock (owner._deliveryLock)
+            {
+                if (noAck)
+                {
+                    // Auto-ack consumers ride past the gate: no ledger, no credit.
+                    deliveryTag = ++owner._nextDeliveryTag;
+                }
+                else
+                {
+                    if (owner._prefetchCount > 0 && owner._unacked.Count >= owner._prefetchCount)
+                    {
+                        return false;
+                    }
+
+                    long bytes = message.Body.LongLength;
+                    if (owner._prefetchSize > 0 && owner._outstandingBytes + bytes > owner._prefetchSize)
+                    {
+                        return false;
+                    }
+
+                    deliveryTag = ++owner._nextDeliveryTag;
+                    owner._unacked[deliveryTag] = new Unacked(deliveryTag, queueName, message);
+                    owner._outstandingBytes += bytes;
+                }
+
+                AmqpMethod deliver = ChannelContext.NewMethod("basic.deliver", deliverRecord =>
+                {
+                    deliverRecord.Set("consumer-tag", consumerTag);
+                    deliverRecord.Set("delivery-tag", deliveryTag);
+                    deliverRecord.Set("redelivered", message.Redelivered);
+                    deliverRecord.Set("exchange", message.Exchange);
+                    deliverRecord.Set("routing-key", message.RoutingKey);
+                });
+
+                owner.ScheduleWriterJob(() => owner._host.WriteDeliveryToWireAsync(
+                    owner._channel, deliver, message.Props, message.Body, default));
+            }
+
+            return true;
+        }
+
+        /// <summary>The pump drain: outside the engine gate, tokenless (a cancelled
+        /// transport surfaces through the write itself, and the pump catches).</summary>
+        public Task DrainDeliveryWritesAsync() => owner.RunWriterChainAsync(CancellationToken.None);
+    }
+
+
+
 
     private ChannelOutcome NotSupportedArguments(AmqpMethod method) =>
         new ChannelOutcomeHardError(

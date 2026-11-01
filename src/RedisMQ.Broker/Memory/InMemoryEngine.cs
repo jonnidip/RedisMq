@@ -17,7 +17,11 @@ public sealed class InMemoryEngine : IRouteEngine
     private readonly Dictionary<(string Vhost, string Name), ExchangeInfo> _exchanges = [];
     private readonly Dictionary<(string Vhost, string Name), QueueInfo> _queues = [];
     private readonly List<Binding> _bindings = [];
-    private readonly Dictionary<(string Vhost, string Queue), List<InMemoryMessage>> _messages = [];
+
+    // Task 7: per-queue delivery state (ready buffer, consumer registry, pump) keyed
+    // like the old message lists; created lazily on first enqueue/consume and, since
+    // queue deletes do not exist in M0, never removed again.
+    private readonly Dictionary<(string Vhost, string Queue), InMemoryQueue> _delivery = [];
     private ulong _lastEnvelopeId; // the highest InMemoryMessage.EnvelopeId handed out
 
     /// <summary>Creates the engine and predeclares, per vhost, the default exchange
@@ -151,50 +155,170 @@ public sealed class InMemoryEngine : IRouteEngine
         }
     }
 
-    /// <summary>Lands one completed publish in the queue's message list: one entry
+    /// <summary>Lands one completed publish in the queue's delivery state: one entry
     /// per (queue, enqueue) call with its own defensive body copy and its own
-    /// engine-global envelope id, assigned under the engine lock.</summary>
+    /// engine-global envelope id, assigned under the engine lock; then the queue's
+    /// pump is armed so a registered consumer serves it immediately.</summary>
     public void Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey)
     {
         ArgumentNullException.ThrowIfNull(properties);
         ArgumentNullException.ThrowIfNull(body);
         lock (_lock)
         {
-            (string, string) key = (vhost, queue);
-            if (!_messages.TryGetValue(key, out List<InMemoryMessage>? list))
-            {
-                list = [];
-                _messages[key] = list;
-            }
-
-            list.Add(new InMemoryMessage(properties, DefensiveCopy(body), exchange, routingKey, ++_lastEnvelopeId));
+            InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
+            delivery.AppendAlreadyLocked(new InMemoryMessage(properties, DefensiveCopy(body), exchange, routingKey, ++_lastEnvelopeId));
+            delivery.WakeAlreadyLocked();
         }
     }
 
     /// <summary>[internal] Test introspection of a queue's stored messages: a fresh
-    /// snapshot with freshly copied bodies — lists or body bytes handed out here can
-    /// never write back into the engine. The name is matched across every vhost that
-    /// has a queue with it, in storage (first-enqueue) order; queue deletes do not
-    /// exist in M0, so the whole dict is enumerated as-is.</summary>
+    /// snapshot with freshly copied bodies across every vhost that has a queue with
+    /// the name, in storage (first-delivery-state creation) order. Ready-only: messages
+    /// claimed by the pump (in flight or unacked) are not visible here — the Task 7
+    /// pump admits them by removing them from the ready buffer.</summary>
     public IReadOnlyList<InMemoryMessage> PeekQueue(string queue)
     {
         lock (_lock)
         {
             List<InMemoryMessage> snapshot = [];
-            foreach ((string _, string Queue) key in _messages.Keys)
+            foreach ((string _, string Queue) key in _delivery.Keys)
             {
                 if (key.Queue != queue)
                 {
                     continue;
                 }
 
-                foreach (InMemoryMessage message in _messages[key])
+                List<InMemoryMessage> raw = [];
+                _delivery[key].SnapshotReadyAlreadyLocked(raw);
+                foreach (InMemoryMessage message in raw)
                 {
                     snapshot.Add(message with { Body = DefensiveCopy(message.Body) });
                 }
             }
 
             return snapshot;
+        }
+    }
+
+    // ---------- consume seam (Task 7) ----------
+
+    /// <summary>The per-queue delivery state, created under the engine lock on first
+    /// touch (enqueue, consume, requeue, or a claim attempt) and kept forever, since
+    /// queue deletes do not exist in M0.</summary>
+    private InMemoryQueue DeliveryQueueAlreadyLocked(string vhost, string queue)
+    {
+        (string, string) key = (vhost, queue);
+        if (!_delivery.TryGetValue(key, out InMemoryQueue? delivery))
+        {
+            delivery = new InMemoryQueue(_lock);
+            _delivery[key] = delivery;
+        }
+
+        return delivery;
+    }
+
+    /// <summary>Exclusive arbitration first (an exclusive consumer repels any joining
+    /// consumer; a new exclusive consumer needs an empty registry), then registration
+    /// and the pump arm — all inside the one engine lock, so a racing competer
+    /// deterministically loses.</summary>
+    public ConsumeRegisterOutcome RegisterConsumer(string vhost, string queue, IQueueConsumer consumer)
+    {
+        ArgumentNullException.ThrowIfNull(consumer);
+        lock (_lock)
+        {
+            if (!_queues.TryGetValue((vhost, queue), out QueueInfo? _))
+            {
+                return ConsumeRegisterOutcome.QueueNotFound;
+            }
+
+            InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
+            if (consumer.IsExclusive && delivery.HasConsumers)
+            {
+                return ConsumeRegisterOutcome.ExclusiveHeld;
+            }
+
+            if (!consumer.IsExclusive && delivery.HasExclusiveConsumer)
+            {
+                return ConsumeRegisterOutcome.ExclusiveHeld;
+            }
+
+            delivery.RegisterConsumerAlreadyLocked(consumer);
+            return ConsumeRegisterOutcome.Registered;
+        }
+    }
+
+    /// <summary>Drops the consumer's registration; unknown (queue, tag) pairs are
+    /// silent no-ops, matching the cancel-ok-echo contract.</summary>
+    public void UnregisterConsumer(string vhost, string queue, string consumerTag)
+    {
+        lock (_lock)
+        {
+            if (_delivery.TryGetValue((vhost, queue), out InMemoryQueue? delivery))
+            {
+                delivery.UnregisterConsumerAlreadyLocked(consumerTag);
+            }
+        }
+    }
+
+    /// <summary>Back to the ready tail with the redelivered flag set; the pump is
+    /// armed under the same lock, so the requeued message can be claimed the moment
+    /// the gate is released.</summary>
+    public void Requeue(string vhost, string queue, InMemoryMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        lock (_lock)
+        {
+            InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
+            delivery.AppendAlreadyLocked(message with { Redelivered = true });
+            delivery.WakeAlreadyLocked();
+        }
+    }
+
+    /// <summary>The basic.get claim, fully atomic: existence, exclusive arbitration,
+    /// the head pop and the remaining count run inside one engine-lock hold, so a
+    /// concurrent pump claim cannot empty the queue between the check and the pop.</summary>
+    public GetClaimOutcome TryClaimForGet(string vhost, string queue, out InMemoryMessage? message, out int remaining)
+    {
+        message = null;
+        remaining = 0;
+        lock (_lock)
+        {
+            if (!_queues.TryGetValue((vhost, queue), out QueueInfo? _))
+            {
+                return GetClaimOutcome.QueueNotFound;
+            }
+
+            // A queue with no delivery state yet has no consumers and no messages.
+            if (!_delivery.TryGetValue((vhost, queue), out InMemoryQueue? delivery))
+            {
+                return GetClaimOutcome.Empty;
+            }
+
+            if (delivery.HasExclusiveConsumer)
+            {
+                return GetClaimOutcome.ExclusiveHeld;
+            }
+
+            if (!delivery.TryPopReadyAlreadyLocked(out InMemoryMessage? popped))
+            {
+                return GetClaimOutcome.Empty;
+            }
+
+            message = popped;
+            remaining = delivery.ReadyCount;
+            return GetClaimOutcome.Claimed;
+        }
+    }
+
+    /// <summary>A pure pump arm — no storage interaction beyond the wake check.</summary>
+    public void Nudge(string vhost, string queue)
+    {
+        lock (_lock)
+        {
+            if (_delivery.TryGetValue((vhost, queue), out InMemoryQueue? delivery))
+            {
+                delivery.WakeAlreadyLocked();
+            }
         }
     }
 
