@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, m0-protocol-shell ]
+  pull_request:
+    branches: [ main, m0-protocol-shell ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build
+        run: dotnet build RedisMQ.sln
+
+      - name: Test
+        run: dotnet test RedisMQ.sln --no-restore --no-build
