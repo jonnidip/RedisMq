@@ -218,4 +218,111 @@ public sealed class M0RegressionTests
         // this test pins the confirm.select → confirm.select-ok handshake.
         Assert.True(channel.IsOpen);
     }
+
+    // ---------- M3: topic / headers / x-max-length against the Redis engine ----------
+
+    [Fact]
+    public async Task Topic_exchange_routes_with_star_and_hash_wildcards()
+    {
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
+        await using var host = TestBrokerHost.Start(engine);
+        await using var connection = await ConnectAsync(host);
+        await using var channel = await NewChannelAsync(connection);
+
+        await channel.ExchangeDeclareAsync("m3-topic", ExchangeType.Topic, durable: false, autoDelete: false);
+        await channel.QueueDeclareAsync("m3-topic-a", durable: false, exclusive: false, autoDelete: false);
+        await channel.QueueDeclareAsync("m3-topic-b", durable: false, exclusive: false, autoDelete: false);
+        await channel.QueueBindAsync("m3-topic-a", "m3-topic", "a.#");
+        await channel.QueueBindAsync("m3-topic-b", "m3-topic", "*.b");
+
+        // The exchange type survives the wire round trip: the engine dispatches on it.
+        Assert.Equal("topic", engine.GetExchange("/", "m3-topic")!.Type);
+
+        // "a.b": # matches one word and * matches one word, so both bindings fire.
+        await channel.BasicPublishAsync("m3-topic", "a.b", mandatory: false, new BasicProperties(), "ab"u8.ToArray());
+        BasicGetResult? both = await channel.BasicGetAsync("m3-topic-a", autoAck: true);
+        Assert.NotNull(both);
+        Assert.Equal("ab", Encoding.UTF8.GetString(both.Body.ToArray()));
+        BasicGetResult? star = await channel.BasicGetAsync("m3-topic-b", autoAck: true);
+        Assert.NotNull(star);
+        Assert.Equal("ab", Encoding.UTF8.GetString(star.Body.ToArray()));
+
+        // "a": a.# matches (the # may match zero words); *.b needs the dot word.
+        await channel.BasicPublishAsync("m3-topic", "a", mandatory: false, new BasicProperties(), "a"u8.ToArray());
+        BasicGetResult? hashZero = await channel.BasicGetAsync("m3-topic-a", autoAck: true);
+        Assert.NotNull(hashZero);
+        Assert.Equal("a", Encoding.UTF8.GetString(hashZero.Body.ToArray()));
+        Assert.Null(await channel.BasicGetAsync("m3-topic-b", autoAck: true));
+
+        // "x.c": neither pattern matches.
+        await channel.BasicPublishAsync("m3-topic", "x.c", mandatory: false, new BasicProperties(), "xc"u8.ToArray());
+        Assert.Null(await channel.BasicGetAsync("m3-topic-a", autoAck: true));
+        Assert.Null(await channel.BasicGetAsync("m3-topic-b", autoAck: true));
+    }
+
+    [Fact]
+    public async Task Headers_exchange_matches_binding_arguments()
+    {
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
+        await using var host = TestBrokerHost.Start(engine);
+        await using var connection = await ConnectAsync(host);
+        await using var channel = await NewChannelAsync(connection);
+
+        await channel.ExchangeDeclareAsync("m3-headers", ExchangeType.Headers, durable: false, autoDelete: false);
+        await channel.QueueDeclareAsync("m3-headers-q", durable: false, exclusive: false, autoDelete: false);
+        await channel.QueueBindAsync("m3-headers-q", "m3-headers", routingKey: "", arguments: new Dictionary<string, object?>
+        {
+            ["x-match"] = "all",
+            ["color"] = "red",
+        });
+
+        Assert.Equal("headers", engine.GetExchange("/", "m3-headers")!.Type);
+
+        // Matching header set routes (the routing key is irrelevant for headers).
+        var matching = new BasicProperties { Headers = new Dictionary<string, object?> { ["color"] = "red" } };
+        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, matching, "red"u8.ToArray());
+        BasicGetResult? hit = await channel.BasicGetAsync("m3-headers-q", autoAck: true);
+        Assert.NotNull(hit);
+        Assert.Equal("red", Encoding.UTF8.GetString(hit.Body.ToArray()));
+
+        // Wrong value and missing header both miss.
+        var wrongValue = new BasicProperties { Headers = new Dictionary<string, object?> { ["color"] = "blue" } };
+        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, wrongValue, "blue"u8.ToArray());
+        Assert.Null(await channel.BasicGetAsync("m3-headers-q", autoAck: true));
+
+        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, new BasicProperties(), "none"u8.ToArray());
+        Assert.Null(await channel.BasicGetAsync("m3-headers-q", autoAck: true));
+    }
+
+    [Fact]
+    public async Task Queue_with_x_max_length_drops_the_oldest_message()
+    {
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
+        await using var host = TestBrokerHost.Start(engine);
+        await using var connection = await ConnectAsync(host);
+        await using var channel = await NewChannelAsync(connection);
+
+        await channel.QueueDeclareAsync(
+            "m3-bounded",
+            durable: false,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-max-length"] = 2 });
+
+        Assert.Equal(2, engine.GetQueue("/", "m3-bounded")!.MaxLength);
+
+        foreach (string body in new[] { "one", "two", "three" })
+        {
+            await channel.BasicPublishAsync("", "m3-bounded", mandatory: false, new BasicProperties(), Encoding.UTF8.GetBytes(body));
+        }
+
+        // Drop-oldest: the first message is gone, the last two remain in order.
+        BasicGetResult? second = await channel.BasicGetAsync("m3-bounded", autoAck: true);
+        Assert.NotNull(second);
+        Assert.Equal("two", Encoding.UTF8.GetString(second.Body.ToArray()));
+        BasicGetResult? third = await channel.BasicGetAsync("m3-bounded", autoAck: true);
+        Assert.NotNull(third);
+        Assert.Equal("three", Encoding.UTF8.GetString(third.Body.ToArray()));
+        Assert.Null(await channel.BasicGetAsync("m3-bounded", autoAck: true));
+    }
 }
