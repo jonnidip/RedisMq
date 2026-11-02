@@ -482,4 +482,39 @@ public sealed class RedisStreamRouteEngineTests
         var r2 = engine.RouteTo(engine.GetExchange("/", "h")!, props2, "");
         Assert.Empty(r2);
     }
+
+    [Fact]
+    public void X_max_length_drops_oldest_messages()
+    {
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareQueue(new QueueInfo("/", "q", MaxLength: 3));
+        engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 1 }, "fex", "rk");
+        engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 2 }, "fex", "rk");
+        engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 3 }, "fex", "rk");
+
+        // All 3 fit (max is 3)
+        var c1 = engine.TryClaimForGet("/", "q", out var m1, out var _);
+        Assert.Equal(GetClaimOutcome.Claimed, c1);
+        Assert.Equal(1UL, m1!.EnvelopeId);
+
+        // Enqueue a 4th message - oldest (1) should be dropped
+        engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 4 }, "fex", "rk");
+
+        // q1 should now have messages 2, 3, 4 (1 was dropped)
+        var c2 = engine.TryClaimForGet("/", "q", out var m2, out var _);
+        Assert.Equal(GetClaimOutcome.Claimed, c2);
+        Assert.Equal(2UL, m2!.EnvelopeId);
+
+        var c3 = engine.TryClaimForGet("/", "q", out var m3, out var _);
+        Assert.Equal(GetClaimOutcome.Claimed, c3);
+        Assert.Equal(3UL, m3!.EnvelopeId);
+
+        var c4 = engine.TryClaimForGet("/", "q", out var m4, out var _);
+        Assert.Equal(GetClaimOutcome.Claimed, c4);
+        Assert.Equal(4UL, m4!.EnvelopeId);
+
+        // Queue should now be empty
+        var c5 = engine.TryClaimForGet("/", "q", out var _, out var _);
+        Assert.Equal(GetClaimOutcome.Empty, c5);
+    }
 }

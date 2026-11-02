@@ -334,6 +334,12 @@ public sealed class InMemoryEngine : IRouteEngine
             InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
             delivery.AppendAlreadyLocked(new InMemoryMessage(properties, DefensiveCopy(body), exchange, routingKey, ++_lastEnvelopeId, Expiration: expiration));
             delivery.WakeAlreadyLocked();
+
+            // Enforce x-max-length if set
+            if (_queues.TryGetValue((vhost, queue), out var qi) && qi.MaxLength is int maxLen && maxLen > 0)
+            {
+                delivery.RemoveOldestMessages(maxLen);
+            }
         }
     }
 

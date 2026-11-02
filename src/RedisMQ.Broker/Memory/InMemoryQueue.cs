@@ -88,6 +88,16 @@ internal sealed class InMemoryQueue
         }
     }
 
+    /// <summary>Removes the oldest messages from the ready buffer until the count
+    /// is at most maxLength. Used for x-max-length enforcement.</summary>
+    internal void RemoveOldestMessages(int maxLength)
+    {
+        while (_ready.Count > maxLength)
+        {
+            _ready.RemoveAt(0);
+        }
+    }
+
     /// <summary>Registers a consumer at the registry tail (registration order = the
     /// round-robin cycle) and arms the pump. Caller holds the engine gate.</summary>
     internal void RegisterConsumerAlreadyLocked(IQueueConsumer consumer)

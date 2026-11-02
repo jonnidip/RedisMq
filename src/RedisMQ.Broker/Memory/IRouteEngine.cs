@@ -26,7 +26,8 @@ public sealed record QueueInfo(
     bool Durable = false,
     bool Exclusive = false,
     bool AutoDelete = false,
-    DateTimeOffset? Expiration = null);
+    DateTimeOffset? Expiration = null,
+    int? MaxLength = null);
 
 /// <summary>
 /// What <c>RegisterConsumer</c> decided about a consume request the channel ran:
