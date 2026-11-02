@@ -217,6 +217,19 @@ public sealed class InMemoryEngine : IRouteEngine
         return delivery;
     }
 
+    /// <summary>Replays a previously-enqueued message into the ready buffer without
+    /// touching the drainer. Used by <see cref="RedisMQ.Redis.RedisStreamRouteEngine"/>
+    /// on startup replay. Caller does not need to hold the engine lock.</summary>
+    internal void ReplayEnqueue(string vhost, string queue, InMemoryMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        lock (_lock)
+        {
+            InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
+            delivery.AppendAlreadyLocked(message);
+        }
+    }
+
     /// <summary>Exclusive arbitration first (an exclusive consumer repels any joining
     /// consumer; a new exclusive consumer needs an empty registry), then registration
     /// and the pump arm — all inside the one engine lock, so a racing competer

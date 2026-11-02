@@ -174,13 +174,100 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         }
     }
 
-    // ---------- startup replay (Task 4 stub — no-op at Task 3) ----------
+    // ---------- startup replay ----------
 
     private async Task ReplayAsync()
     {
-        // Task 4 implements replay from {mq:top} and {mq:q:...} into _memory.
-        // At Task 3 this is a no-op so the engine can serve immediately.
-        await Task.CompletedTask;
+        if (_redis is null)
+        {
+            return;
+        }
+
+        // Replay topology: exchanges, queues, bindings from {mq:top}.
+        // Call _memory directly (not this.DeclareExchange etc.) so the drainer
+        // is not fed a second copy of each entry.
+        var topologyResult = await _redis.ExecuteAsync("XRANGE", RedisKeys.TopologyKey, "-", "+");
+        ReplayTopologyEntries(topologyResult);
+
+        // Replay ready queues: for each known queue, read its stream and rebuild
+        // the ready buffer (without touching the drainer).
+        foreach (string queueName in _memory.QueueNamesOfVhost(_vhost))
+        {
+            string queueKey = RedisKeys.QueueKey(_vhost, queueName);
+            var queueResult = await _redis.ExecuteAsync("XRANGE", queueKey, "-", "+");
+            ReplayQueueEntries(queueName, queueResult);
+        }
+    }
+
+    private void ReplayTopologyEntries(RedisResult result)
+    {
+        for (int i = 0; i < result.Length; i++)
+        {
+            var entry = result[i]; // RedisResult: [id, [field1, value1, field2, value2, ...]]
+            var id = (string)entry[0]!;
+            var fields = (string[])entry[1]!;
+            var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+            for (int j = 0; j < fields.Length; j += 2)
+            {
+                dict[fields[j]!] = fields[j + 1]!;
+            }
+
+            string kind = dict.GetValueOrDefault("kind") ?? string.Empty;
+            string vhost = dict.GetValueOrDefault("vhost") ?? string.Empty;
+
+            switch (kind)
+            {
+                case nameof(WriteCommandKind.DeclareExchange):
+                    _memory.DeclareExchange(new ExchangeInfo(
+                        vhost,
+                        dict.GetValueOrDefault("exchange") ?? string.Empty,
+                        dict.GetValueOrDefault("type") ?? string.Empty));
+                    break;
+
+                case nameof(WriteCommandKind.DeclareQueue):
+                    _memory.DeclareQueue(new QueueInfo(
+                        vhost,
+                        dict.GetValueOrDefault("queue") ?? string.Empty,
+                        bool.TryParse(dict.GetValueOrDefault("durable") ?? "0", out var d) && d,
+                        bool.TryParse(dict.GetValueOrDefault("exclusive") ?? "0", out var e) && e,
+                        bool.TryParse(dict.GetValueOrDefault("auto-delete") ?? "0", out var a) && a));
+                    break;
+
+                case nameof(WriteCommandKind.Bind):
+                    _memory.Bind(
+                        vhost,
+                        dict.GetValueOrDefault("exchange") ?? string.Empty,
+                        dict.GetValueOrDefault("queue") ?? string.Empty,
+                        dict.GetValueOrDefault("routing-key") ?? string.Empty);
+                    break;
+            }
+        }
+    }
+
+    private void ReplayQueueEntries(string queueName, RedisResult result)
+    {
+        for (int i = 0; i < result.Length; i++)
+        {
+            var entry = result[i]; // RedisResult: [id, [field1, value1, field2, value2, ...]]
+            var fields = (string[])entry[1]!;
+            var dict = new Dictionary<string, string>(StringComparer.Ordinal);
+            for (int j = 0; j < fields.Length; j += 2)
+            {
+                dict[fields[j]!] = fields[j + 1]!;
+            }
+
+            var record = StreamCodec.DecodeEnqueue(
+                dict.Select(kv => (kv.Key, kv.Value)).ToList());
+            ContentProperties? properties = null;
+            if (!string.IsNullOrEmpty(record.PropertiesJson))
+            {
+                properties = JsonSerializer.Deserialize<ContentProperties>(record.PropertiesJson);
+            }
+
+            var message = new InMemoryMessage(
+                properties ?? new ContentProperties(), record.Body, record.Exchange, record.RoutingKey, record.EnvelopeId);
+            _memory.ReplayEnqueue(_vhost, queueName, message);
+        }
     }
 
     /// <inheritdoc/>

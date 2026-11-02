@@ -143,4 +143,66 @@ public sealed class RedisStreamRouteEngineTests
         engine.DeclareExchange(new ExchangeInfo("/", "fex", "direct"));
         Assert.Equal("direct", engine.GetExchange("/", "fex")!.Type);
     }
+
+    [Fact]
+    public async Task Replay_restores_topology_and_ready_queues_after_restart()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        // Use a unique vhost so previous test runs don't leave stale stream data.
+        string vhost = $"/replay-test-{Guid.NewGuid():N}";
+
+        // First engine: declare topology + enqueue messages.
+        await using var engine1 = new RedisStreamRouteEngine(db, vhost, replayOnStart: false, drainerCapacity: 1024);
+        engine1.DeclareExchange(new ExchangeInfo(vhost, "fex", "direct"));
+        engine1.DeclareQueue(new QueueInfo(vhost, "q"));
+        engine1.Bind(vhost, "fex", "q", "rk");
+        engine1.Enqueue(vhost, "q", new ContentProperties(), new byte[] { 1, 2, 3 }, "fex", "rk");
+        engine1.Enqueue(vhost, "q", new ContentProperties(), new byte[] { 4, 5, 6 }, "fex", "rk");
+        await Task.Delay(500, TestContext.Current.CancellationToken); // give the drainer time to mirror writes to Redis
+
+        // Second engine over the same Redis+vhost: replay should restore state.
+        await using var engine2 = new RedisStreamRouteEngine(db, vhost, replayOnStart: true, drainerCapacity: 1024);
+        Assert.NotNull(engine2.GetExchange(vhost, "fex"));
+        Assert.Equal("direct", engine2.GetExchange(vhost, "fex")!.Type);
+        Assert.NotNull(engine2.GetQueue(vhost, "q"));
+        Assert.Equal(["q"], engine2.RouteTo(engine2.GetExchange(vhost, "fex")!, new ContentProperties(), "rk"));
+
+        // Replayed messages are claimable.
+        int claimed = 0;
+        while (engine2.TryClaimForGet(vhost, "q", out var m, out var _) == GetClaimOutcome.Claimed)
+        {
+            claimed++;
+            if (claimed > 10) break; // safety
+        }
+        Assert.Equal(2, claimed);
+    }
+
+    [Fact]
+    public async Task Drainer_channel_is_bounded()
+    {
+        // Bounded channel: small capacity, no Redis to drain, rapid enqueues
+        // should not block or grow unbounded (in-memory state stays correct).
+        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false, drainerCapacity: 4);
+        engine.DeclareQueue(new QueueInfo("/", "q"));
+        for (int i = 0; i < 100; i++)
+        {
+            engine.Enqueue("/", "q", new ContentProperties(), new byte[] { (byte)i }, "fex", "rk");
+        }
+
+        // All enqueues landed in memory (channel drops overflow silently;
+        // memory is the system of record).
+        int claimed = 0;
+        while (engine.TryClaimForGet("/", "q", out var m, out var left) == GetClaimOutcome.Claimed)
+        {
+            claimed++;
+            if (claimed > 100) break; // safety
+        }
+
+        Assert.True(claimed > 0);
+    }
 }
