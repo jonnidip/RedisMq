@@ -190,7 +190,8 @@ public sealed class ChannelContext
     // confirm mode is off).
     private bool _confirmMode; // publisher confirms enabled via confirm.select
     private long _confirmSequence; // monotonic confirm sequence, ascends 1, 2, 3 per channel
-    private long? _pendingConfirmSequence; // confirm sequence for the pending publish, if any
+    private long? _pendingConfirmSequence; // sequence assigned to the in-flight publish
+    private bool _flowActive = true; // channel.flow active state; false pauses delivery
 
     // Task 7 — the per-channel serialized writer chain: consumer-path replies and
     // deliveries are scheduled here (never written inline), so a queue-pump claim can
@@ -534,18 +535,10 @@ public sealed class ChannelContext
 
     private ChannelOutcome OnChannelFlow(AmqpMethod method)
     {
-        if (!Equals(method.Get("active"), true))
-        {
-            // rabbit_channel: flowing off exits not_implemented "active=false",
-            // a hard error through map_exception.
-            return new ChannelOutcomeHardError(
-                AmqpConstants.NotImplemented,
-                "NOT_IMPLEMENTED - active=false",
-                method.ClassId, method.MethodId);
-        }
-
+        bool active = method.Get("active") is true;
+        _flowActive = active;
         return new ChannelOutcomeReply(NewMethod("channel.flow-ok", flowOk =>
-            flowOk.Set("active", true)));
+            flowOk.Set("active", _flowActive)));
     }
 
     // ---------- exchange.declare (rabbit_exchange order) ----------
@@ -981,6 +974,13 @@ public sealed class ChannelContext
     {
         string queue = method.Get("queue") as string ?? string.Empty;
         bool noAck = method.Get("no-ack") is true;
+
+        // Channel flow control: if flow is off, basic.get does not deliver
+        if (!_flowActive)
+        {
+            return new ChannelOutcomeSilent();
+        }
+
         GetClaimOutcome outcome = _engine.TryClaimForGet(_vhost, queue, out InMemoryMessage? message, out int remaining);
         switch (outcome)
         {
@@ -1285,6 +1285,12 @@ public sealed class ChannelContext
             long deliveryTag;
             lock (owner._deliveryLock)
             {
+                // Channel flow control: if flow is off, no new deliveries are admitted
+                if (!owner._flowActive)
+                {
+                    return false;
+                }
+
                 if (noAck)
                 {
                     // Auto-ack consumers ride past the gate: no ledger, no credit.

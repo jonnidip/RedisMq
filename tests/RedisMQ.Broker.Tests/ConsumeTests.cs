@@ -849,6 +849,59 @@ public sealed class ConsumeTests
         }
     }
 
+    [Fact]
+    public async Task Channel_flow_false_pauses_delivery_true_resumes()
+    {
+        (AmqpBrokerServer server, WireClient client, _) = SpawnServer();
+        try
+        {
+            await HandshakeAsync(client);
+            await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
+
+            // Declare queue through default exchange (routing key = queue name)
+            await client.SendAsync(MethodFrameOn(1, QueueDeclareFrame(1, "q", durable: false)));
+            _ = await client.ReadMethodOnChannelAsync(1, 50, 11);
+
+            // Publish a message through default exchange
+            await client.SendAsync(MethodFrameOn(1, PublishFrame(channel: 1, exchange: "", routingKey: "q")));
+            await client.SendAsync(ContentHeaderFrameOn(1, body: 1, properties: new ContentProperties()));
+            await client.SendAsync(BodyFrameOn(1, new byte[] { 42 }));
+
+            // channel.flow(active=false) pauses delivery
+            await client.SendAsync(MethodFrameOn(1, ChannelFlowFrame(1, active: false)));
+            AmqpMethod flowOk = await client.ReadMethodOnChannelAsync(1, 20, 21);
+            Assert.False((bool)flowOk.Get("active")!);
+
+            // basic.get should be paused - no message delivered
+            await client.SendAsync(MethodFrameOn(1, GetFrame(1, "q")));
+            AmqpMethod getOk = await client.ReadMethodOnChannelAsync(1, 60, 71);
+            Assert.Equal(0, (int)getOk.Get("message-count")!);
+            (ContentHeader _, byte[] body) = await client.ReadContentOnChannelAsync(1);
+            Assert.Empty(body);
+
+            // Resume flow
+            await client.SendAsync(MethodFrameOn(1, ChannelFlowFrame(1, active: true)));
+            flowOk = await client.ReadMethodOnChannelAsync(1, 20, 21);
+            Assert.True((bool)flowOk.Get("active")!);
+
+            // Now basic.get should return the message
+            await client.SendAsync(MethodFrameOn(1, GetFrame(1, "q")));
+            getOk = await client.ReadMethodOnChannelAsync(1, 60, 71);
+            Assert.Equal(1L, getOk.Get("delivery-tag"));
+            Assert.Equal(0, (int)getOk.Get("message-count")!);
+            (ContentHeader _, byte[] body2) = await client.ReadContentOnChannelAsync(1);
+            Assert.Equal(1, body2.Length);
+            Assert.Equal(42, body2[0]);
+
+            await client.SendAsync(MethodFrameOn(1, AckFrame(1)));
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
     // ---------- harness (the per-file M0 pattern mirrors PublishTests) ----------
 
     private static BrokerServerOptions NewOptions() => new()
