@@ -200,12 +200,15 @@ public sealed class ChannelContext
     private readonly object _writerLock = new();
     private readonly Queue<Func<ValueTask>> _writerJobs = [];
 
-    internal ChannelContext(ushort channel, string vhost, IRouteEngine engine, IChannelDeliveryHost host)
+    private readonly string _connectionId;
+
+    internal ChannelContext(ushort channel, string vhost, IRouteEngine engine, IChannelDeliveryHost host, string? connectionId = null)
     {
         _channel = channel;
         _vhost = vhost;
         _engine = engine;
         _host = host;
+        _connectionId = connectionId ?? Guid.NewGuid().ToString("N");
     }
 
     public bool IsMourning => _state == ChannelState.Mourning;
@@ -724,6 +727,12 @@ public sealed class ChannelContext
         if (prior is not null)
         {
             return DeclaredQueueOutcome(method, actual, prior, durable, exclusive, autoDelete, nowait);
+        }
+
+        // Track exclusive queue ownership for connection teardown reconciliation.
+        if (exclusive)
+        {
+            _engine.RegisterExclusiveQueueOwner(_vhost, actual, _connectionId);
         }
 
         return DeclareOk(nowait, "queue.declare-ok", actual, updateMrdq: actual);

@@ -87,7 +87,9 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
     private readonly Dictionary<ushort, ChannelContext> _channels = []; // Running and Mourning channels
     private bool _disposed;
 
-    public WireConnection(BrokerServerOptions options, IRouteEngine routes, TransportSide transport)
+    private readonly string _connectionId;
+
+    public WireConnection(BrokerServerOptions options, IRouteEngine routes, TransportSide transport, string? connectionId = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(routes);
@@ -95,6 +97,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
         _options = options;
         _transport = transport;
+        _connectionId = connectionId ?? Guid.NewGuid().ToString("N");
         _frameMax = options.FrameMax; // pre-TuneOk bound: the broker's own configured max
         // The topology engine backs Task 5's channel dispatch: every channel context
         // hands its declare/bind calls to it.
@@ -166,6 +169,9 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
                 {
                     channel.TearDownActiveConsumers();
                 }
+
+                // Reconcile exclusive/auto-delete queue ownership on connection end.
+                Routes.ReconcileConnection(_connectionId);
             }
 
             await DisposeAsync();
@@ -630,7 +636,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
         // The connection is the channel's delivery host: every consumer-path write
         // (obligated by the queue pumps) funnels through this instance's gated writers.
-        var fresh = new ChannelContext(channel, _vhost, Routes, this);
+        var fresh = new ChannelContext(channel, _vhost, Routes, this, _connectionId);
         _channels[channel] = fresh;
         return fresh;
     }
