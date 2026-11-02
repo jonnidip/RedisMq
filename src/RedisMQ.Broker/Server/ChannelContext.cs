@@ -184,6 +184,14 @@ public sealed class ChannelContext
     private ulong _serverConsumerTags; // amq.ctag-N counter
     private bool _consumersTornDown;
 
+    // Task 8/M2 — publisher confirms: confirm.select enables confirms on this channel;
+    // _confirmSequence is the monotonic confirm sequence; _pendingConfirmSequence is the
+    // sequence assigned to the in-flight publish (null when no publish is pending or
+    // confirm mode is off).
+    private bool _confirmMode; // publisher confirms enabled via confirm.select
+    private long _confirmSequence; // monotonic confirm sequence, ascends 1, 2, 3 per channel
+    private long? _pendingConfirmSequence; // confirm sequence for the pending publish, if any
+
     // Task 7 — the per-channel serialized writer chain: consumer-path replies and
     // deliveries are scheduled here (never written inline), so a queue-pump claim can
     // never put a deliver ahead of a reply the channel already promised. The single
@@ -297,6 +305,7 @@ public sealed class ChannelContext
             (60, 90) => OnBasicReject(method),
             (60, 120) => OnBasicNack(method), // (60,100) is recover-async: outside the M0 set
             (60, 110) => OnBasicRecover(method),
+            (85, 10) => OnConfirmSelect(method), // confirm.select: enable publisher confirms
             _ => new ChannelOutcomeHardError(
                 AmqpConstants.NotImplemented,
                 $"NOT_IMPLEMENTED - {method.Schema.Name} ({classId},{methodId}) is not part of the M0 channel method set",
@@ -323,6 +332,10 @@ public sealed class ChannelContext
     {
         _pendingPublish = method;
         _pendingContentPhase = ContentPhase.ExpectHeader;
+        if (_confirmMode)
+        {
+            _pendingConfirmSequence = ++_confirmSequence;
+        }
         return new ChannelOutcomeSilent();
     }
 
@@ -416,6 +429,8 @@ public sealed class ChannelContext
         AmqpMethod method = _pendingPublish!;
         ContentHeader header = _pendingHeader!;
         byte[] body = _pendingBody!.ToArray();
+        // Capture the confirm sequence before ResetPendingContent clears it.
+        var pendingConfirmSequence = _pendingConfirmSequence;
         ResetPendingContent();
 
         // rabbit_channel: handle_method(#'basic.publish'{immediate = true}, ...)
@@ -466,6 +481,16 @@ public sealed class ChannelContext
                     body);
             }
 
+            // Non-mandatory unroutable: message is dropped. Confirm if confirm mode.
+            if (_confirmMode && pendingConfirmSequence is long droppedSeq)
+            {
+                return ChainReply("confirm.ack", ack =>
+                {
+                    ack.Set("delivery-tag", droppedSeq);
+                    ack.Set("multiple", false);
+                });
+            }
+
             return new ChannelOutcomeSilent();
         }
 
@@ -474,6 +499,17 @@ public sealed class ChannelContext
             // One engine entry per routed queue, in binding-insertion order; the body
             // ownership may move because the engine stores its own defensive copy.
             _engine.Enqueue(_vhost, queue, header.Properties, body, exchangeName, routingKey);
+        }
+
+        // Publisher confirms: confirm.ack when the message has been handled (enqueued
+        // to all bound queues, or dropped as non-mandatory unroutable).
+        if (_confirmMode && pendingConfirmSequence is long seq)
+        {
+            return ChainReply("confirm.ack", ack =>
+            {
+                ack.Set("delivery-tag", seq);
+                ack.Set("multiple", false);
+            });
         }
 
         return new ChannelOutcomeSilent(); // basic.publish never replies on success
@@ -485,6 +521,7 @@ public sealed class ChannelContext
         _pendingHeader = null;
         _pendingBody = null;
         _pendingContentPhase = ContentPhase.ExpectMethod;
+        _pendingConfirmSequence = null;
     }
 
     /// <summary>The assembler's unexpected_frame shape: soft 505 on this channel (the
@@ -1095,6 +1132,15 @@ public sealed class ChannelContext
         });
 
         return ChannelOutcomeChain.Instance;
+    }
+
+    /// <summary>confirm.select: enable publisher confirms on this channel. Replies
+    /// confirm.select-ok; subsequent publishes are confirmed with confirm.ack (or
+    /// confirm.nack on failure) once the message has been handled.</summary>
+    private ChannelOutcome OnConfirmSelect(AmqpMethod method)
+    {
+        _confirmMode = true;
+        return ChainReply("confirm.select-ok");
     }
 
     /// <summary>The close/retire sweep: every consumer leaves the engine and every

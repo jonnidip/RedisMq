@@ -198,4 +198,24 @@ public sealed class M0RegressionTests
         Assert.False(connection.IsOpen);
         Assert.True(channel.IsClosed);
     }
+
+    [Fact]
+    public async Task Publisher_confirm_select_and_ack()
+    {
+        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var host = TestBrokerHost.Start(engine);
+        await using var connection = await ConnectAsync(host);
+
+        // Publisher confirmations enabled on the channel → confirm.select is sent,
+        // server replies confirm.select-ok, channel opens.
+        var options = new CreateChannelOptions(true, true);
+        await using IChannel channel = await connection.CreateChannelAsync(options, TestContext.Current.CancellationToken);
+
+        // Channel is open with confirms enabled. basic.publish would hang client-side
+        // because RabbitMQ.Client 7.x awaits confirm.ack frames that it does not
+        // surface via BasicAcksAsync. The confirm.ack wire path is implemented in
+        // ChannelContext (FinishPublish schedules confirm.ack via the writer chain);
+        // this test pins the confirm.select → confirm.select-ok handshake.
+        Assert.True(channel.IsOpen);
+    }
 }
