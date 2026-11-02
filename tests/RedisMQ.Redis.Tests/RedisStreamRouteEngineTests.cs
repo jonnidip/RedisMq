@@ -49,3 +49,31 @@ public sealed class StreamCodecTests
         Assert.Equal("{mq:top}", RedisKeys.TopologyKey);
     }
 }
+
+public sealed class WriteCommandTests
+{
+    [Fact]
+    public void To_stream_fields_and_back_round_trips_each_kind()
+    {
+        var commands = new[]
+        {
+            WriteCommand.DeclareExchange("/", "fex", "direct"),
+            WriteCommand.DeclareQueue("/", "q", durable: false, exclusive: false, autoDelete: false),
+            WriteCommand.Bind("/", "fex", "q", "rk"),
+            WriteCommand.Unbind("/", "fex", "q", "rk"),
+            WriteCommand.Enqueue("/", "q", 3, "fex", "rk", new byte[] { 1, 2, 3}, "{\"ct\":\"text/plain\"}"),
+            WriteCommand.RegisterConsumer("/", "q", "ctag"),
+            WriteCommand.UnregisterConsumer("/", "q", "ctag"),
+            WriteCommand.Requeue("/", "q", 3, "fex", "rk", new byte[] { 9 }, "{}", redelivered: true),
+        };
+
+        foreach (var command in commands)
+        {
+            var fields = command.ToStreamFields();
+            var roundTripped = WriteCommand.FromStreamFields(command.Kind, fields);
+            Assert.Equal(command.Kind, roundTripped.Kind);
+            Assert.Equal(command.Vhost, roundTripped.Vhost);
+            Assert.Equal(command.Body, roundTripped.Body);
+        }
+    }
+}
