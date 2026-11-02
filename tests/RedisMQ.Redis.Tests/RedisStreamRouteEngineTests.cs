@@ -259,6 +259,85 @@ public sealed class RedisStreamRouteEngineTests
     }
 
     [Fact]
+    public void Topic_exchange_star_matches_exactly_one_word()
+    {
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareExchange(new ExchangeInfo("/", "t", "topic"));
+        engine.DeclareQueue(new QueueInfo("/", "q1"));
+        engine.Bind("/", "t", "q1", "a.b.c");
+
+        var r1 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b.c");
+        Assert.Equal(["q1"], r1);
+
+        var r2 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b");
+        Assert.Empty(r2);
+
+        var r3 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b.c.d");
+        Assert.Empty(r3);
+    }
+
+    [Fact]
+    public void Topic_exchange_hash_matches_zero_or_more_words()
+    {
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareExchange(new ExchangeInfo("/", "t", "topic"));
+        engine.DeclareQueue(new QueueInfo("/", "q1"));
+        engine.Bind("/", "t", "q1", "a.#");
+
+        var r1 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a");
+        Assert.Equal(["q1"], r1);
+
+        var r2 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b");
+        Assert.Equal(["q1"], r2);
+
+        var r3 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b.c");
+        Assert.Equal(["q1"], r3);
+
+        var r4 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "b.c");
+        Assert.Empty(r4);
+    }
+
+    [Fact]
+    public void Topic_exchange_star_does_not_match_zero_or_multiple_words()
+    {
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareExchange(new ExchangeInfo("/", "t", "topic"));
+        engine.DeclareQueue(new QueueInfo("/", "q1"));
+        engine.Bind("/", "t", "q1", "a.*.c");
+
+        var r1 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b.c");
+        Assert.Equal(["q1"], r1);
+
+        var r2 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.c");
+        Assert.Empty(r2);
+
+        var r3 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b.c.d");
+        Assert.Empty(r3);
+    }
+
+    [Fact]
+    public void Topic_exchange_multiple_queues_route_correctly()
+    {
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareExchange(new ExchangeInfo("/", "t", "topic"));
+        engine.DeclareQueue(new QueueInfo("/", "q1"));
+        engine.DeclareQueue(new QueueInfo("/", "q2"));
+        engine.DeclareQueue(new QueueInfo("/", "q3"));
+        engine.Bind("/", "t", "q1", "a.b.c");
+        engine.Bind("/", "t", "q2", "a.#");
+        engine.Bind("/", "t", "q3", "*.b.*");
+
+        var r1 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b.c");
+        Assert.Equal(new[] { "q1", "q2", "q3" }, r1);
+
+        var r2 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "a.b");
+        Assert.Equal(new[] { "q2" }, r2);
+
+        var r3 = engine.RouteTo(engine.GetExchange("/", "t")!, new ContentProperties(), "x.b.y");
+        Assert.Equal(new[] { "q3" }, r3);
+    }
+
+    [Fact]
     public void Remove_expired_messages_from_ready_buffer()
     {
         // InMemoryEngine removes expired messages from ready buffers.

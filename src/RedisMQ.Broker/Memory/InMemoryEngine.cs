@@ -125,15 +125,119 @@ public sealed class InMemoryEngine : IRouteEngine
             foreach (Binding binding in _bindings)
             {
                 if (binding.Vhost == exchange.Vhost
-                    && binding.Exchange == exchange.Name
-                    && binding.RoutingKey == routingKey)
+                    && binding.Exchange == exchange.Name)
                 {
-                    queues.Add(binding.Queue);
+                    if (MatchesRoutingKey(binding.RoutingKey, routingKey, exchange.Type))
+                    {
+                        queues.Add(binding.Queue);
+                    }
                 }
             }
 
             return queues;
         }
+    }
+
+    /// <summary>
+    /// Matches a publish routing key against a binding routing key for the given
+    /// exchange type. Direct exchange requires exact match; topic exchange supports
+    /// wildcard matching (star = exactly one word, hash = zero or more words).
+    /// </summary>
+    private static bool MatchesRoutingKey(string bindingKey, string routingKey, string exchangeType)
+    {
+        if (exchangeType == "direct")
+        {
+            return bindingKey == routingKey;
+        }
+
+        if (exchangeType == "topic")
+        {
+            return TopicMatches(bindingKey, routingKey);
+        }
+
+        // Headers exchange: routing key is irrelevant; header matching happens
+        // elsewhere. Return true to let the channel decide based on headers.
+        return true;
+    }
+
+    /// <summary>
+    /// Topic wildcard matching per AMQP 0-9-1:
+    ///   star matches exactly one word
+    ///   hash matches zero or more words
+    /// Words are separated by ".".
+    /// </summary>
+    private static bool TopicMatches(string bindingKey, string routingKey)
+    {
+        var bindingWords = bindingKey.Split('.');
+        var routeWords = routingKey.Split('.');
+
+        return TopicMatch(bindingWords, 0, routeWords, 0);
+    }
+
+    private static bool TopicMatch(string[] bindingWords, int bi, string[] routeWords, int ri)
+    {
+        // Both exhausted: match
+        if (bi == bindingWords.Length && ri == routeWords.Length)
+        {
+            return true;
+        }
+
+        // Binding exhausted but route remains: no match (unless binding ended with #,
+        // which is handled below)
+        if (bi == bindingWords.Length)
+        {
+            return false;
+        }
+
+        // Route exhausted but binding remains: match only if remaining binding
+        // words are all #
+        if (ri == routeWords.Length)
+        {
+            for (int i = bi; i < bindingWords.Length; i++)
+            {
+                if (bindingWords[i] != "#")
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        string bw = bindingWords[bi];
+
+        if (bw == "#")
+        {
+            // # matches zero or more words: try consuming 0..N route words
+            for (int k = ri; k <= routeWords.Length; k++)
+            {
+                if (TopicMatch(bindingWords, bi + 1, routeWords, k))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if (ri >= routeWords.Length)
+        {
+            return false;
+        }
+
+        string rw = routeWords[ri];
+
+        if (bw == "*")
+        {
+            // * matches exactly one word
+            return TopicMatch(bindingWords, bi + 1, routeWords, ri + 1);
+        }
+
+        // Literal word must match exactly
+        if (bw != rw)
+        {
+            return false;
+        }
+
+        return TopicMatch(bindingWords, bi + 1, routeWords, ri + 1);
     }
 
     /// <summary>The declared queue names of a vhost, most-helpful for engine-state
