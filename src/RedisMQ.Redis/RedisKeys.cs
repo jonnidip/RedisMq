@@ -7,8 +7,13 @@ namespace RedisMQ.Redis;
 /// </summary>
 public static class RedisKeys
 {
-    /// <summary>Topology write-ahead log stream: every declare/bind/unbind operation.</summary>
-    public const string TopologyKey = "{mq:top}";
+    /// <summary>Topology write-ahead log stream root pattern: every declare/bind/unbind operation.
+    /// Per-vhost keys are built with <see cref="TopologyKey(string)"/>.</summary>
+    public const string TopologyKeyRoot = "{mq:top}";
+
+    /// <summary>Builds the per-vhost topology write-ahead log stream key.</summary>
+    /// <param name="vhost">Vhost name (scope).</param>
+    public static string TopologyKey(string vhost) => $"{{mq:top:{vhost}}}";
 
     /// <summary>Builds the per-queue write-ahead log stream key.</summary>
     /// <param name="vhost">Vhost name (scope).</param>

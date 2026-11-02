@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Threading.Channels;
 using RedisMQ.Broker.Codec;
 using RedisMQ.Broker.Memory;
+using RedisMQ.Broker.Server;
 using StackExchange.Redis;
 
 namespace RedisMQ.Redis;
@@ -16,7 +17,7 @@ namespace RedisMQ.Redis;
 public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
 {
     private readonly IDatabase? _redis;
-    private readonly string _vhost;
+    private readonly string[] _vhosts;
     private readonly InMemoryEngine _memory;
     private readonly Channel<WriteCommand>? _channel;
     private readonly Task? _drainerTask;
@@ -27,19 +28,31 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     /// unavailable); in that case all writes go to memory only and no drainer
     /// is started. When <paramref name="replayOnStart"/> is true, Redis topology
     /// and ready-queue streams are replayed into memory before the engine serves.
+    /// When <paramref name="enforceEvictionGate"/> is true and Redis is available,
+    /// the server's maxmemory-policy is checked at startup; eviction policies that
+    /// could discard durable data cause the constructor to throw.
     /// </summary>
-    public RedisStreamRouteEngine(IDatabase? redis, string vhost, bool replayOnStart = true, int drainerCapacity = 1024)
+    public RedisStreamRouteEngine(IDatabase? redis, IReadOnlyList<string> vhosts, bool replayOnStart = true, int drainerCapacity = 1024, bool enforceEvictionGate = true)
     {
-        ArgumentNullException.ThrowIfNull(vhost);
+        ArgumentNullException.ThrowIfNull(vhosts);
+        if (vhosts.Count == 0)
+        {
+            throw new ArgumentException("At least one vhost is required", nameof(vhosts));
+        }
         _redis = redis;
-        _vhost = vhost;
-        _memory = new InMemoryEngine(new[] { vhost });
+        _vhosts = [.. vhosts];
+        _memory = new InMemoryEngine(_vhosts);
 
         if (redis is not null)
         {
             _channel = Channel.CreateBounded<WriteCommand>(
                 new BoundedChannelOptions(drainerCapacity) { FullMode = BoundedChannelFullMode.Wait });
             _drainerTask = Task.Run(() => DrainAsync(_stopCts.Token));
+        }
+
+        if (enforceEvictionGate && redis is not null)
+        {
+            CheckEvictionPolicy();
         }
 
         if (replayOnStart && redis is not null)
@@ -157,7 +170,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         {
             case WriteCommandKind.DeclareExchange or WriteCommandKind.DeclareQueue or
                  WriteCommandKind.Bind or WriteCommandKind.Unbind:
-                await _redis.StreamAddAsync(RedisKeys.TopologyKey, fields.Select(f => new NameValueEntry(f.Field, f.Value)).ToArray());
+                await _redis.StreamAddAsync(RedisKeys.TopologyKey(command.Vhost ?? string.Empty), fields.Select(f => new NameValueEntry(f.Field, f.Value)).ToArray());
                 break;
 
             case WriteCommandKind.Enqueue or WriteCommandKind.Requeue:
@@ -169,7 +182,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
             case WriteCommandKind.RegisterConsumer or WriteCommandKind.UnregisterConsumer:
                 // Consumer registration is in-memory state; mirrored to the
                 // topology log for durability.
-                await _redis.StreamAddAsync(RedisKeys.TopologyKey, fields.Select(f => new NameValueEntry(f.Field, f.Value)).ToArray());
+                await _redis.StreamAddAsync(RedisKeys.TopologyKey(command.Vhost ?? string.Empty), fields.Select(f => new NameValueEntry(f.Field, f.Value)).ToArray());
                 break;
         }
     }
@@ -183,19 +196,46 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
             return;
         }
 
-        // Replay topology: exchanges, queues, bindings from {mq:top}.
+        // Replay topology: exchanges, queues, bindings from {mq:top:<vhost>}.
         // Call _memory directly (not this.DeclareExchange etc.) so the drainer
         // is not fed a second copy of each entry.
-        var topologyResult = await _redis.ExecuteAsync("XRANGE", RedisKeys.TopologyKey, "-", "+");
-        ReplayTopologyEntries(topologyResult);
-
-        // Replay ready queues: for each known queue, read its stream and rebuild
-        // the ready buffer (without touching the drainer).
-        foreach (string queueName in _memory.QueueNamesOfVhost(_vhost))
+        foreach (string vhost in _vhosts)
         {
-            string queueKey = RedisKeys.QueueKey(_vhost, queueName);
-            var queueResult = await _redis.ExecuteAsync("XRANGE", queueKey, "-", "+");
-            ReplayQueueEntries(queueName, queueResult);
+            var topologyResult = await _redis.ExecuteAsync("XRANGE", RedisKeys.TopologyKey(vhost), "-", "+");
+            ReplayTopologyEntries(topologyResult);
+        }
+
+        // Replay ready queues: for each known queue in each vhost, read its stream
+        // and rebuild the ready buffer (without touching the drainer).
+        foreach (string vhost in _vhosts)
+        {
+            foreach (string queueName in _memory.QueueNamesOfVhost(vhost))
+            {
+                string queueKey = RedisKeys.QueueKey(vhost, queueName);
+                var queueResult = await _redis.ExecuteAsync("XRANGE", queueKey, "-", "+");
+                ReplayQueueEntries(vhost, queueName, queueResult);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Startup eviction-policy gate. Reads Redis CONFIG GET maxmemory-policy and
+    /// refuses to start if an eviction policy that could discard durable data is
+    /// in effect. noeviction is permitted.
+    /// </summary>
+    private void CheckEvictionPolicy()
+    {
+        ArgumentNullException.ThrowIfNull(_redis);
+        var result = _redis.Execute("CONFIG", "GET", "maxmemory-policy");
+        if (result.Length >= 2)
+        {
+            var policyValue = (string)result[1];
+            if (!string.Equals("noeviction", policyValue, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new BrokerConfigurationException(
+                    $"Redis maxmemory-policy '{policyValue}' may evict durable data; " +
+                    "set maxmemory-policy noeviction or disable the eviction gate.");
+            }
         }
     }
 
@@ -244,7 +284,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         }
     }
 
-    private void ReplayQueueEntries(string queueName, RedisResult result)
+    private void ReplayQueueEntries(string vhost, string queueName, RedisResult result)
     {
         for (int i = 0; i < result.Length; i++)
         {
@@ -266,7 +306,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
 
             var message = new InMemoryMessage(
                 properties ?? new ContentProperties(), record.Body, record.Exchange, record.RoutingKey, record.EnvelopeId);
-            _memory.ReplayEnqueue(_vhost, queueName, message);
+            _memory.ReplayEnqueue(vhost, queueName, message);
         }
     }
 

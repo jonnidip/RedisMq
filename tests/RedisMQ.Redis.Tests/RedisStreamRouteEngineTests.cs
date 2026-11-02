@@ -1,6 +1,7 @@
 using System.Text;
 using RedisMQ.Broker.Codec;
 using RedisMQ.Broker.Memory;
+using RedisMQ.Broker.Server;
 using RedisMQ.Redis;
 using StackExchange.Redis;
 using Xunit;
@@ -49,7 +50,7 @@ public sealed class StreamCodecTests
     [Fact]
     public void Topology_key_is_hash_tagged()
     {
-        Assert.Equal("{mq:top}", RedisKeys.TopologyKey);
+        Assert.Equal("{mq:top:/}", RedisKeys.TopologyKey("/"));
     }
 }
 
@@ -108,7 +109,7 @@ public sealed class RedisStreamRouteEngineTests
         // reads/writes go through InMemoryEngine synchronously.
         await using var engine = new RedisStreamRouteEngine(
             redis: null!,
-            vhost: "/",
+            vhosts: ["/"],
             replayOnStart: false,
             drainerCapacity: 1024);
 
@@ -131,6 +132,36 @@ public sealed class RedisStreamRouteEngineTests
     }
 
     [Fact]
+    public async Task Multi_vhost_engine_isolates_topology_per_vhost()
+    {
+        await using var engine = new RedisStreamRouteEngine(null!, ["/", "alt"], replayOnStart: false);
+
+        // Declare exchange + queue in each vhost.
+        engine.DeclareExchange(new ExchangeInfo("/", "fex", "direct"));
+        engine.DeclareQueue(new QueueInfo("/", "q"));
+        engine.Bind("/", "fex", "q", "rk");
+
+        engine.DeclareExchange(new ExchangeInfo("alt", "fex", "direct"));
+        engine.DeclareQueue(new QueueInfo("alt", "q"));
+        engine.Bind("alt", "fex", "q", "rk");
+
+        // Each vhost has its own exchange.
+        Assert.NotNull(engine.GetExchange("/", "fex"));
+        Assert.Equal("direct", engine.GetExchange("/", "fex")!.Type);
+        Assert.NotNull(engine.GetExchange("alt", "fex"));
+        Assert.Equal("direct", engine.GetExchange("alt", "fex")!.Type);
+
+        // Route isolation: routing in "/" does not affect "alt".
+        Assert.Equal(["q"], engine.RouteTo(engine.GetExchange("/", "fex")!, new ContentProperties(), "rk"));
+        Assert.Equal(["q"], engine.RouteTo(engine.GetExchange("alt", "fex")!, new ContentProperties(), "rk"));
+
+        // Enqueue in one vhost does not appear in the other.
+        engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 1 }, "fex", "rk");
+        var claimAlt = engine.TryClaimForGet("alt", "q", out var _, out var _);
+        Assert.Equal(GetClaimOutcome.Empty, claimAlt);
+    }
+
+    [Fact]
     public async Task Can_connect_and_declare_when_redis_available()
     {
         var db = TryConnectRedis();
@@ -139,9 +170,30 @@ public sealed class RedisStreamRouteEngineTests
             return; // Redis unavailable: skip gracefully
         }
 
-        await using var engine = new RedisStreamRouteEngine(db, "/", replayOnStart: false, drainerCapacity: 1024);
+        await using var engine = new RedisStreamRouteEngine(db, ["/"], replayOnStart: false, drainerCapacity: 1024);
         engine.DeclareExchange(new ExchangeInfo("/", "fex", "direct"));
         Assert.Equal("direct", engine.GetExchange("/", "fex")!.Type);
+    }
+
+    [Fact]
+    public async Task Eviction_gate_refuses_unsafe_policy()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        // Set an eviction policy that would discard durable data.
+        await db.ExecuteAsync("CONFIG", "SET", "maxmemory-policy", "allkeys-lru");
+
+        Assert.Throws<BrokerConfigurationException>(() =>
+            new RedisStreamRouteEngine(db, ["/"], replayOnStart: false, enforceEvictionGate: true));
+
+        // noeviction is permitted.
+        await db.ExecuteAsync("CONFIG", "SET", "maxmemory-policy", "noeviction");
+        await using var engine = new RedisStreamRouteEngine(db, ["/"], replayOnStart: false, enforceEvictionGate: true);
+        Assert.NotNull(engine);
     }
 
     [Fact]
@@ -157,7 +209,7 @@ public sealed class RedisStreamRouteEngineTests
         string vhost = $"/replay-test-{Guid.NewGuid():N}";
 
         // First engine: declare topology + enqueue messages.
-        await using var engine1 = new RedisStreamRouteEngine(db, vhost, replayOnStart: false, drainerCapacity: 1024);
+        await using var engine1 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 1024);
         engine1.DeclareExchange(new ExchangeInfo(vhost, "fex", "direct"));
         engine1.DeclareQueue(new QueueInfo(vhost, "q"));
         engine1.Bind(vhost, "fex", "q", "rk");
@@ -166,7 +218,7 @@ public sealed class RedisStreamRouteEngineTests
         await Task.Delay(500, TestContext.Current.CancellationToken); // give the drainer time to mirror writes to Redis
 
         // Second engine over the same Redis+vhost: replay should restore state.
-        await using var engine2 = new RedisStreamRouteEngine(db, vhost, replayOnStart: true, drainerCapacity: 1024);
+        await using var engine2 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: true, drainerCapacity: 1024);
         Assert.NotNull(engine2.GetExchange(vhost, "fex"));
         Assert.Equal("direct", engine2.GetExchange(vhost, "fex")!.Type);
         Assert.NotNull(engine2.GetQueue(vhost, "q"));
@@ -187,7 +239,7 @@ public sealed class RedisStreamRouteEngineTests
     {
         // Bounded channel: small capacity, no Redis to drain, rapid enqueues
         // should not block or grow unbounded (in-memory state stays correct).
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false, drainerCapacity: 4);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false, drainerCapacity: 4);
         engine.DeclareQueue(new QueueInfo("/", "q"));
         for (int i = 0; i < 100; i++)
         {

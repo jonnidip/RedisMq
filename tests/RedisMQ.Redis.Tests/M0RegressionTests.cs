@@ -28,7 +28,7 @@ public sealed class M0RegressionTests
     [Fact]
     public async Task Connect_authenticates_and_opens_a_channel()
     {
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
         await using var host = TestBrokerHost.Start(engine);
         await using var connection = await ConnectAsync(host);
         Assert.True(connection.IsOpen);
@@ -40,7 +40,7 @@ public sealed class M0RegressionTests
     [Fact]
     public async Task Declare_bind_publish_consume_round_trips()
     {
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
         await using var host = TestBrokerHost.Start(engine);
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
@@ -68,7 +68,7 @@ public sealed class M0RegressionTests
     [Fact]
     public async Task Qos_count_gate_admits_exactly_10_and_more_flow_after_acks()
     {
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
         await using var host = TestBrokerHost.Start(engine);
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
@@ -113,7 +113,7 @@ public sealed class M0RegressionTests
     [Fact]
     public async Task Nack_requeue_redelivers_with_redelivered_flag()
     {
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
         await using var host = TestBrokerHost.Start(engine);
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
@@ -150,7 +150,7 @@ public sealed class M0RegressionTests
     [Fact]
     public async Task BasicGet_returns_the_head_and_reports_empty_after()
     {
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
         await using var host = TestBrokerHost.Start(engine);
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
@@ -170,7 +170,7 @@ public sealed class M0RegressionTests
     [Fact]
     public async Task Publish_to_unknown_exchange_closes_the_channel_404()
     {
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
         await using var host = TestBrokerHost.Start(engine);
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
@@ -189,7 +189,7 @@ public sealed class M0RegressionTests
     [Fact]
     public async Task Clean_close_rides_no_errors()
     {
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
         await using var host = TestBrokerHost.Start(engine);
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
@@ -202,7 +202,7 @@ public sealed class M0RegressionTests
     [Fact]
     public async Task Publisher_confirm_select_and_ack()
     {
-        await using var engine = new RedisStreamRouteEngine(null!, "/", replayOnStart: false);
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
         await using var host = TestBrokerHost.Start(engine);
         await using var connection = await ConnectAsync(host);
 
