@@ -165,8 +165,16 @@ public sealed class InMemoryEngine : IRouteEngine
         ArgumentNullException.ThrowIfNull(body);
         lock (_lock)
         {
+            // Parse AMQP expiration (milliseconds as string) to DateTimeOffset.
+            DateTimeOffset? expiration = null;
+            if (!string.IsNullOrEmpty(properties.Expiration) &&
+                long.TryParse(properties.Expiration, out var ms))
+            {
+                expiration = DateTimeOffset.FromUnixTimeMilliseconds(ms);
+            }
+
             InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
-            delivery.AppendAlreadyLocked(new InMemoryMessage(properties, DefensiveCopy(body), exchange, routingKey, ++_lastEnvelopeId));
+            delivery.AppendAlreadyLocked(new InMemoryMessage(properties, DefensiveCopy(body), exchange, routingKey, ++_lastEnvelopeId, Expiration: expiration));
             delivery.WakeAlreadyLocked();
         }
     }
@@ -333,6 +341,62 @@ public sealed class InMemoryEngine : IRouteEngine
                 delivery.WakeAlreadyLocked();
             }
         }
+    }
+
+    /// <summary>Deletes a queue and all its messages. Internal: used by M1's
+    /// RedisStreamRouteEngine for exclusive/auto-delete reconciliation.</summary>
+    internal void DeleteQueue(string vhost, string queue)
+    {
+        lock (_lock)
+        {
+            _queues.Remove((vhost, queue));
+            _delivery.Remove((vhost, queue));
+        }
+    }
+
+    /// <summary>Returns a queue's expiration time, or null if none was set.</summary>
+    internal DateTimeOffset? GetQueueExpiry(string vhost, string queue)
+    {
+        lock (_lock)
+        {
+            if (_queues.TryGetValue((vhost, queue), out QueueInfo? qi))
+            {
+                return qi.Expiration;
+            }
+            return null;
+        }
+    }
+
+    /// <summary>Removes expired messages from all queues' ready buffers.
+    /// Messages whose <see cref="InMemoryMessage.Expiration"/> is in the past
+    /// are dropped. Used by M1's reaper. Unacked-ledger expiry is handled
+    /// per-channel in ChannelContext, not here.</summary>
+    internal void RemoveExpiredReadyMessages()
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_lock)
+        {
+            foreach ((string Vhost, string Queue) key in _delivery.Keys)
+            {
+                _delivery[key].RemoveExpiredMessages(now);
+            }
+        }
+    }
+
+    /// <summary>Connection teardown reconciliation: M0's in-memory engine has no
+    /// connection-aware queue ownership, so this is a no-op. M1's
+    /// RedisStreamRouteEngine implements it fully.</summary>
+    public void ReconcileConnection(string connectionId)
+    {
+        // M0: no connection-tracking of queues, nothing to clean up.
+    }
+
+    /// <summary>Records exclusive queue ownership. M0's in-memory engine has no
+    /// connection-aware queue ownership, so this is a no-op. M1's
+    /// RedisStreamRouteEngine implements it fully.</summary>
+    public void RegisterExclusiveQueueOwner(string vhost, string queue, string connectionId)
+    {
+        // M0: no connection-tracking of queues, nothing to clean up.
     }
 
     /// <summary>The body bytes are handed to (or out of) the store solely through

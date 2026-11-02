@@ -99,6 +99,13 @@ public sealed record WriteCommand
         ConsumerTag = consumerTag,
     };
 
+    public static WriteCommand DeleteQueue(string vhost, string queue) => new()
+    {
+        Kind = WriteCommandKind.DeleteQueue,
+        Vhost = vhost,
+        Queue = queue,
+    };
+
     public static WriteCommand Requeue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties, bool redelivered) => new()
     {
         Kind = WriteCommandKind.Requeue,
@@ -150,6 +157,10 @@ public sealed record WriteCommand
             case WriteCommandKind.RegisterConsumer or WriteCommandKind.UnregisterConsumer:
                 fields.Add(("queue", Queue ?? string.Empty));
                 fields.Add(("consumer-tag", ConsumerTag ?? string.Empty));
+                break;
+
+            case WriteCommandKind.DeleteQueue:
+                fields.Add(("queue", Queue ?? string.Empty));
                 break;
 
             case WriteCommandKind.Enqueue or WriteCommandKind.Requeue:
@@ -223,6 +234,10 @@ public sealed record WriteCommand
                 dict.GetValueOrDefault("queue") ?? string.Empty,
                 dict.GetValueOrDefault("consumer-tag") ?? string.Empty),
 
+            WriteCommandKind.DeleteQueue => DeleteQueue(
+                vhost,
+                dict.GetValueOrDefault("queue") ?? string.Empty),
+
             _ => throw new InvalidOperationException($"Unknown write command kind: {kind}"),
         };
     }
@@ -238,4 +253,5 @@ public enum WriteCommandKind
     RegisterConsumer,
     UnregisterConsumer,
     Requeue,
+    DeleteQueue,
 }

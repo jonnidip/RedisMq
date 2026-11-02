@@ -257,4 +257,81 @@ public sealed class RedisStreamRouteEngineTests
 
         Assert.True(claimed > 0);
     }
+
+    [Fact]
+    public void Remove_expired_messages_from_ready_buffer()
+    {
+        // InMemoryEngine removes expired messages from ready buffers.
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareQueue(new QueueInfo("/", "q"));
+        engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 1 }, "fex", "rk");
+        engine.Enqueue("/", "q", new ContentProperties() { Expiration = "0" }, new byte[] { 2 }, "fex", "rk");
+        engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 3 }, "fex", "rk");
+
+        engine.RemoveExpiredReadyMessages();
+
+        // Only non-expired messages remain.
+        var claim1 = engine.TryClaimForGet("/", "q", out var m1, out var _);
+        Assert.Equal(GetClaimOutcome.Claimed, claim1);
+        Assert.Equal(1UL, m1!.EnvelopeId);
+        var claim2 = engine.TryClaimForGet("/", "q", out var m2, out var _);
+        Assert.Equal(GetClaimOutcome.Claimed, claim2);
+        Assert.Equal(3UL, m2!.EnvelopeId);
+        var claim3 = engine.TryClaimForGet("/", "q", out var _, out var _);
+        Assert.Equal(GetClaimOutcome.Empty, claim3);
+    }
+
+    [Fact]
+    public void Expiration_field_roundtrips_on_InMemoryMessage()
+    {
+        var exp = DateTimeOffset.UtcNow.AddMinutes(5);
+        var msg = new InMemoryMessage(
+            new ContentProperties(),
+            new byte[] { 1 },
+            "fex",
+            "rk",
+            42,
+            false,
+            exp);
+        Assert.Equal(exp, msg.Expiration);
+    }
+
+    [Fact]
+    public async Task ReconcileConnection_deletes_exclusive_queue_on_connection_drop()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/excl-test-{Guid.NewGuid():N}";
+
+        // Two engines over the same Redis to simulate two connections sharing Redis.
+        await using var engine1 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 1024);
+        await using var engine2 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 1024);
+
+        // Engine A declares an exclusive queue.
+        engine1.DeclareQueue(new QueueInfo(vhost, "excl-q", Exclusive: true));
+        Assert.NotNull(engine1.GetQueue(vhost, "excl-q"));
+
+        // Engine A registers an exclusive consumer (simulating ownership).
+        var consumer = new TestConsumer("consumer-A");
+        var regResult = engine1.RegisterConsumer(vhost, "excl-q", consumer);
+        Assert.Equal(ConsumeRegisterOutcome.Registered, regResult);
+
+        // Engine A drops its connection → ReconcileConnection deletes the exclusive queue.
+        engine1.ReconcileConnection("conn-A");
+
+        // Engine B should no longer see the queue.
+        Assert.Null(engine2.GetQueue(vhost, "excl-q"));
+    }
+
+    private sealed class TestConsumer(string tag) : IQueueConsumer
+    {
+        public string ConsumerTag => tag;
+        public bool IsExclusive => true;
+        public bool TryAdmitForDelivery(InMemoryMessage message) => true;
+        public Task DrainDeliveryWritesAsync() => Task.CompletedTask;
+    }
 }

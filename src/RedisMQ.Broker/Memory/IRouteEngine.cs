@@ -25,7 +25,8 @@ public sealed record QueueInfo(
     string Name,
     bool Durable = false,
     bool Exclusive = false,
-    bool AutoDelete = false);
+    bool AutoDelete = false,
+    DateTimeOffset? Expiration = null);
 
 /// <summary>
 /// What <c>RegisterConsumer</c> decided about a consume request the channel ran:
@@ -154,4 +155,19 @@ public interface IRouteEngine
     /// a credit-freeing or prefetch-raising path on the channel needs (a pump that
     /// idled out on a full gate must be re-spawned by whoever frees credit).</summary>
     void Nudge(string vhost, string queue);
+
+    /// <summary>Connection teardown reconciliation: deletes exclusive queues owned by
+    /// <paramref name="connectionId"/> and auto-delete queues whose last consumer
+    /// has disconnected. Called by <see cref="WireConnection"/> on connection end.
+    /// M0's <see cref="InMemoryEngine"/> implements this as a no-op; M1's
+    /// <see cref="RedisStreamRouteEngine"/> implements it fully.
+    /// </summary>
+    void ReconcileConnection(string connectionId);
+
+    /// <summary>
+    /// Records that <paramref name="connectionId"/> owns an exclusive queue.
+    /// Called by <see cref="WireConnection"/> when a channel declares an exclusive
+    /// queue on its connection.
+    /// </summary>
+    void RegisterExclusiveQueueOwner(string vhost, string queue, string connectionId);
 }

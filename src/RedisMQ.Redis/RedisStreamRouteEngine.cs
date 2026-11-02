@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Text.Json;
 using System.Threading.Channels;
 using RedisMQ.Broker.Codec;
@@ -22,6 +23,11 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     private readonly Channel<WriteCommand>? _channel;
     private readonly Task? _drainerTask;
     private readonly CancellationTokenSource _stopCts = new();
+
+    // Exclusive queue ownership and auto-delete consumer tracking for connection
+    // teardown reconciliation.
+    private readonly Dictionary<(string Vhost, string Queue), string> _exclusiveQueues = [];
+    private readonly Dictionary<(string Vhost, string Queue), HashSet<string>> _autoDeleteQueues = [];
 
     /// <summary>
     /// Creates the engine. <paramref name="redis"/> may be null (e.g. Redis
@@ -88,6 +94,16 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     {
         var prior = _memory.DeclareQueue(queue);
         EnqueueCommand(WriteCommand.DeclareQueue(queue.Vhost, queue.Name, queue.Durable, queue.Exclusive, queue.AutoDelete));
+
+        // Track exclusive queue ownership for connection teardown reconciliation.
+        if (queue.Exclusive)
+        {
+            lock (_exclusiveQueues)
+            {
+                _exclusiveQueues[(queue.Vhost, queue.Name)] = queue.Name;
+            }
+        }
+
         return prior;
     }
 
@@ -122,11 +138,57 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         EnqueueCommand(WriteCommand.UnregisterConsumer(vhost, queue, consumerTag));
     }
 
+    /// <summary>
+    /// Records that <paramref name="connectionId"/> owns an exclusive queue.
+    /// Called by <see cref="WireConnection"/> when a channel declares an exclusive
+    /// queue on its connection.
+    /// </summary>
+    public void RegisterExclusiveQueueOwner(string vhost, string queue, string connectionId)
+    {
+        lock (_exclusiveQueues)
+        {
+            _exclusiveQueues[(vhost, queue)] = connectionId;
+        }
+    }
+
     public void Requeue(string vhost, string queue, InMemoryMessage message)
     {
         _memory.Requeue(vhost, queue, message);
         EnqueueCommand(WriteCommand.Requeue(vhost, queue, message.EnvelopeId, message.Exchange, message.RoutingKey,
             message.Body, message.Props, message.Redelivered));
+    }
+
+    /// <summary>
+    /// Connection teardown reconciliation: deletes exclusive queues owned by this
+    /// connection and auto-delete queues whose last consumer has disconnected.
+    /// </summary>
+    public void ReconcileConnection(string connectionId)
+    {
+        lock (_exclusiveQueues)
+        {
+            var queuesToDelete = _exclusiveQueues.Keys.ToList();
+            foreach (var (vhost, queue) in queuesToDelete)
+            {
+                _memory.DeleteQueue(vhost, queue);
+                _exclusiveQueues.Remove((vhost, queue));
+                EnqueueCommand(WriteCommand.DeleteQueue(vhost, queue));
+            }
+        }
+
+        lock (_autoDeleteQueues)
+        {
+            var queuesToDelete = _autoDeleteQueues
+                .Where(kv => kv.Value.Remove(connectionId) && kv.Value.Count == 0)
+                .Select(kv => kv.Key)
+                .ToList();
+
+            foreach (var (vhost, queue) in queuesToDelete)
+            {
+                _memory.DeleteQueue(vhost, queue);
+                _autoDeleteQueues.Remove((vhost, queue));
+                EnqueueCommand(WriteCommand.DeleteQueue(vhost, queue));
+            }
+        }
     }
 
     // ---------- drainer ----------

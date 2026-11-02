@@ -19,4 +19,5 @@ public sealed record InMemoryMessage(
     string Exchange,
     string RoutingKey,
     ulong EnvelopeId,
-    bool Redelivered = false);
+    bool Redelivered = false,
+    DateTimeOffset? Expiration = null);

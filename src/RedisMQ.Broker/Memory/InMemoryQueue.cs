@@ -75,6 +75,19 @@ internal sealed class InMemoryQueue
         return true;
     }
 
+    /// <summary>Removes expired messages from the ready buffer. Messages whose
+    /// <see cref="InMemoryMessage.Expiration"/> is in the past are dropped.</summary>
+    internal void RemoveExpiredMessages(DateTimeOffset now)
+    {
+        for (int i = _ready.Count - 1; i >= 0; i--)
+        {
+            if (_ready[i].Expiration is DateTimeOffset exp && exp <= now)
+            {
+                _ready.RemoveAt(i);
+            }
+        }
+    }
+
     /// <summary>Registers a consumer at the registry tail (registration order = the
     /// round-robin cycle) and arms the pump. Caller holds the engine gate.</summary>
     internal void RegisterConsumerAlreadyLocked(IQueueConsumer consumer)
