@@ -54,36 +54,27 @@ public sealed class WireFlowTests
     }
 
     [Fact]
-    public async Task Channel_flow_false_hard_closes_the_connection_with_540()
+    public async Task Channel_flow_false_pauses_the_channel_instead_of_closing_the_connection()
     {
         await using TestBrokerHost host = TestBrokerHost.Start();
         await using SocketWireClient client = await ConnectAsync(host);
 
         await HandshakeAsync(client);
 
-        // channel.flow(active=false) → hard connection.close(10, 50), code 540,
-        // text NOT_IMPLEMENTED - active=false, class/method 20/20.
+        // channel.flow(active=false) → channel.flow-ok(active=false); the channel and
+        // the connection stay open (M3 turns the M0 hard close into a per-channel pause).
         await client.SendAsync(MethodFrameOn(1, ChannelFlowFrame(1, active: false)));
+        AmqpMethod paused = await client.ReadMethodOnChannelAsync(1, 20, 21);
+        Assert.Equal(false, paused.Get("active"));
 
-        AmqpMethod close = await client.ReadMethodAsync(10, 50);
-        Assert.Equal(540, (ushort)(short)close.Get("reply-code")!);
-        Assert.Equal(
-            "NOT_IMPLEMENTED - active=false",
-            (string)close.Get("reply-text")!);
-        Assert.Equal(20, (ushort)(short)close.Get("class-id")!);
-        Assert.Equal(20, (ushort)(short)close.Get("method-id")!);
+        // Still alive: a second channel opens normally on the same connection.
+        await client.SendAsync(MethodFrameOn(2, ChannelOpenFrame()));
+        _ = await client.ReadMethodOnChannelAsync(2, 20, 11);
 
-        // Ack the server's close with close-ok; the server then completes the transport.
-        await client.SendAsync(MethodFrameOn(0, ChannelCloseOkFrame()));
-
-        // The TCP connection is now dead: any read hits EOF.
-        await Assert.ThrowsAsync<IOException>(async () =>
-        {
-            byte[] probe = new byte[1];
-            int read = await client._stream!.ReadAsync(probe, 0, 1, TestContext.Current.CancellationToken);
-            if (read == 0)
-                throw new IOException("EOF");
-        });
+        // And flow can be resumed on the paused channel.
+        await client.SendAsync(MethodFrameOn(1, ChannelFlowFrame(1, active: true)));
+        AmqpMethod resumed = await client.ReadMethodOnChannelAsync(1, 20, 21);
+        Assert.Equal(true, resumed.Get("active"));
     }
 
     // ---------- handshake and wire helpers ----------

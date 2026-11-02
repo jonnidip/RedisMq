@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.IO.Pipelines;
@@ -13,38 +13,38 @@ using Xunit;
 namespace RedisMQ.Broker.Tests;
 
 // Channel FSM + in-memory topology (Task 5): the same "evil client" harness shape as
-// ConnectionFsmTests — raw frames over an in-proc TransportPair wired into an
-// AmqpBrokerServer running the REAL InMemoryEngine — pinned by concrete wire
+// ConnectionFsmTests â€” raw frames over an in-proc TransportPair wired into an
+// AmqpBrokerServer running the REAL InMemoryEngine â€” pinned by concrete wire
 // semantics read out of the RabbitMQ server sources (master, 4.x):
 //
-//   rabbit_channel.erl      — channel FSM clauses (starting/running/closing),
+//   rabbit_channel.erl      â€” channel FSM clauses (starting/running/closing),
 //                             "second 'channel.open' seen" and "expected
 //                             'channel.open'" as channel_error (hard 504),
-//                             channel.flow(true) → flow-ok(true) with
-//                             flow(false) → not_implemented "active=false",
+//                             channel.flow(true) â†’ flow-ok(true) with
+//                             flow(false) â†’ not_implemented "active=false",
 //                             a mourning (server channel.close) channel that
 //                             discards traffic and repeats close-ok, declare/
 //                             bind fan-out and return semantics,
 //                             most_recently_declared_queue ("" queue shortcut).
-//   rabbit_exchange.erl     — check_type ("unknown exchange type") and
-//                             assert_equivalence order type→durable→
-//                             auto-delete→internal.
-//   rabbit_amqqueue.erl     — assert_equivalence order exclusive-access(durably,
-//                             resource_locked wording first)→durable→auto-delete,
+//   rabbit_exchange.erl     â€” check_type ("unknown exchange type") and
+//                             assert_equivalence order typeâ†’durableâ†’
+//                             auto-deleteâ†’internal.
+//   rabbit_amqqueue.erl     â€” assert_equivalence order exclusive-access(durably,
+//                             resource_locked wording first)â†’durableâ†’auto-delete,
 //                             not_found "no {kind} '{name}' in vhost '{vhost}'".
-//   rabbit_reader.erl       — per-channel command assembly, heartbeat on a
-//                             non-zero channel → unexpected_frame ("type N, all
+//   rabbit_reader.erl       â€” per-channel command assembly, heartbeat on a
+//                             non-zero channel â†’ unexpected_frame ("type N, all
 //                             octets = ...") anywhere, channel.close_ok retiring
 //                             the channel number so it can be re-opened.
-//   rabbit_command_assembler.erl — "expected method frame, got non method
+//   rabbit_command_assembler.erl â€” "expected method frame, got non method
 //                             frame instead" when content arrives with no
 //                             pending content-bearing method.
-//   rabbit_binary_generator.erl  — map_exception: soft codes close the channel
+//   rabbit_binary_generator.erl  â€” map_exception: soft codes close the channel
 //                             (channel.close on that channel), hard codes close
 //                             the connection (connection.close on channel 0).
 //
 // Soft codes (channel close): 311/403/404/405/406. Hard codes (connection close):
-// 320/402/501/502/503/504/505/506/530/540/541. No mocks beyond the transport —
+// 320/402/501/502/503/504/505/506/530/540/541. No mocks beyond the transport â€”
 // the codec under test produces and consumes the same bytes on both ends.
 public sealed class ChannelTopologyTests
 {
@@ -102,7 +102,7 @@ public sealed class ChannelTopologyTests
         }
     }
 
-    // ---------- (c) redeclare mismatch → channel.close(precondition-failed) ----------
+    // ---------- (c) redeclare mismatch â†’ channel.close(precondition-failed) ----------
 
     [Fact]
     public async Task Redeclare_with_mismatched_durable_flag_closes_the_channel_with_precondition_failed()
@@ -173,7 +173,7 @@ public sealed class ChannelTopologyTests
     public async Task Queue_redeclare_with_mismatched_exclusive_flag_closes_with_resource_locked_first()
     {
         // RabbitMQ's queue equivalence runs exclusive-access first (resource_locked
-        // 405 wording) before durable/auto-delete — pinned with BOTH flags changed:
+        // 405 wording) before durable/auto-delete â€” pinned with BOTH flags changed:
         // the 405 must arrive, not the 406 the durable mismatch would produce.
         (AmqpBrokerServer server, WireClient client, _) = SpawnServer(NewOptions());
         try
@@ -345,7 +345,7 @@ public sealed class ChannelTopologyTests
             // server wrongly answered, the strict reads below would mismatch.
             await client.SendAsync(MethodFrameOn(1, QueueDeclareFrame(1, "discarded", durable: true)));
 
-            // channel.close during mourning → close-ok again, channel still closing.
+            // channel.close during mourning â†’ close-ok again, channel still closing.
             await client.SendAsync(MethodFrameOn(1, ClientChannelCloseFrame(1)));
             _ = await client.ReadMethodOnChannelAsync(1, 20, 41);
 
@@ -365,7 +365,7 @@ public sealed class ChannelTopologyTests
     {
         // Brief (e) reading B (RabbitMQ-true): once the client closed the channel
         // cleanly, the number is retired; a further method on it starts a fresh
-        // starting-state channel that only accepts channel.open → hard 504.
+        // starting-state channel that only accepts channel.open â†’ hard 504.
         (AmqpBrokerServer server, WireClient client, _) = SpawnServer(NewOptions());
         try
         {
@@ -465,7 +465,7 @@ public sealed class ChannelTopologyTests
             _ = await client.ReadMethodOnChannelAsync(2, 20, 11);
 
             // Two declares in flight at once, one per channel. The M0 pump answers
-            // serially, so the replies arrive in processing order — but each reply
+            // serially, so the replies arrive in processing order â€” but each reply
             // must stay on its own channel: the strict channel discriminator fails
             // any cross-channel reply here, which is the no-cross-talk contract.
             await client.SendAsync(MethodFrameOn(1, ExchangeDeclareFrame(1, "ex1", durable: true)));
@@ -689,7 +689,7 @@ public sealed class ChannelTopologyTests
     }
 
     [Fact]
-    public async Task Channel_flow_active_false_closes_the_connection_with_not_implemented()
+    public async Task Channel_flow_active_false_replies_flow_ok_and_pauses_delivery()
     {
         (AmqpBrokerServer server, WireClient client, _) = SpawnServer(NewOptions());
         try
@@ -699,10 +699,15 @@ public sealed class ChannelTopologyTests
             await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
             _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
 
+            // M3: channel.flow(false) is a per-channel pause, not a connection close.
+            // The channel stays open and echoes flow-ok with active=false.
             await client.SendAsync(MethodFrameOn(1, ChannelFlowFrame(1, active: false)));
-            (ushort code, string text) close = await ReadConnectionCloseCodeTextAsync(client);
-            Assert.Equal(AmqpConstants.NotImplemented, close.code);
-            Assert.Equal("NOT_IMPLEMENTED - active=false", close.text);
+            AmqpMethod flowOk = await client.ReadMethodOnChannelAsync(1, 20, 21);
+            Assert.Equal(false, flowOk.Get("active"));
+
+            // The channel is still alive: a subsequent method answers normally.
+            await client.SendAsync(MethodFrameOn(1, ExchangeDeclareFrame(1, "still-alive", durable: false)));
+            _ = await client.ReadMethodOnChannelAsync(1, 40, 11);
         }
         finally
         {
@@ -719,7 +724,7 @@ public sealed class ChannelTopologyTests
         // assembler is in "expect method" state: any content frame is an
         // UNEXPECTED_FRAME close with the rabbit_command_assembler wording. Task 6
         // moved this to a CHANNEL-level soft close (the M0 pin; RabbitMQ 4.4's own
-        // error classes actually make it a hard connection close — report note D1).
+        // error classes actually make it a hard connection close â€” report note D1).
         (AmqpBrokerServer server, WireClient client, _) = SpawnServer(NewOptions());
         try
         {
@@ -747,7 +752,7 @@ public sealed class ChannelTopologyTests
     {
         // The Task 6 fix restoration of the Task 4/5 wire truth: a channel number
         // that never saw channel.open gets NO context born for a stray content
-        // frame — the connection itself closes hard (no channel.close, no mourning,
+        // frame â€” the connection itself closes hard (no channel.close, no mourning,
         // no Starting channel created from content). Note the partition pinned in
         // the Task 6 fix report: an OPENED RUNNING channel's stray content stays
         // the channel-level soft close (the test above).
@@ -981,7 +986,7 @@ public sealed class ChannelTopologyTests
     public async Task Non_empty_declare_arguments_are_refused_with_not_implemented()
     {
         // M0 refuses arguments on non-passive declares/ binds outright (hard 540,
-        // not_implemented per the fixture class) — a flagged RabbitMQ deviation:
+        // not_implemented per the fixture class) â€” a flagged RabbitMQ deviation:
         // real RabbitMQ accepts and validates declare arguments.
         (AmqpBrokerServer server, WireClient client, _) = SpawnServer(NewOptions());
         try
@@ -1539,6 +1544,118 @@ public sealed class ChannelTopologyTests
             return MethodCodec.ReadMethod(ref reader, schema);
         }
     }
+
+    // ---------- M3: topic / headers exchanges and x-max-length over the wire ----------
+
+    [Fact]
+    public async Task Topic_exchange_declare_bind_and_route_over_the_wire()
+    {
+        (AmqpBrokerServer server, WireClient client, InMemoryEngine engine) = SpawnServer(NewOptions());
+        try
+        {
+            await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41);
+            await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
+
+            await client.SendAsync(MethodFrameOn(1, ExchangeDeclareFrame(1, "t", durable: false, type: "topic")));
+            _ = await client.ReadMethodOnChannelAsync(1, 40, 11);
+            await client.SendAsync(MethodFrameOn(1, QueueDeclareFrame(1, "topic-q-a")));
+            _ = await client.ReadMethodOnChannelAsync(1, 50, 11);
+            await client.SendAsync(MethodFrameOn(1, QueueDeclareFrame(1, "topic-q-b")));
+            _ = await client.ReadMethodOnChannelAsync(1, 50, 11);
+
+            await client.SendAsync(MethodFrameOn(1, QueueBindFrame(1, "topic-q-a", "t", "a.#")));
+            _ = await client.ReadMethodOnChannelAsync(1, 50, 21);
+            await client.SendAsync(MethodFrameOn(1, QueueBindFrame(1, "topic-q-b", "t", "*.b")));
+            _ = await client.ReadMethodOnChannelAsync(1, 50, 21);
+
+            ExchangeInfo topic = engine.GetExchange("/", "t")!;
+            Assert.Equal("topic", topic.Type);
+            Assert.Equal(["topic-q-a", "topic-q-b"], engine.RouteTo(topic, new ContentProperties(), "a.b"));
+            Assert.Equal(["topic-q-a"], engine.RouteTo(topic, new ContentProperties(), "a")); // # matches zero words
+            Assert.Empty(engine.RouteTo(topic, new ContentProperties(), "x.c"));
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
+    [Fact]
+    public async Task Headers_exchange_binding_arguments_are_stored_and_matched()
+    {
+        (AmqpBrokerServer server, WireClient client, InMemoryEngine engine) = SpawnServer(NewOptions());
+        try
+        {
+            await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41);
+            await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
+
+            await client.SendAsync(MethodFrameOn(1, ExchangeDeclareFrame(1, "h", durable: false, type: "headers")));
+            _ = await client.ReadMethodOnChannelAsync(1, 40, 11);
+            await client.SendAsync(MethodFrameOn(1, QueueDeclareFrame(1, "headers-q")));
+            _ = await client.ReadMethodOnChannelAsync(1, 50, 11);
+
+            // Queue.bind carries its arguments to the engine (M3 removed the M0 refusal).
+            var bindingArgs = new FieldTable([
+                new("x-match", FieldValue.From("all")),
+                new("color", FieldValue.From("red")),
+            ]);
+            await client.SendAsync(MethodFrameOn(1, QueueBindFrame(1, "headers-q", "h", "", bindingArgs)));
+            _ = await client.ReadMethodOnChannelAsync(1, 50, 21);
+
+            ExchangeInfo headers = engine.GetExchange("/", "h")!;
+            Assert.Equal("headers", headers.Type);
+
+            var matching = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("red"))]) };
+            Assert.Equal(["headers-q"], engine.RouteTo(headers, matching, ""));
+
+            var wrongValue = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("blue"))]) };
+            Assert.Empty(engine.RouteTo(headers, wrongValue, ""));
+
+            var missing = new ContentProperties();
+            Assert.Empty(engine.RouteTo(headers, missing, ""));
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
+    [Fact]
+    public async Task Queue_declare_with_x_max_length_bounds_the_queue_over_the_wire()
+    {
+        (AmqpBrokerServer server, WireClient client, InMemoryEngine engine) = SpawnServer(NewOptions());
+        try
+        {
+            await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41);
+            await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
+
+            var args = new FieldTable([new("x-max-length", FieldValue.From(2))]);
+            await client.SendAsync(MethodFrameOn(1, QueueDeclareFrame(1, "bounded-q", arguments: args)));
+            _ = await client.ReadMethodOnChannelAsync(1, 50, 11);
+
+            Assert.Equal(2, engine.GetQueue("/", "bounded-q")!.MaxLength);
+
+            engine.Enqueue("/", "bounded-q", new ContentProperties(), new byte[] { 1 }, "", "bounded-q");
+            engine.Enqueue("/", "bounded-q", new ContentProperties(), new byte[] { 2 }, "", "bounded-q");
+            engine.Enqueue("/", "bounded-q", new ContentProperties(), new byte[] { 3 }, "", "bounded-q");
+
+            Assert.Equal(GetClaimOutcome.Claimed, engine.TryClaimForGet("/", "bounded-q", out InMemoryMessage? first, out _));
+            Assert.Equal(new byte[] { 2 }, first!.Body);
+            Assert.Equal(GetClaimOutcome.Claimed, engine.TryClaimForGet("/", "bounded-q", out InMemoryMessage? second, out _));
+            Assert.Equal(new byte[] { 3 }, second!.Body);
+            Assert.Equal(GetClaimOutcome.Empty, engine.TryClaimForGet("/", "bounded-q", out _, out _));
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
 }
 
 // In-memory route engine unit tests (Task 5): direct stores, bindings and the
@@ -1645,7 +1762,7 @@ public sealed class InMemoryRouteEngineTests
     // atomic creation-only compare-and-set under the engine's single lock, so of
     // two racing first-declares of one (vhost, name) exactly one call creates the
     // record (null return) and the other receives the winner's unchanged record
-    // for its channel-side equivalence check — last-write-wins is unreachable.
+    // for its channel-side equivalence check â€” last-write-wins is unreachable.
 
     [Fact]
     public async Task Racing_creates_of_the_same_exchange_with_different_flags_keep_the_winner()
@@ -1671,7 +1788,7 @@ public sealed class InMemoryRouteEngineTests
             Assert.Equal(1, creations);
 
             // The loser's non-null return IS the winner's record, and the store
-            // still holds that same instance — the loser did not overwrite it.
+            // still holds that same instance â€” the loser did not overwrite it.
             ExchangeInfo winner = (results[0] ?? results[1])!;
             Assert.Same(winner, engine.GetExchange("/", "race-x"));
         }
@@ -1751,4 +1868,5 @@ public sealed class InMemoryRouteEngineTests
             Assert.Equal(first, engine.GetQueue("/", "race-q"));
         }
     }
+
 }

@@ -856,45 +856,118 @@ public sealed class ConsumeTests
         try
         {
             await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41); // connection.open-ok
             await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
             _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
 
-            // Declare queue through default exchange (routing key = queue name)
-            await client.SendAsync(MethodFrameOn(1, QueueDeclareFrame(1, "q", durable: false)));
-            _ = await client.ReadMethodOnChannelAsync(1, 50, 11);
+            // A no-ack consumer rides past the credit gate, so the only thing that can
+            // withhold a delivery is channel flow.
+            await LoadAsync(client, 1, "q", "m-one");
+            await client.SendAsync(MethodFrameOn(1, ConsumeFrame(1, "q", consumerTag: "ct", noAck: true)));
+            _ = await client.ReadMethodOnChannelAsync(1, 60, 21); // consume-ok
+            (AmqpMethod first, ContentHeader _, byte[] firstBody) = await ReadDeliverAsync(client, 1);
+            Assert.Equal("m-one", Encoding.UTF8.GetString(firstBody));
 
-            // Publish a message through default exchange
-            await client.SendAsync(MethodFrameOn(1, PublishFrame(channel: 1, exchange: "", routingKey: "q")));
-            await client.SendAsync(ContentHeaderFrameOn(1, body: 1, properties: new ContentProperties()));
-            await client.SendAsync(BodyFrameOn(1, new byte[] { 42 }));
-
-            // channel.flow(active=false) pauses delivery
+            // Pause the channel: flow(false) answers flow-ok(active=false) and gates
+            // consumer admissions while leaving the channel open.
             await client.SendAsync(MethodFrameOn(1, ChannelFlowFrame(1, active: false)));
             AmqpMethod flowOk = await client.ReadMethodOnChannelAsync(1, 20, 21);
             Assert.False((bool)flowOk.Get("active")!);
 
-            // basic.get should be paused - no message delivered
-            await client.SendAsync(MethodFrameOn(1, GetFrame(1, "q")));
-            AmqpMethod getOk = await client.ReadMethodOnChannelAsync(1, 60, 71);
-            Assert.Equal(0, (int)getOk.Get("message-count")!);
-            (ContentHeader _, byte[] body) = await client.ReadContentOnChannelAsync(1);
-            Assert.Empty(body);
+            // Publish while paused. The passive declare is the in-order sync point that
+            // proves the publish was fully processed by the channel.
+            await LoadUnfencedAsync(client, 1, "q", "m-two");
+            await FenceAsync(client, 1, "q");
 
-            // Resume flow
+            // Absence check: nothing may be delivered while flow is off.
+            Assert.Null(await client.TryReadMethodOnChannelAsync(1, 150));
+
+            // Resume: the queued message is pumped out without any further publish.
             await client.SendAsync(MethodFrameOn(1, ChannelFlowFrame(1, active: true)));
             flowOk = await client.ReadMethodOnChannelAsync(1, 20, 21);
             Assert.True((bool)flowOk.Get("active")!);
+            (AmqpMethod second, ContentHeader _, byte[] secondBody) = await ReadDeliverAsync(client, 1);
+            Assert.Equal("m-two", Encoding.UTF8.GetString(secondBody));
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
 
-            // Now basic.get should return the message
+    [Fact]
+    public async Task Delivery_tags_are_one_monotonic_sequence_across_get_and_consume()
+    {
+        (AmqpBrokerServer server, WireClient client, _) = SpawnServer();
+        try
+        {
+            await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41);
+            await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
+
+            await LoadAsync(client, 1, "q", "m-one", "m-two", "m-three");
+
+            // basic.get claims tag 1 and reports the two messages still ready.
             await client.SendAsync(MethodFrameOn(1, GetFrame(1, "q")));
-            getOk = await client.ReadMethodOnChannelAsync(1, 60, 71);
+            AmqpMethod getOk = await client.ReadMethodOnChannelAsync(1, 60, 71);
             Assert.Equal(1L, getOk.Get("delivery-tag"));
-            Assert.Equal(0, (int)getOk.Get("message-count")!);
-            (ContentHeader _, byte[] body2) = await client.ReadContentOnChannelAsync(1);
-            Assert.Equal(1, body2.Length);
-            Assert.Equal(42, body2[0]);
-
+            Assert.Equal(2, (int)getOk.Get("message-count")!);
+            (ContentHeader _, byte[] firstBody) = await client.ReadContentOnChannelAsync(1);
+            Assert.Equal("m-one", Encoding.UTF8.GetString(firstBody));
             await client.SendAsync(MethodFrameOn(1, AckFrame(1)));
+
+            // Consumer deliveries continue the SAME per-channel tag sequence (2, 3).
+            await client.SendAsync(MethodFrameOn(1, ConsumeFrame(1, "q", consumerTag: "ct", noAck: true)));
+            _ = await client.ReadMethodOnChannelAsync(1, 60, 21); // consume-ok
+
+            (AmqpMethod second, ContentHeader _, byte[] secondBody) = await ReadDeliverAsync(client, 1);
+            Assert.Equal(2L, second.Get("delivery-tag"));
+            Assert.Equal("m-two", Encoding.UTF8.GetString(secondBody));
+
+            (AmqpMethod third, ContentHeader _, byte[] thirdBody) = await ReadDeliverAsync(client, 1);
+            Assert.Equal(3L, third.Get("delivery-tag"));
+            Assert.Equal("m-three", Encoding.UTF8.GetString(thirdBody));
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
+    [Fact]
+    public async Task Raising_qos_frees_credit_and_unblocks_a_gated_pump()
+    {
+        (AmqpBrokerServer server, WireClient client, _) = SpawnServer();
+        try
+        {
+            await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41);
+            await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
+
+            await client.SendAsync(MethodFrameOn(1, QosFrame(prefetchCount: 1)));
+            _ = await client.ReadMethodOnChannelAsync(1, 60, 11); // qos-ok
+
+            await LoadAsync(client, 1, "q", "m-one", "m-two");
+            await client.SendAsync(MethodFrameOn(1, ConsumeFrame(1, "q", consumerTag: "ct")));
+            _ = await client.ReadMethodOnChannelAsync(1, 60, 21); // consume-ok
+
+            (AmqpMethod first, ContentHeader _, byte[] firstBody) = await ReadDeliverAsync(client, 1);
+            Assert.Equal(1L, first.Get("delivery-tag"));
+            Assert.Equal("m-one", Encoding.UTF8.GetString(firstBody));
+
+            // prefetch(1) holds m-two back until a slot frees; raising the limit to 2
+            // frees a slot without any ack, so the pump must resume on its own.
+            await client.SendAsync(MethodFrameOn(1, QosFrame(prefetchCount: 2)));
+            _ = await client.ReadMethodOnChannelAsync(1, 60, 11); // qos-ok
+
+            (AmqpMethod second, ContentHeader _, byte[] secondBody) = await ReadDeliverAsync(client, 1);
+            Assert.Equal(2L, second.Get("delivery-tag"));
+            Assert.Equal("m-two", Encoding.UTF8.GetString(secondBody));
+
+            await client.SendAsync(MethodFrameOn(1, AckFrame(1, multiple: true)));
+            await client.SendAsync(MethodFrameOn(1, AckFrame(2, multiple: true)));
         }
         finally
         {

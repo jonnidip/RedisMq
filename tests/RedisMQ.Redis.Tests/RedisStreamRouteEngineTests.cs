@@ -235,6 +235,58 @@ public sealed class RedisStreamRouteEngineTests
     }
 
     [Fact]
+    public async Task Replay_restores_headers_binding_arguments_and_max_length()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/replay-m3-{Guid.NewGuid():N}";
+
+        await using var engine1 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 1024);
+        engine1.DeclareExchange(new ExchangeInfo(vhost, "h", "headers"));
+        engine1.DeclareQueue(new QueueInfo(vhost, "q", MaxLength: 3));
+        var args = new FieldTable([
+            new("x-match", FieldValue.From("all")),
+            new("color", FieldValue.From("red")),
+        ]);
+        engine1.Bind(vhost, "h", "q", "", args);
+        await Task.Delay(500, TestContext.Current.CancellationToken); // let the drainer mirror the writes
+
+        await using var engine2 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: true, drainerCapacity: 1024);
+
+        // x-max-length survives the restart.
+        Assert.Equal(3, engine2.GetQueue(vhost, "q")!.MaxLength);
+
+        // Binding arguments survive too: only matching header sets route.
+        ExchangeInfo headers = engine2.GetExchange(vhost, "h")!;
+        var matching = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("red"))]) };
+        Assert.Equal(["q"], engine2.RouteTo(headers, matching, ""));
+        var other = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("blue"))]) };
+        Assert.Empty(engine2.RouteTo(headers, other, ""));
+    }
+
+    [Fact]
+    public void WriteCommand_roundtrips_m3_topology_fields()
+    {
+        var args = new FieldTable([
+            new("x-match", FieldValue.From("any")),
+            new("attempts", FieldValue.From(7)),
+        ]);
+        WriteCommand bind = WriteCommand.Bind("/", "h", "q", "", args);
+        WriteCommand decodedBind = WriteCommand.FromStreamFields(WriteCommandKind.Bind, bind.ToStreamFields());
+        Assert.Equal(args, decodedBind.Arguments);
+
+        WriteCommand declare = WriteCommand.DeclareQueue(
+            "/", "q", durable: true, exclusive: false, autoDelete: false, maxLength: 5);
+        WriteCommand decodedDeclare = WriteCommand.FromStreamFields(
+            WriteCommandKind.DeclareQueue, declare.ToStreamFields());
+        Assert.Equal(5, decodedDeclare.MaxLength);
+    }
+
+    [Fact]
     public async Task Drainer_channel_is_bounded()
     {
         // Bounded channel: small capacity, no Redis to drain, rapid enqueues
