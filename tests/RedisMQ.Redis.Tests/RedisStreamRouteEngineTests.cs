@@ -1,5 +1,8 @@
 using System.Text;
+using RedisMQ.Broker.Codec;
+using RedisMQ.Broker.Memory;
 using RedisMQ.Redis;
+using StackExchange.Redis;
 using Xunit;
 
 namespace RedisMQ.Redis.Tests;
@@ -61,10 +64,10 @@ public sealed class WriteCommandTests
             WriteCommand.DeclareQueue("/", "q", durable: false, exclusive: false, autoDelete: false),
             WriteCommand.Bind("/", "fex", "q", "rk"),
             WriteCommand.Unbind("/", "fex", "q", "rk"),
-            WriteCommand.Enqueue("/", "q", 3, "fex", "rk", new byte[] { 1, 2, 3}, "{\"ct\":\"text/plain\"}"),
+            WriteCommand.Enqueue("/", "q", 3, "fex", "rk", new byte[] { 1, 2, 3 }, new ContentProperties()),
             WriteCommand.RegisterConsumer("/", "q", "ctag"),
             WriteCommand.UnregisterConsumer("/", "q", "ctag"),
-            WriteCommand.Requeue("/", "q", 3, "fex", "rk", new byte[] { 9 }, "{}", redelivered: true),
+            WriteCommand.Requeue("/", "q", 3, "fex", "rk", new byte[] { 9 }, new ContentProperties(), redelivered: true),
         };
 
         foreach (var command in commands)
@@ -75,5 +78,69 @@ public sealed class WriteCommandTests
             Assert.Equal(command.Vhost, roundTripped.Vhost);
             Assert.Equal(command.Body, roundTripped.Body);
         }
+    }
+}
+
+public sealed class RedisStreamRouteEngineTests
+{
+    private static IDatabase? TryConnectRedis()
+    {
+        try
+        {
+            var connectTask = ConnectionMultiplexer.ConnectAsync("localhost:6379");
+            if (connectTask.Wait(TimeSpan.FromSeconds(2)))
+            {
+                return connectTask.Result.GetDatabase();
+            }
+        }
+        catch
+        {
+            // Redis unavailable
+        }
+
+        return null;
+    }
+
+    [Fact]
+    public async Task Reads_delegate_to_in_memory_engine_without_redis()
+    {
+        // No Redis required: construct with a non-connected database and verify
+        // reads/writes go through InMemoryEngine synchronously.
+        await using var engine = new RedisStreamRouteEngine(
+            redis: null!,
+            vhost: "/",
+            replayOnStart: false,
+            drainerCapacity: 1024);
+
+        engine.DeclareExchange(new ExchangeInfo("/", "fex", "direct"));
+        engine.DeclareQueue(new QueueInfo("/", "q"));
+        engine.Bind("/", "fex", "q", "rk");
+
+        Assert.NotNull(engine.GetExchange("/", "fex"));
+        Assert.Equal("direct", engine.GetExchange("/", "fex")!.Type);
+        Assert.NotNull(engine.GetQueue("/", "q"));
+        Assert.Equal(["q"], engine.RouteTo(engine.GetExchange("/", "fex")!, new ContentProperties(), "rk"));
+
+        // Enqueue updates InMemoryEngine synchronously.
+        engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 1, 2, 3 }, "fex", "rk");
+        var claim = engine.TryClaimForGet("/", "q", out var message, out var remaining);
+        Assert.Equal(GetClaimOutcome.Claimed, claim);
+        Assert.NotNull(message);
+        Assert.Equal(1UL, message!.EnvelopeId);
+        Assert.Equal(0, remaining);
+    }
+
+    [Fact]
+    public async Task Can_connect_and_declare_when_redis_available()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        await using var engine = new RedisStreamRouteEngine(db, "/", replayOnStart: false, drainerCapacity: 1024);
+        engine.DeclareExchange(new ExchangeInfo("/", "fex", "direct"));
+        Assert.Equal("direct", engine.GetExchange("/", "fex")!.Type);
     }
 }
