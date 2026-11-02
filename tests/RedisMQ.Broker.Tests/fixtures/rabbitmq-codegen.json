@@ -476,7 +476,20 @@
                          "synchronous": true},
                         {"id": 11,
                          "arguments": [],
-                         "name": "select-ok"}],
+                         "name": "select-ok"},
+                        {"id": 50,
+                         "arguments": [
+                             {"type": "longlong", "name": "delivery-tag"},
+                             {"type": "bit", "name": "multiple", "default-value": false}],
+                         "name": "ack",
+                         "synchronous": false},
+                        {"id": 51,
+                         "arguments": [
+                             {"type": "longlong", "name": "delivery-tag"},
+                             {"type": "bit", "name": "multiple", "default-value": false},
+                             {"type": "bit", "name": "requeue", "default-value": false}],
+                         "name": "nack",
+                         "synchronous": false}],
             "name": "confirm"
         }
     ]
