@@ -245,6 +245,10 @@ git commit -m "test(redis): full M0/M1/M2 regression against multi-vhost engine 
 - **Durability:** `WriteCommand` persists `x-max-length` and the AMQP-encoded binding
   arguments, and startup replay restores both, so headers bindings and bounded queues
   survive a restart.
+- **Redis-engine conformance:** `M0RegressionTests` gained topic wildcard,
+  headers `x-match` and `x-max-length` drop-oldest scenarios that publish through
+  `RedisStreamRouteEngine` over a real socket (no Redis required —
+  `replayOnStart: false` with a null multiplexer).
 - **Flow control:** `channel.flow(false)` pauses consumer delivery
   (`ChannelContext._flowActive` gates `TryAdmitForDelivery`); `channel.flow(true)`
   nudges the channel's queues so parked messages are pumped out. `basic.get` is not
