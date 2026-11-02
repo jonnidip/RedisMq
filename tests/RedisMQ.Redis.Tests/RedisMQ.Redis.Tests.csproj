@@ -15,10 +15,13 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
+    <PackageReference Include="RabbitMQ.Client" Version="7.2.2" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\RedisMQ.Redis\RedisMQ.Redis.csproj" />
+    <ProjectReference Include="..\..\src\RedisMQ.Broker\RedisMQ.Broker.csproj" />
+    <ProjectReference Include="..\..\tests\RedisMQ.Conformance\RedisMQ.Conformance.csproj" />
   </ItemGroup>
 
 </Project>

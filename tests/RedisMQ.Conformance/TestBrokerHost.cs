@@ -42,6 +42,25 @@ public sealed class TestBrokerHost : IAsyncDisposable, IDisposable
         return new TestBrokerHost(server, listener);
     }
 
+    /// <summary>Starts the host against a supplied <see cref="IRouteEngine"/> instead of
+    /// the default <see cref="InMemoryEngine"/>. Used by M1 regression tests to verify
+    /// that the M0 wire surface is engine-agnostic.</summary>
+    public static TestBrokerHost Start(IRouteEngine engine, Action<BrokerServerOptions>? configure = null)
+    {
+        var options = new BrokerServerOptions
+        {
+            Port = 0,
+            Vhosts = ["/"],
+            Users = [new BrokerUser("guest", "guest")],
+        };
+        configure?.Invoke(options);
+
+        var listener = new SocketListener(options.Port);
+        var server = new AmqpBrokerServer(options, engine, listener);
+        server.StartAsync().GetAwaiter().GetResult();
+        return new TestBrokerHost(server, listener);
+    }
+
     public async Task StopAsync()
     {
         // The server drains its connections first, then the listener dies.
