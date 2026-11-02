@@ -1,3 +1,6 @@
+using System.Text.Json;
+using RedisMQ.Broker.Codec;
+
 namespace RedisMQ.Redis;
 
 /// <summary>
@@ -27,7 +30,7 @@ public sealed record WriteCommand
     // Enqueue / Requeue payload.
     public ulong EnvelopeId { get; init; }
     public byte[]? Body { get; init; }
-    public string? PropertiesJson { get; init; }
+    public ContentProperties? Properties { get; init; }
     public bool Redelivered { get; init; }
 
     // ---------- factory methods ----------
@@ -68,7 +71,7 @@ public sealed record WriteCommand
         RoutingKey = routingKey,
     };
 
-    public static WriteCommand Enqueue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, string propertiesJson) => new()
+    public static WriteCommand Enqueue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties) => new()
     {
         Kind = WriteCommandKind.Enqueue,
         Vhost = vhost,
@@ -77,7 +80,7 @@ public sealed record WriteCommand
         Exchange = exchange,
         RoutingKey = routingKey,
         Body = body,
-        PropertiesJson = propertiesJson,
+        Properties = properties,
     };
 
     public static WriteCommand RegisterConsumer(string vhost, string queue, string consumerTag) => new()
@@ -96,7 +99,7 @@ public sealed record WriteCommand
         ConsumerTag = consumerTag,
     };
 
-    public static WriteCommand Requeue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, string propertiesJson, bool redelivered) => new()
+    public static WriteCommand Requeue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties, bool redelivered) => new()
     {
         Kind = WriteCommandKind.Requeue,
         Vhost = vhost,
@@ -105,7 +108,7 @@ public sealed record WriteCommand
         Exchange = exchange,
         RoutingKey = routingKey,
         Body = body,
-        PropertiesJson = propertiesJson,
+        Properties = properties,
         Redelivered = redelivered,
     };
 
@@ -153,7 +156,7 @@ public sealed record WriteCommand
                 fields.Add(("queue", Queue ?? string.Empty));
                 fields.AddRange(StreamCodec.EncodeEnqueue(new EnvelopeRecord(
                     EnvelopeId, Exchange ?? string.Empty, RoutingKey ?? string.Empty,
-                    Body ?? [], PropertiesJson ?? string.Empty)));
+                    Body ?? [], PropertiesJson: Properties is not null ? JsonSerializer.Serialize(Properties) : string.Empty)));
                 fields.Add(("redelivered", Redelivered ? "1" : "0"));
                 break;
         }
@@ -173,9 +176,15 @@ public sealed record WriteCommand
             var record = StreamCodec.DecodeEnqueue(fields);
             string queue = dict.GetValueOrDefault("queue") ?? string.Empty;
             bool redelivered = bool.TryParse(dict.GetValueOrDefault("redelivered"), out var r) && r;
+            ContentProperties? properties = null;
+            if (!string.IsNullOrEmpty(record.PropertiesJson))
+            {
+                properties = JsonSerializer.Deserialize<ContentProperties>(record.PropertiesJson);
+            }
+
             return kind == WriteCommandKind.Enqueue
-                ? Enqueue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body, record.PropertiesJson)
-                : Requeue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body, record.PropertiesJson, redelivered);
+                ? Enqueue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body, properties)
+                : Requeue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body, properties, redelivered);
         }
 
         return kind switch
