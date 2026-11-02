@@ -87,7 +87,7 @@ public sealed class InMemoryEngine : IRouteEngine
         }
     }
 
-    public void Bind(string vhost, string exchange, string queue, string routingKey)
+    public void Bind(string vhost, string exchange, string queue, string routingKey, FieldTable? arguments = null)
     {
         lock (_lock)
         {
@@ -99,7 +99,7 @@ public sealed class InMemoryEngine : IRouteEngine
                 }
             }
 
-            _bindings.Add(new Binding(vhost, exchange, queue, routingKey));
+            _bindings.Add(new Binding(vhost, exchange, queue, routingKey, arguments));
         }
     }
 
@@ -125,12 +125,15 @@ public sealed class InMemoryEngine : IRouteEngine
             foreach (Binding binding in _bindings)
             {
                 if (binding.Vhost == exchange.Vhost
-                    && binding.Exchange == exchange.Name)
+                    && binding.Exchange == exchange.Name
+                    && MatchesRoutingKey(binding.RoutingKey, routingKey, exchange.Type))
                 {
-                    if (MatchesRoutingKey(binding.RoutingKey, routingKey, exchange.Type))
+                    // Headers exchange: match message headers against binding arguments
+                    if (exchange.Type == "headers" && !HeadersMatch(binding.Arguments, properties.Headers))
                     {
-                        queues.Add(binding.Queue);
+                        continue;
                     }
+                    queues.Add(binding.Queue);
                 }
             }
 
@@ -142,6 +145,7 @@ public sealed class InMemoryEngine : IRouteEngine
     /// Matches a publish routing key against a binding routing key for the given
     /// exchange type. Direct exchange requires exact match; topic exchange supports
     /// wildcard matching (star = exactly one word, hash = zero or more words).
+    /// Headers exchange ignores the routing key; header matching happens separately.
     /// </summary>
     private static bool MatchesRoutingKey(string bindingKey, string routingKey, string exchangeType)
     {
@@ -156,7 +160,7 @@ public sealed class InMemoryEngine : IRouteEngine
         }
 
         // Headers exchange: routing key is irrelevant; header matching happens
-        // elsewhere. Return true to let the channel decide based on headers.
+        // elsewhere. Return true to let the caller decide based on headers.
         return true;
     }
 
@@ -238,6 +242,56 @@ public sealed class InMemoryEngine : IRouteEngine
         }
 
         return TopicMatch(bindingWords, bi + 1, routeWords, ri + 1);
+    }
+
+    /// <summary>
+    /// Headers exchange matching: a message matches a binding if all (x-match=all)
+    /// or any (x-match=any) of the binding's arguments are present and equal in the
+    /// message headers. The x-match key itself is ignored.
+    /// </summary>
+    private static bool HeadersMatch(FieldTable? bindingArgs, FieldTable? messageHeaders)
+    {
+        if (bindingArgs is null || bindingArgs.Count == 0)
+        {
+            return true; // no binding args = match all
+        }
+
+        if (messageHeaders is null)
+        {
+            return false; // no message headers to match against
+        }
+
+        // Extract x-match from binding args
+        bool matchAll = bindingArgs.TryGetValue("x-match", out var xMatchVal)
+            && xMatchVal.TypeLetter == 'S'
+            && (string)xMatchVal.Raw == "any";
+
+        if (matchAll)
+        {
+            // any: at least one binding arg must match a message header
+            foreach (var kv in bindingArgs)
+            {
+                if (kv.Key == "x-match") continue;
+                if (messageHeaders.TryGetValue(kv.Key, out var msgVal) && msgVal.Equals(kv.Value))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        else
+        {
+            // all: every binding arg must be present and equal in message headers
+            foreach (var kv in bindingArgs)
+            {
+                if (kv.Key == "x-match") continue;
+                if (!messageHeaders.TryGetValue(kv.Key, out var msgVal) || !msgVal.Equals(kv.Value))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     /// <summary>The declared queue names of a vhost, most-helpful for engine-state
@@ -508,7 +562,7 @@ public sealed class InMemoryEngine : IRouteEngine
     private static byte[] DefensiveCopy(byte[] body) =>
         body.Length == 0 ? [] : body.AsSpan().ToArray();
 
-    private readonly record struct Binding(string Vhost, string Exchange, string Queue, string RoutingKey)
+    private readonly record struct Binding(string Vhost, string Exchange, string Queue, string RoutingKey, FieldTable? Arguments)
     {
         public bool Matches(string vhost, string exchange, string queue, string routingKey) =>
             Vhost == vhost && Exchange == exchange && Queue == queue && RoutingKey == routingKey;

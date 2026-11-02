@@ -107,9 +107,9 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         return prior;
     }
 
-    public void Bind(string vhost, string exchange, string queue, string routingKey)
+    public void Bind(string vhost, string exchange, string queue, string routingKey, FieldTable? arguments = null)
     {
-        _memory.Bind(vhost, exchange, queue, routingKey);
+        _memory.Bind(vhost, exchange, queue, routingKey, arguments);
         EnqueueCommand(WriteCommand.Bind(vhost, exchange, queue, routingKey));
     }
 

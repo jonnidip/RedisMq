@@ -413,4 +413,73 @@ public sealed class RedisStreamRouteEngineTests
         public bool TryAdmitForDelivery(InMemoryMessage message) => true;
         public Task DrainDeliveryWritesAsync() => Task.CompletedTask;
     }
+
+    [Fact]
+    public void Headers_exchange_xmatch_all_requires_all_headers()
+    {
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareExchange(new ExchangeInfo("/", "h", "headers"));
+        engine.DeclareQueue(new QueueInfo("/", "q1"));
+        var args = new FieldTable([new("color", FieldValue.From("red")), new("size", FieldValue.From("large"))]);
+        engine.Bind("/", "h", "q1", "", args);
+
+        // All headers match
+        var props1 = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("red")), new("size", FieldValue.From("large"))]) };
+        var r1 = engine.RouteTo(engine.GetExchange("/", "h")!, props1, "");
+        Assert.Equal(["q1"], r1);
+
+        // Missing one header
+        var props2 = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("red"))]) };
+        var r2 = engine.RouteTo(engine.GetExchange("/", "h")!, props2, "");
+        Assert.Empty(r2);
+
+        // Wrong value
+        var props3 = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("blue")), new("size", FieldValue.From("large"))]) };
+        var r3 = engine.RouteTo(engine.GetExchange("/", "h")!, props3, "");
+        Assert.Empty(r3);
+    }
+
+    [Fact]
+    public void Headers_exchange_xmatch_any_matches_any_header()
+    {
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareExchange(new ExchangeInfo("/", "h", "headers"));
+        engine.DeclareQueue(new QueueInfo("/", "q1"));
+        var args = new FieldTable([new("color", FieldValue.From("red")), new("size", FieldValue.From("large")), new("x-match", FieldValue.From("any"))]);
+        engine.Bind("/", "h", "q1", "", args);
+
+        // Only color matches
+        var props1 = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("red")), new("size", FieldValue.From("small"))]) };
+        var r1 = engine.RouteTo(engine.GetExchange("/", "h")!, props1, "");
+        Assert.Equal(["q1"], r1);
+
+        // Only size matches
+        var props2 = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("blue")), new("size", FieldValue.From("large"))]) };
+        var r2 = engine.RouteTo(engine.GetExchange("/", "h")!, props2, "");
+        Assert.Equal(["q1"], r2);
+
+        // Neither matches
+        var props3 = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("blue")), new("size", FieldValue.From("small"))]) };
+        var r3 = engine.RouteTo(engine.GetExchange("/", "h")!, props3, "");
+        Assert.Empty(r3);
+    }
+
+    [Fact]
+    public void Headers_exchange_defaults_to_xmatch_all()
+    {
+        var engine = new InMemoryEngine(["/"]);
+        engine.DeclareExchange(new ExchangeInfo("/", "h", "headers"));
+        engine.DeclareQueue(new QueueInfo("/", "q1"));
+        // No x-match in arguments → defaults to all
+        var args = new FieldTable([new("color", FieldValue.From("red"))]);
+        engine.Bind("/", "h", "q1", "", args);
+
+        var props1 = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("red"))]) };
+        var r1 = engine.RouteTo(engine.GetExchange("/", "h")!, props1, "");
+        Assert.Equal(["q1"], r1);
+
+        var props2 = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("blue"))]) };
+        var r2 = engine.RouteTo(engine.GetExchange("/", "h")!, props2, "");
+        Assert.Empty(r2);
+    }
 }

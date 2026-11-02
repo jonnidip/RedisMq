@@ -98,7 +98,7 @@ public interface IRouteEngine
     QueueInfo? DeclareQueue(QueueInfo queue);
 
     /// <summary>Records a binding; a duplicate is a no-op keeping the original order.</summary>
-    void Bind(string vhost, string exchange, string queue, string routingKey);
+    void Bind(string vhost, string exchange, string queue, string routingKey, FieldTable? arguments = null);
 
     /// <summary>Drops a binding; removing an absent one is a no-op (RabbitMQ semantics).</summary>
     void Unbind(string vhost, string exchange, string queue, string routingKey);

@@ -844,7 +844,7 @@ public sealed class ChannelContext
 
         if (add)
         {
-            _engine.Bind(_vhost, exchange, queueName, key); // duplicates are a no-op
+            _engine.Bind(_vhost, exchange, queueName, key, arguments); // duplicates are a no-op
         }
         else
         {
