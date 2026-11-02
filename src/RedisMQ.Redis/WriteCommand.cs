@@ -23,6 +23,12 @@ public sealed record WriteCommand
     public bool Exclusive { get; init; }
     public bool AutoDelete { get; init; }
     public string? Type { get; init; }
+    public int? MaxLength { get; init; }
+
+    /// <summary>Binding arguments (headers exchanges match on them). Encoded as the
+    /// AMQP field-table wire form so arbitrary <see cref="FieldValue"/> payloads
+    /// round-trip byte-exactly.</summary>
+    public FieldTable? Arguments { get; init; }
 
     // Consumer payload (RegisterConsumer / UnregisterConsumer).
     public string? ConsumerTag { get; init; }
@@ -43,7 +49,7 @@ public sealed record WriteCommand
         Type = type,
     };
 
-    public static WriteCommand DeclareQueue(string vhost, string name, bool durable, bool exclusive, bool autoDelete) => new()
+    public static WriteCommand DeclareQueue(string vhost, string name, bool durable, bool exclusive, bool autoDelete, int? maxLength = null) => new()
     {
         Kind = WriteCommandKind.DeclareQueue,
         Vhost = vhost,
@@ -51,15 +57,17 @@ public sealed record WriteCommand
         Durable = durable,
         Exclusive = exclusive,
         AutoDelete = autoDelete,
+        MaxLength = maxLength,
     };
 
-    public static WriteCommand Bind(string vhost, string exchange, string queue, string routingKey) => new()
+    public static WriteCommand Bind(string vhost, string exchange, string queue, string routingKey, FieldTable? arguments = null) => new()
     {
         Kind = WriteCommandKind.Bind,
         Vhost = vhost,
         Exchange = exchange,
         Queue = queue,
         RoutingKey = routingKey,
+        Arguments = arguments,
     };
 
     public static WriteCommand Unbind(string vhost, string exchange, string queue, string routingKey) => new()
@@ -122,8 +130,7 @@ public sealed record WriteCommand
     // ---------- stream field serialization ----------
 
     /// <summary>Serializes this command to stream field/value pairs.</summary>
-    public (string Field, string Value)[] ToStreamFields()
-    {
+    public (string Field, string Value)[] ToStreamFields()    {
         var fields = new List<(string Field, string Value)>
         {
             (RedisKeys.TopologyField.Kind, Kind.ToString()),
@@ -146,12 +153,20 @@ public sealed record WriteCommand
                 fields.Add(("durable", Durable ? "1" : "0"));
                 fields.Add(("exclusive", Exclusive ? "1" : "0"));
                 fields.Add(("auto-delete", AutoDelete ? "1" : "0"));
+                if (MaxLength is int maxLength)
+                {
+                    fields.Add(("x-max-length", maxLength.ToString()));
+                }
                 break;
 
             case WriteCommandKind.Bind or WriteCommandKind.Unbind:
                 fields.Add(("exchange", Exchange ?? string.Empty));
                 fields.Add(("queue", Queue ?? string.Empty));
                 fields.Add(("routing-key", RoutingKey ?? string.Empty));
+                if (Arguments is { Count: > 0 })
+                {
+                    fields.Add(("arguments", EncodeArguments(Arguments)));
+                }
                 break;
 
             case WriteCommandKind.RegisterConsumer or WriteCommandKind.UnregisterConsumer:
@@ -210,13 +225,15 @@ public sealed record WriteCommand
                 dict.GetValueOrDefault("queue") ?? string.Empty,
                 bool.TryParse(dict.GetValueOrDefault("durable"), out var d) && d,
                 bool.TryParse(dict.GetValueOrDefault("exclusive"), out var e) && e,
-                bool.TryParse(dict.GetValueOrDefault("auto-delete"), out var a) && a),
+                bool.TryParse(dict.GetValueOrDefault("auto-delete"), out var a) && a,
+                int.TryParse(dict.GetValueOrDefault("x-max-length"), out var ml) ? ml : null),
 
             WriteCommandKind.Bind => Bind(
                 vhost,
                 dict.GetValueOrDefault("exchange") ?? string.Empty,
                 dict.GetValueOrDefault("queue") ?? string.Empty,
-                dict.GetValueOrDefault("routing-key") ?? string.Empty),
+                dict.GetValueOrDefault("routing-key") ?? string.Empty,
+                DecodeArguments(dict.GetValueOrDefault("arguments"))),
 
             WriteCommandKind.Unbind => Unbind(
                 vhost,
@@ -240,6 +257,33 @@ public sealed record WriteCommand
 
             _ => throw new InvalidOperationException($"Unknown write command kind: {kind}"),
         };
+    }
+
+    /// <summary>Encodes a field table in its AMQP 0-9-1 wire form (base64 for the
+    /// stream value), so every FieldValue kind round-trips exactly.</summary>
+    private static string EncodeArguments(FieldTable table)
+    {
+        var writer = new ByteWriter();
+        writer.WriteFieldTable(table);
+        return Convert.ToBase64String(writer.ToArray());
+    }
+
+    internal static FieldTable? DecodeArguments(string? encoded)
+    {
+        if (string.IsNullOrEmpty(encoded))
+        {
+            return null;
+        }
+
+        try
+        {
+            var reader = new ByteReader(Convert.FromBase64String(encoded));
+            return reader.TryReadFieldTable(out FieldTable table) ? table : null;
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
     }
 }
 

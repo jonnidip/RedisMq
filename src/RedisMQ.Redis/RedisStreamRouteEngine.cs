@@ -93,7 +93,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     public QueueInfo? DeclareQueue(QueueInfo queue)
     {
         var prior = _memory.DeclareQueue(queue);
-        EnqueueCommand(WriteCommand.DeclareQueue(queue.Vhost, queue.Name, queue.Durable, queue.Exclusive, queue.AutoDelete));
+        EnqueueCommand(WriteCommand.DeclareQueue(queue.Vhost, queue.Name, queue.Durable, queue.Exclusive, queue.AutoDelete, queue.MaxLength));
 
         // Track exclusive queue ownership for connection teardown reconciliation.
         if (queue.Exclusive)
@@ -110,7 +110,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     public void Bind(string vhost, string exchange, string queue, string routingKey, FieldTable? arguments = null)
     {
         _memory.Bind(vhost, exchange, queue, routingKey, arguments);
-        EnqueueCommand(WriteCommand.Bind(vhost, exchange, queue, routingKey));
+        EnqueueCommand(WriteCommand.Bind(vhost, exchange, queue, routingKey, arguments));
     }
 
     public void Unbind(string vhost, string exchange, string queue, string routingKey)
@@ -332,7 +332,8 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
                         dict.GetValueOrDefault("queue") ?? string.Empty,
                         bool.TryParse(dict.GetValueOrDefault("durable") ?? "0", out var d) && d,
                         bool.TryParse(dict.GetValueOrDefault("exclusive") ?? "0", out var e) && e,
-                        bool.TryParse(dict.GetValueOrDefault("auto-delete") ?? "0", out var a) && a));
+                        bool.TryParse(dict.GetValueOrDefault("auto-delete") ?? "0", out var a) && a,
+                        MaxLength: int.TryParse(dict.GetValueOrDefault("x-max-length"), out var ml) ? ml : null));
                     break;
 
                 case nameof(WriteCommandKind.Bind):
@@ -340,7 +341,8 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
                         vhost,
                         dict.GetValueOrDefault("exchange") ?? string.Empty,
                         dict.GetValueOrDefault("queue") ?? string.Empty,
-                        dict.GetValueOrDefault("routing-key") ?? string.Empty);
+                        dict.GetValueOrDefault("routing-key") ?? string.Empty,
+                        WriteCommand.DecodeArguments(dict.GetValueOrDefault("arguments")));
                     break;
             }
         }

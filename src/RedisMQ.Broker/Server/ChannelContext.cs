@@ -127,6 +127,10 @@ public sealed class ChannelContext
 {
     private const string DirectType = "direct";
 
+    /// <summary>The exchange types M3 routes (AMQP 0-9-1 standard set).</summary>
+    private static bool IsKnownExchangeType(string type) =>
+        type is DirectType or "fanout" or "topic" or "headers";
+
     private enum ChannelState
     {
         Starting, // the number exists on the connection but saw no channel.open yet
@@ -537,6 +541,13 @@ public sealed class ChannelContext
     {
         bool active = method.Get("active") is true;
         _flowActive = active;
+        if (active)
+        {
+            // Deliveries were gated while flow was off: wake this channel's queues so
+            // any messages that landed in the meantime are pumped out now.
+            NudgeChannelQueues();
+        }
+
         return new ChannelOutcomeReply(NewMethod("channel.flow-ok", flowOk =>
             flowOk.Set("active", _flowActive)));
     }
@@ -577,8 +588,10 @@ public sealed class ChannelContext
             return DeclareOk(nowait, "exchange.declare-ok", name);
         }
 
-        // rabbit_exchange:check_type runs before everything else.
-        if (!string.Equals(type, DirectType, StringComparison.Ordinal))
+        // rabbit_exchange:check_type runs before everything else. M3 understands the
+        // four standard types; 'direct' keeps exact-key routing, 'fanout' ignores the
+        // key, 'topic' honours * / # and 'headers' matches the binding arguments.
+        if (!IsKnownExchangeType(type))
         {
             return Soft(method, AmqpConstants.PreconditionFailed, $"PRECONDITION_FAILED - unknown exchange type '{type}'");
         }
@@ -671,9 +684,26 @@ public sealed class ChannelContext
         bool nowait = method.Get("nowait") is true;
         FieldTable arguments = method.Get("arguments") as FieldTable ?? new FieldTable();
 
+        // M3 understands x-max-length on queue.declare; any other non-empty argument
+        // set keeps the M0 not_implemented deviation (pinned by
+        // Non_empty_declare_arguments_are_refused_with_not_implemented).
+        int? maxLength = null;
         if (!passive && arguments.Count > 0)
         {
-            return NotSupportedArguments(method);
+            if (!arguments.TryGetValue("x-max-length", out FieldValue maxLengthValue))
+            {
+                return NotSupportedArguments(method);
+            }
+
+            if (!TryReadIntegral(maxLengthValue, out long parsed) || parsed < 0)
+            {
+                return Soft(
+                    method,
+                    AmqpConstants.PreconditionFailed,
+                    $"PRECONDITION_FAILED - invalid arg 'x-max-length' for queue '{name}' in vhost '{_vhost}'");
+            }
+
+            maxLength = (int)Math.Min(parsed, int.MaxValue);
         }
 
         if (passive)
@@ -710,16 +740,16 @@ public sealed class ChannelContext
         QueueInfo? declared = _engine.GetQueue(_vhost, actual);
         if (declared is not null)
         {
-            return DeclaredQueueOutcome(method, actual, declared, durable, exclusive, autoDelete, nowait);
+            return DeclaredQueueOutcome(method, actual, declared, durable, exclusive, autoDelete, maxLength, nowait);
         }
 
         // Creation-only compare-and-set (see the exchange arm): a racing creator's
         // record is returned rather than overwritten, and the loser runs the same
         // resource_locked-first ladder against the winner's record.
-        QueueInfo? prior = _engine.DeclareQueue(new QueueInfo(_vhost, actual, durable, exclusive, autoDelete));
+        QueueInfo? prior = _engine.DeclareQueue(new QueueInfo(_vhost, actual, durable, exclusive, autoDelete, MaxLength: maxLength));
         if (prior is not null)
         {
-            return DeclaredQueueOutcome(method, actual, prior, durable, exclusive, autoDelete, nowait);
+            return DeclaredQueueOutcome(method, actual, prior, durable, exclusive, autoDelete, maxLength, nowait);
         }
 
         // Track exclusive queue ownership for connection teardown reconciliation.
@@ -743,6 +773,7 @@ public sealed class ChannelContext
         bool durable,
         bool exclusive,
         bool autoDelete,
+        int? maxLength,
         bool nowait)
     {
         if (declared.Exclusive != exclusive)
@@ -765,10 +796,15 @@ public sealed class ChannelContext
             return InequivalentQueue(method, name, "auto-delete", autoDelete, declared.AutoDelete);
         }
 
+        if (declared.MaxLength != maxLength)
+        {
+            return InequivalentQueue(method, name, "x-max-length", maxLength, declared.MaxLength);
+        }
+
         return DeclareOk(nowait, "queue.declare-ok", name, updateMrdq: name);
     }
 
-    private ChannelOutcome InequivalentQueue(AmqpMethod method, string name, string key, bool received, bool current) =>
+    private ChannelOutcome InequivalentQueue(AmqpMethod method, string name, string key, object received, object current) =>
         Soft(
             method,
             AmqpConstants.PreconditionFailed,
@@ -790,10 +826,8 @@ public sealed class ChannelContext
         string routingKey = method.Get("routing-key") as string ?? string.Empty;
         FieldTable arguments = method.Get("arguments") as FieldTable ?? new FieldTable();
 
-        if (arguments.Count > 0)
-        {
-            return NotSupportedArguments(method);
-        }
+        // M3: queue.bind carries the binding arguments (headers exchanges match on
+        // them); nothing is refused here.
 
         // expand_shortcuts runs before any handle_method check in RabbitMQ: the ""
         // queue expands to the most recently declared queue or dies with
@@ -974,12 +1008,6 @@ public sealed class ChannelContext
     {
         string queue = method.Get("queue") as string ?? string.Empty;
         bool noAck = method.Get("no-ack") is true;
-
-        // Channel flow control: if flow is off, basic.get does not deliver
-        if (!_flowActive)
-        {
-            return new ChannelOutcomeSilent();
-        }
 
         GetClaimOutcome outcome = _engine.TryClaimForGet(_vhost, queue, out InMemoryMessage? message, out int remaining);
         switch (outcome)
@@ -1382,6 +1410,23 @@ public sealed class ChannelContext
     /// explanation: the booleans 'true'/'false'.</summary>
     private static string ErlangAtom(object value) =>
         value is bool boolean ? (boolean ? "true" : "false") : value.ToString() ?? "";
+
+    /// <summary>Reads an integral field value as a long; false for any
+    /// non-integral letter or an out-of-range unsigned payload.</summary>
+    private static bool TryReadIntegral(FieldValue value, out long result)
+    {
+        switch (value.Raw)
+        {
+            case sbyte sb: result = sb; return true;
+            case byte b: result = b; return true;
+            case short s: result = s; return true;
+            case ushort us: result = us; return true;
+            case int i: result = i; return true;
+            case ulong ul when ul <= long.MaxValue: result = (long)ul; return true;
+            case long l: result = l; return true;
+            default: result = 0; return false;
+        }
+    }
 
     private static AmqpMethod NewMethod(string name, Action<AmqpMethod>? setFields = null)
     {
