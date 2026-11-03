@@ -1043,6 +1043,14 @@ public sealed class ChannelContext
         }
 
         InMemoryMessage claimed = message!;
+        if (noAck)
+        {
+            // basic.get(autoAck:true) hands the message straight over, so the durable
+            // copy settles now (outside _deliveryLock — same ladder concern as the
+            // consumer path).
+            _engine.Acknowledge(_vhost, queue, claimed);
+        }
+
         ScheduleWriterJob(() => _host.WriteMethodToWireAsync(_channel, NewMethod("basic.get-ok", ok =>
         {
             ok.Set("delivery-tag", tag);
@@ -1066,15 +1074,26 @@ public sealed class ChannelContext
     /// the tail order stable. Credit freed → the channel's consumer queues are
     /// nudged (a pump idled out on the gate re-spawns).</summary>
     private ChannelOutcome OnBasicAck(AmqpMethod method) =>
-        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, method.Get("multiple") is true, requeue: false);
+        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, method.Get("multiple") is true, SettleAction.Ack);
 
     private ChannelOutcome OnBasicReject(AmqpMethod method) =>
-        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, multiple: false, requeue: method.Get("requeue") is true);
+        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, multiple: false,
+            method.Get("requeue") is true ? SettleAction.Requeue : SettleAction.Reject);
 
     private ChannelOutcome OnBasicNack(AmqpMethod method) =>
-        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, method.Get("multiple") is true, requeue: method.Get("requeue") is true);
+        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, method.Get("multiple") is true,
+            method.Get("requeue") is true ? SettleAction.Requeue : SettleAction.Reject);
 
-    private ChannelOutcome SettleLedger(AmqpMethod method, long tag, bool multiple, bool requeue)
+    /// <summary>What a settle does to each ledger entry: ack drops it, reject drops
+    /// it without requeue, requeue returns it to the queue tail.</summary>
+    private enum SettleAction
+    {
+        Ack,
+        Reject,
+        Requeue,
+    }
+
+    private ChannelOutcome SettleLedger(AmqpMethod method, long tag, bool multiple, SettleAction action)
     {
         List<Unacked> settled = [];
         lock (_deliveryLock)
@@ -1116,14 +1135,34 @@ public sealed class ChannelContext
             }
         }
 
-        // Requeues land tail-first in tag order; and both paths free credit.
+        // Requeues land tail-first in tag order. Every branch also tells the engine
+        // so the durable mirror can settle the matching stream entries.
         settled.Sort((left, right) => left.Tag.CompareTo(right.Tag));
-        if (requeue)
+        switch (action)
         {
-            foreach (Unacked entry in settled)
-            {
-                _engine.Requeue(_vhost, entry.Queue, entry.Message);
-            }
+            case SettleAction.Requeue:
+                foreach (Unacked entry in settled)
+                {
+                    _engine.Requeue(_vhost, entry.Queue, entry.Message);
+                }
+
+                break;
+
+            case SettleAction.Ack:
+                foreach (Unacked entry in settled)
+                {
+                    _engine.Acknowledge(_vhost, entry.Queue, entry.Message);
+                }
+
+                break;
+
+            case SettleAction.Reject:
+                foreach (Unacked entry in settled)
+                {
+                    _engine.Reject(_vhost, entry.Queue, entry.Message);
+                }
+
+                break;
         }
 
         NudgeChannelQueues();
@@ -1311,6 +1350,7 @@ public sealed class ChannelContext
         public bool TryAdmitForDelivery(InMemoryMessage message)
         {
             long deliveryTag;
+            bool autoAck = false;
             lock (owner._deliveryLock)
             {
                 // Channel flow control: if flow is off, no new deliveries are admitted
@@ -1323,6 +1363,7 @@ public sealed class ChannelContext
                 {
                     // Auto-ack consumers ride past the gate: no ledger, no credit.
                     deliveryTag = ++owner._nextDeliveryTag;
+                    autoAck = true;
                 }
                 else
                 {
@@ -1353,6 +1394,14 @@ public sealed class ChannelContext
 
                 owner.ScheduleWriterJob(() => owner._host.WriteDeliveryToWireAsync(
                     owner._channel, deliver, message.Props, message.Body, default));
+            }
+
+            // Auto-ack mirrors the settle: the durable copy is removed as soon as the
+            // message is handed out. Outside _deliveryLock to keep the lock ladder
+            // one-way (the pump holds the engine gate while taking _deliveryLock).
+            if (autoAck)
+            {
+                owner._engine.Acknowledge(owner._vhost, queueName, message);
             }
 
             return true;
