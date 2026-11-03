@@ -23,6 +23,10 @@ public sealed record WriteCommand
     public bool AutoDelete { get; init; }
     public string? Type { get; init; }
     public int? MaxLength { get; init; }
+    public int? ExpiresMs { get; init; }
+    public string? DeadLetterExchange { get; init; }
+    public string? DeadLetterRoutingKey { get; init; }
+    public int? DeliveryLimit { get; init; }
 
     /// <summary>Binding arguments (headers exchanges match on them). Encoded as the
     /// AMQP field-table wire form so arbitrary <see cref="FieldValue"/> payloads
@@ -68,7 +72,17 @@ public sealed record WriteCommand
         Type = type,
     };
 
-    public static WriteCommand DeclareQueue(string vhost, string name, bool durable, bool exclusive, bool autoDelete, int? maxLength = null) => new()
+    public static WriteCommand DeclareQueue(
+        string vhost,
+        string name,
+        bool durable,
+        bool exclusive,
+        bool autoDelete,
+        int? maxLength = null,
+        int? expiresMs = null,
+        string? deadLetterExchange = null,
+        string? deadLetterRoutingKey = null,
+        int? deliveryLimit = null) => new()
     {
         Kind = WriteCommandKind.DeclareQueue,
         Vhost = vhost,
@@ -77,6 +91,10 @@ public sealed record WriteCommand
         Exclusive = exclusive,
         AutoDelete = autoDelete,
         MaxLength = maxLength,
+        ExpiresMs = expiresMs,
+        DeadLetterExchange = deadLetterExchange,
+        DeadLetterRoutingKey = deadLetterRoutingKey,
+        DeliveryLimit = deliveryLimit,
     };
 
     public static WriteCommand Bind(string vhost, string exchange, string queue, string routingKey, FieldTable? arguments = null) => new()
@@ -198,6 +216,26 @@ public sealed record WriteCommand
                 {
                     fields.Add(("x-max-length", maxLength.ToString()));
                 }
+
+                if (ExpiresMs is int expiresMs)
+                {
+                    fields.Add(("x-expires", expiresMs.ToString()));
+                }
+
+                if (DeadLetterExchange is not null)
+                {
+                    fields.Add(("x-dead-letter-exchange", DeadLetterExchange));
+                }
+
+                if (DeadLetterRoutingKey is not null)
+                {
+                    fields.Add(("x-dead-letter-routing-key", DeadLetterRoutingKey));
+                }
+
+                if (DeliveryLimit is int deliveryLimit)
+                {
+                    fields.Add(("x-delivery-limit", deliveryLimit.ToString()));
+                }
                 break;
 
             case WriteCommandKind.Bind or WriteCommandKind.Unbind:
@@ -268,7 +306,11 @@ public sealed record WriteCommand
                 bool.TryParse(dict.GetValueOrDefault("durable"), out var d) && d,
                 bool.TryParse(dict.GetValueOrDefault("exclusive"), out var e) && e,
                 bool.TryParse(dict.GetValueOrDefault("auto-delete"), out var a) && a,
-                int.TryParse(dict.GetValueOrDefault("x-max-length"), out var ml) ? ml : null),
+                int.TryParse(dict.GetValueOrDefault("x-max-length"), out var ml) ? ml : null,
+                int.TryParse(dict.GetValueOrDefault("x-expires"), out var exp) ? exp : null,
+                dict.GetValueOrDefault("x-dead-letter-exchange"),
+                dict.GetValueOrDefault("x-dead-letter-routing-key"),
+                int.TryParse(dict.GetValueOrDefault("x-delivery-limit"), out var dl) ? dl : null),
 
             WriteCommandKind.Bind => Bind(
                 vhost,

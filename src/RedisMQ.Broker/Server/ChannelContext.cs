@@ -679,26 +679,16 @@ public sealed class ChannelContext
         bool nowait = method.Get("nowait") is true;
         FieldTable arguments = method.Get("arguments") as FieldTable ?? new FieldTable();
 
-        // M3 understands x-max-length on queue.declare; any other non-empty argument
-        // set keeps the M0 not_implemented deviation (pinned by
-        // Non_empty_declare_arguments_are_refused_with_not_implemented).
-        int? maxLength = null;
+        // M4: queue.declare accepts x-max-length, x-expires, x-delivery-limit and the
+        // two dead-letter arguments. Unknown arguments keep the M0 not_implemented
+        // deviation; invalid values are the soft precondition failure RabbitMQ raises.
+        QueueDeclareArguments parsed = default;
         if (!passive && arguments.Count > 0)
         {
-            if (!arguments.TryGetValue("x-max-length", out FieldValue maxLengthValue))
+            if (!TryReadQueueArguments(method, name, arguments, out parsed, out ChannelOutcome? failure))
             {
-                return NotSupportedArguments(method);
+                return failure!;
             }
-
-            if (!TryReadIntegral(maxLengthValue, out long parsed) || parsed < 0)
-            {
-                return Soft(
-                    method,
-                    AmqpConstants.PreconditionFailed,
-                    $"PRECONDITION_FAILED - invalid arg 'x-max-length' for queue '{name}' in vhost '{_vhost}'");
-            }
-
-            maxLength = (int)Math.Min(parsed, int.MaxValue);
         }
 
         if (passive)
@@ -735,16 +725,26 @@ public sealed class ChannelContext
         QueueInfo? declared = _engine.GetQueue(_vhost, actual);
         if (declared is not null)
         {
-            return DeclaredQueueOutcome(method, actual, declared, durable, exclusive, autoDelete, maxLength, nowait);
+            return DeclaredQueueOutcome(method, actual, declared, durable, exclusive, autoDelete, parsed, nowait);
         }
 
         // Creation-only compare-and-set (see the exchange arm): a racing creator's
         // record is returned rather than overwritten, and the loser runs the same
         // resource_locked-first ladder against the winner's record.
-        QueueInfo? prior = _engine.DeclareQueue(new QueueInfo(_vhost, actual, durable, exclusive, autoDelete, MaxLength: maxLength));
+        QueueInfo? prior = _engine.DeclareQueue(new QueueInfo(
+            _vhost,
+            actual,
+            durable,
+            exclusive,
+            autoDelete,
+            parsed.Expiration,
+            parsed.MaxLength,
+            parsed.DeadLetterExchange,
+            parsed.DeadLetterRoutingKey,
+            parsed.DeliveryLimit));
         if (prior is not null)
         {
-            return DeclaredQueueOutcome(method, actual, prior, durable, exclusive, autoDelete, maxLength, nowait);
+            return DeclaredQueueOutcome(method, actual, prior, durable, exclusive, autoDelete, parsed, nowait);
         }
 
         // Track exclusive queue ownership for connection teardown reconciliation.
@@ -768,7 +768,7 @@ public sealed class ChannelContext
         bool durable,
         bool exclusive,
         bool autoDelete,
-        int? maxLength,
+        QueueDeclareArguments arguments,
         bool nowait)
     {
         if (declared.Exclusive != exclusive)
@@ -791,13 +791,160 @@ public sealed class ChannelContext
             return InequivalentQueue(method, name, "auto-delete", autoDelete, declared.AutoDelete);
         }
 
-        if (declared.MaxLength != maxLength)
+        if (declared.Expiration != arguments.Expiration)
         {
-            return InequivalentQueue(method, name, "x-max-length", maxLength, declared.MaxLength);
+            return InequivalentQueue(method, name, "x-expires", arguments.Expiration, declared.Expiration);
+        }
+
+        if (declared.MaxLength != arguments.MaxLength)
+        {
+            return InequivalentQueue(method, name, "x-max-length", arguments.MaxLength, declared.MaxLength);
+        }
+
+        if (declared.DeadLetterExchange != arguments.DeadLetterExchange)
+        {
+            return InequivalentQueue(
+                method, name, "x-dead-letter-exchange",
+                arguments.DeadLetterExchange, declared.DeadLetterExchange);
+        }
+
+        if (declared.DeadLetterRoutingKey != arguments.DeadLetterRoutingKey)
+        {
+            return InequivalentQueue(
+                method, name, "x-dead-letter-routing-key",
+                arguments.DeadLetterRoutingKey, declared.DeadLetterRoutingKey);
+        }
+
+        if (declared.DeliveryLimit != arguments.DeliveryLimit)
+        {
+            return InequivalentQueue(method, name, "x-delivery-limit", arguments.DeliveryLimit, declared.DeliveryLimit);
         }
 
         return DeclareOk(nowait, "queue.declare-ok", name, updateMrdq: name);
     }
+
+    /// <summary>The parsed queue.declare arguments; default = "none supplied".</summary>
+    private readonly record struct QueueDeclareArguments(
+        TimeSpan? Expiration,
+        int? MaxLength,
+        string? DeadLetterExchange,
+        string? DeadLetterRoutingKey,
+        int? DeliveryLimit);
+
+    /// <summary>
+    /// Validates and reads the v1 queue arguments. Unknown keys keep the M0
+    /// not_implemented verdict; a non-integral or negative integral, or a
+    /// non-string dead-letter name, is the soft PRECONDITION_FAILED naming the key.
+    /// An explicitly empty dead-letter name stays <c>""</c> (the default exchange);
+    /// only an absent key is <c>null</c> (no dead-lettering).
+    /// </summary>
+    private bool TryReadQueueArguments(
+        AmqpMethod method,
+        string queue,
+        FieldTable arguments,
+        out QueueDeclareArguments parsed,
+        out ChannelOutcome? failure)
+    {
+        parsed = default;
+        failure = null;
+        TimeSpan? expiration = null;
+        int? maxLength = null;
+        int? deliveryLimit = null;
+        string? deadLetterExchange = null;
+        string? deadLetterRoutingKey = null;
+
+        foreach ((string key, FieldValue value) in arguments)
+        {
+            switch (key)
+            {
+                case "x-max-length":
+                    if (!TryReadNonNegativeIntegral(value, out long maxLengthValue))
+                    {
+                        failure = InvalidQueueArgument(method, queue, key);
+                        return false;
+                    }
+
+                    maxLength = (int)maxLengthValue;
+                    break;
+
+                case "x-expires":
+                    if (!TryReadNonNegativeIntegral(value, out long expiresValue))
+                    {
+                        failure = InvalidQueueArgument(method, queue, key);
+                        return false;
+                    }
+
+                    expiration = TimeSpan.FromMilliseconds(expiresValue);
+                    break;
+
+                case "x-delivery-limit":
+                    if (!TryReadNonNegativeIntegral(value, out long deliveryLimitValue))
+                    {
+                        failure = InvalidQueueArgument(method, queue, key);
+                        return false;
+                    }
+
+                    deliveryLimit = (int)deliveryLimitValue;
+                    break;
+
+                case "x-dead-letter-exchange":
+                    if (!TryReadName(value, out deadLetterExchange))
+                    {
+                        failure = InvalidQueueArgument(method, queue, key);
+                        return false;
+                    }
+
+                    break;
+
+                case "x-dead-letter-routing-key":
+                    if (!TryReadName(value, out deadLetterRoutingKey))
+                    {
+                        failure = InvalidQueueArgument(method, queue, key);
+                        return false;
+                    }
+
+                    break;
+
+                default:
+                    failure = NotSupportedArguments(method);
+                    return false;
+            }
+        }
+
+        parsed = new QueueDeclareArguments(
+            expiration, maxLength, deadLetterExchange, deadLetterRoutingKey, deliveryLimit);
+        return true;
+    }
+
+    /// <summary>Integral, non-negative, clamped to int (the engine's argument shape).</summary>
+    private static bool TryReadNonNegativeIntegral(FieldValue value, out long result)
+    {
+        if (!TryReadIntegral(value, out result) || result < 0)
+        {
+            return false;
+        }
+
+        result = Math.Min(result, int.MaxValue);
+        return true;
+    }
+
+    private static bool TryReadName(FieldValue value, out string? name)
+    {
+        if (value.Raw is string text)
+        {
+            name = text;
+            return true;
+        }
+
+        name = null;
+        return false;
+    }
+
+    private ChannelOutcome InvalidQueueArgument(AmqpMethod method, string queue, string key) =>
+        Soft(
+            method,
+            AmqpConstants.PreconditionFailed,
+            $"PRECONDITION_FAILED - invalid arg '{key}' for queue '{queue}' in vhost '{_vhost}'");
 
     private ChannelOutcome InequivalentQueue(AmqpMethod method, string name, string key, object received, object current) =>
         Soft(
@@ -1483,10 +1630,16 @@ public sealed class ChannelContext
     private ChannelOutcome Soft(AmqpMethod method, ushort code, string text) =>
         new ChannelOutcomeSoftError(code, text, method.ClassId, method.MethodId);
 
-    /// <summary>Renders flag values as Erlang writes them into an inequivalent-arg
-    /// explanation: the booleans 'true'/'false'.</summary>
-    private static string ErlangAtom(object value) =>
-        value is bool boolean ? (boolean ? "true" : "false") : value.ToString() ?? "";
+    /// <summary>Renders values as Erlang writes them into an inequivalent-arg
+    /// explanation: the booleans 'true'/'false', an absent argument 'undefined',
+    /// and x-expires as its millisecond count.</summary>
+    private static string ErlangAtom(object? value) => value switch
+    {
+        null => "undefined",
+        bool boolean => boolean ? "true" : "false",
+        TimeSpan span => ((long)span.TotalMilliseconds).ToString(System.Globalization.CultureInfo.InvariantCulture),
+        _ => value.ToString() ?? "",
+    };
 
     /// <summary>Reads an integral field value as a long; false for any
     /// non-integral letter or an out-of-range unsigned payload.</summary>

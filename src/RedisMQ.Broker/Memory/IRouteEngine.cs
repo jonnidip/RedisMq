@@ -19,6 +19,9 @@ public sealed record ExchangeInfo(
 /// Manifest of a declared queue. Flags again verbatim as declared: RabbitMQ's
 /// channel strips <c>durable</c> when <c>exclusive</c> is declared; M0 does not
 /// (Task 5 report deviation), so the stored record is exactly what arrived.
+/// <see cref="Expiration"/> is the x-expires idle duration (not a deadline); the
+/// dead-letter fields preserve the difference between absent (null) and explicitly
+/// empty (the default exchange), and <see cref="DeliveryLimit"/> is the x-delivery-limit.
 /// </summary>
 public sealed record QueueInfo(
     string Vhost,
@@ -26,8 +29,11 @@ public sealed record QueueInfo(
     bool Durable = false,
     bool Exclusive = false,
     bool AutoDelete = false,
-    DateTimeOffset? Expiration = null,
-    int? MaxLength = null);
+    TimeSpan? Expiration = null,
+    int? MaxLength = null,
+    string? DeadLetterExchange = null,
+    string? DeadLetterRoutingKey = null,
+    int? DeliveryLimit = null);
 
 /// <summary>
 /// What <c>RegisterConsumer</c> decided about a consume request the channel ran:

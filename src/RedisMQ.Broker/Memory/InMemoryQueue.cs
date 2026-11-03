@@ -218,11 +218,12 @@ internal sealed class InMemoryQueue
         }
 
         InMemoryMessage message = _ready[0];
+        InMemoryMessage claimed = message with { DeliveryCount = message.DeliveryCount + 1 };
         for (int attempt = 0; attempt < _consumers.Count; attempt++)
         {
             int index = (_rrIndex + attempt) % _consumers.Count;
             IQueueConsumer consumer = _consumers[index];
-            if (consumer.TryAdmitForDelivery(message))
+            if (consumer.TryAdmitForDelivery(claimed))
             {
                 _ready.RemoveAt(0);
                 // The cycle pointer is the POSITION after the claimer, not modulo

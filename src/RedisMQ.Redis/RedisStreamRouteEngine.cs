@@ -105,7 +105,19 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     public QueueInfo? DeclareQueue(QueueInfo queue)
     {
         var prior = _memory.DeclareQueue(queue);
-        EnqueueCommand(WriteCommand.DeclareQueue(queue.Vhost, queue.Name, queue.Durable, queue.Exclusive, queue.AutoDelete, queue.MaxLength));
+        EnqueueCommand(WriteCommand.DeclareQueue(
+            queue.Vhost,
+            queue.Name,
+            queue.Durable,
+            queue.Exclusive,
+            queue.AutoDelete,
+            queue.MaxLength,
+            queue.Expiration is TimeSpan idle
+                ? (int)Math.Clamp(idle.TotalMilliseconds, 0, int.MaxValue)
+                : null,
+            queue.DeadLetterExchange,
+            queue.DeadLetterRoutingKey,
+            queue.DeliveryLimit));
 
         // Track exclusive queue ownership for connection teardown reconciliation.
         if (queue.Exclusive)
@@ -289,19 +301,20 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         _ = _channel.Writer.TryWrite(batch.Count == 1 ? batch[0] : WriteCommand.Delta([.. batch]));
     }
 
-    /// <summary>The publish path's absolute deadline, mirroring the in-memory
-    /// parse (Task 7 makes the property relative to enqueue time).</summary>
+    /// <summary>The publish path's absolute deadline from the AMQP relative
+    /// millisecond <c>expiration</c> property, mirroring the in-memory parse.</summary>
     private static DateTimeOffset? ExpirationOf(ContentProperties properties)
     {
         if (string.IsNullOrEmpty(properties.Expiration)
-            || !long.TryParse(properties.Expiration, out long milliseconds))
+            || !long.TryParse(properties.Expiration, out long milliseconds)
+            || milliseconds < 0)
         {
             return null;
         }
 
         try
         {
-            return DateTimeOffset.FromUnixTimeMilliseconds(milliseconds);
+            return DateTimeOffset.UtcNow.AddMilliseconds(milliseconds);
         }
         catch (ArgumentOutOfRangeException)
         {
@@ -602,7 +615,13 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
                         bool.TryParse(dict.GetValueOrDefault("durable") ?? "0", out var d) && d,
                         bool.TryParse(dict.GetValueOrDefault("exclusive") ?? "0", out var e) && e,
                         bool.TryParse(dict.GetValueOrDefault("auto-delete") ?? "0", out var a) && a,
-                        MaxLength: int.TryParse(dict.GetValueOrDefault("x-max-length"), out var ml) ? ml : null));
+                        int.TryParse(dict.GetValueOrDefault("x-expires"), out var ex)
+                            ? TimeSpan.FromMilliseconds(ex)
+                            : null,
+                        int.TryParse(dict.GetValueOrDefault("x-max-length"), out var ml) ? ml : null,
+                        dict.GetValueOrDefault("x-dead-letter-exchange"),
+                        dict.GetValueOrDefault("x-dead-letter-routing-key"),
+                        int.TryParse(dict.GetValueOrDefault("x-delivery-limit"), out var dl) ? dl : null));
                     break;
 
                 case nameof(WriteCommandKind.Bind):

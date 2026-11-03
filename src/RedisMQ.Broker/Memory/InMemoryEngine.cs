@@ -24,6 +24,10 @@ public sealed class InMemoryEngine : IRouteEngine
     private readonly Dictionary<(string Vhost, string Queue), InMemoryQueue> _delivery = [];
     private ulong _lastEnvelopeId; // the highest InMemoryMessage.EnvelopeId handed out
 
+    // M4 Task 7: per-queue last-use stamps for x-expires (idle queue expiry). Pure
+    // in-memory state: it resets on restart, so a queue restarts its idle clock.
+    private readonly Dictionary<(string Vhost, string Queue), DateTimeOffset> _lastUsed = [];
+
     /// <summary>Creates the engine and predeclares, per vhost, the default exchange
     /// (empty name, direct type, durable) and <c>amq.direct</c> exactly as the real
     /// broker's internal declarations do. The declares run on empty dictionaries, so
@@ -75,6 +79,8 @@ public sealed class InMemoryEngine : IRouteEngine
     {
         lock (_lock)
         {
+            _lastUsed[(queue.Vhost, queue.Name)] = DateTimeOffset.UtcNow;
+
             // The same creation-only compare-and-set as DeclareExchange: the winner's
             // record is returned to the loser, never overwritten.
             if (_queues.TryGetValue((queue.Vhost, queue.Name), out QueueInfo? prior))
@@ -91,6 +97,8 @@ public sealed class InMemoryEngine : IRouteEngine
     {
         lock (_lock)
         {
+            _lastUsed[(vhost, queue)] = DateTimeOffset.UtcNow;
+
             foreach (Binding existing in _bindings)
             {
                 if (existing.Matches(vhost, exchange, queue, routingKey))
@@ -325,14 +333,13 @@ public sealed class InMemoryEngine : IRouteEngine
         List<InMemoryMessage> dropped = [];
         lock (_lock)
         {
-            // Parse AMQP expiration (milliseconds as string) to DateTimeOffset.
-            DateTimeOffset? expiration = null;
-            if (!string.IsNullOrEmpty(properties.Expiration) &&
-                long.TryParse(properties.Expiration, out var ms))
-            {
-                expiration = DateTimeOffset.FromUnixTimeMilliseconds(ms);
-            }
+            // The AMQP `expiration` property is milliseconds from enqueue, not an
+            // absolute Unix timestamp: resolve the deadline now. Negative or
+            // unparseable values leave no deadline (M1 behavior, pinned by tests),
+            // and an overflowing deadline is dropped rather than thrown.
+            DateTimeOffset? expiration = ResolveExpiration(properties.Expiration);
 
+            _lastUsed[(vhost, queue)] = DateTimeOffset.UtcNow;
             InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
             envelopeId = ++_lastEnvelopeId;
             delivery.AppendAlreadyLocked(new InMemoryMessage(properties, DefensiveCopy(body), exchange, routingKey, envelopeId, Expiration: expiration));
@@ -424,6 +431,8 @@ public sealed class InMemoryEngine : IRouteEngine
                 return ConsumeRegisterOutcome.QueueNotFound;
             }
 
+            _lastUsed[(vhost, queue)] = DateTimeOffset.UtcNow;
+
             InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
             if (consumer.IsExclusive && delivery.HasConsumers)
             {
@@ -449,6 +458,14 @@ public sealed class InMemoryEngine : IRouteEngine
             if (_delivery.TryGetValue((vhost, queue), out InMemoryQueue? delivery))
             {
                 delivery.UnregisterConsumerAlreadyLocked(consumerTag);
+
+                // The idle clock restarts when the last consumer leaves: x-expires
+                // measures "no consumers and no use", not time since the queue was
+                // ever touched.
+                if (!delivery.HasConsumers)
+                {
+                    _lastUsed[(vhost, queue)] = DateTimeOffset.UtcNow;
+                }
             }
         }
     }
@@ -507,6 +524,8 @@ public sealed class InMemoryEngine : IRouteEngine
                 return GetClaimOutcome.QueueNotFound;
             }
 
+            _lastUsed[(vhost, queue)] = DateTimeOffset.UtcNow;
+
             // A queue with no delivery state yet has no consumers and no messages.
             if (!_delivery.TryGetValue((vhost, queue), out InMemoryQueue? delivery))
             {
@@ -523,7 +542,7 @@ public sealed class InMemoryEngine : IRouteEngine
                 return GetClaimOutcome.Empty;
             }
 
-            message = popped;
+            message = popped with { DeliveryCount = popped.DeliveryCount + 1 };
             remaining = delivery.ReadyCount;
             return GetClaimOutcome.Claimed;
         }
@@ -549,20 +568,29 @@ public sealed class InMemoryEngine : IRouteEngine
         {
             _queues.Remove((vhost, queue));
             _delivery.Remove((vhost, queue));
+            _lastUsed.Remove((vhost, queue));
             _bindings.RemoveAll(binding => binding.Vhost == vhost && binding.Queue == queue);
         }
     }
 
-    /// <summary>Returns a queue's expiration time, or null if none was set.</summary>
-    internal DateTimeOffset? GetQueueExpiry(string vhost, string queue)
+    /// <summary>The queue's configured idle-expiry duration (x-expires), or null
+    /// when the queue has none. Whether the idle clock has run out is the reaper's
+    /// call (LastUsed + this duration).</summary>
+    internal TimeSpan? GetQueueIdleExpiration(string vhost, string queue)
     {
         lock (_lock)
         {
-            if (_queues.TryGetValue((vhost, queue), out QueueInfo? qi))
-            {
-                return qi.Expiration;
-            }
-            return null;
+            return _queues.TryGetValue((vhost, queue), out QueueInfo? qi) ? qi.Expiration : null;
+        }
+    }
+
+    /// <summary>The queue's last-use stamp, or null when the queue does not exist.
+    /// In-memory only: a restart forgets it and the idle clock begins afresh.</summary>
+    internal DateTimeOffset? GetQueueLastUsed(string vhost, string queue)
+    {
+        lock (_lock)
+        {
+            return _lastUsed.TryGetValue((vhost, queue), out DateTimeOffset lastUsed) ? lastUsed : null;
         }
     }
 
@@ -602,6 +630,28 @@ public sealed class InMemoryEngine : IRouteEngine
     /// this copy, so no message ever aliases another's array.</summary>
     private static byte[] DefensiveCopy(byte[] body) =>
         body.Length == 0 ? [] : body.AsSpan().ToArray();
+
+    /// <summary>The AMQP expiration property is a relative millisecond count. A
+    /// negative or unparseable value means "no deadline"; a deadline that would
+    /// overflow the clock is dropped rather than thrown.</summary>
+    private static DateTimeOffset? ResolveExpiration(string? expiration)
+    {
+        if (string.IsNullOrEmpty(expiration)
+            || !long.TryParse(expiration, out long milliseconds)
+            || milliseconds < 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return DateTimeOffset.UtcNow.AddMilliseconds(milliseconds);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
 
     private readonly record struct Binding(string Vhost, string Exchange, string Queue, string RoutingKey, FieldTable? Arguments)
     {

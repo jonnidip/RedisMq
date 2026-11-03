@@ -447,6 +447,41 @@ public sealed class RedisStreamRouteEngineTests
     }
 
     [Fact]
+    public async Task Replay_restores_queue_arguments()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/replay-args-{Guid.NewGuid():N}";
+
+        await using (var engine1 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 1024))
+        {
+            engine1.DeclareExchange(new ExchangeInfo(vhost, "dlx", "direct"));
+            engine1.DeclareQueue(new QueueInfo(
+                vhost,
+                "q",
+                Expiration: TimeSpan.FromSeconds(30),
+                MaxLength: 5,
+                DeadLetterExchange: "dlx",
+                DeadLetterRoutingKey: "dead",
+                DeliveryLimit: 3));
+            await Task.Delay(500, TestContext.Current.CancellationToken); // let the drainer mirror the declare
+        }
+
+        await using var engine2 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: true, drainerCapacity: 1024);
+
+        QueueInfo restored = engine2.GetQueue(vhost, "q")!;
+        Assert.Equal(TimeSpan.FromSeconds(30), restored.Expiration);
+        Assert.Equal(5, restored.MaxLength);
+        Assert.Equal("dlx", restored.DeadLetterExchange);
+        Assert.Equal("dead", restored.DeadLetterRoutingKey);
+        Assert.Equal(3, restored.DeliveryLimit);
+    }
+
+    [Fact]
     public async Task Replay_restores_expiry_delivery_count_and_redelivered()
     {
         var db = TryConnectRedis();
@@ -484,7 +519,7 @@ public sealed class RedisStreamRouteEngineTests
         Assert.NotNull(claimed);
         Assert.Equal(42UL, claimed!.EnvelopeId);
         Assert.Equal(expiresAt, claimed.Expiration);
-        Assert.Equal(4, claimed.DeliveryCount);
+        Assert.Equal(5, claimed.DeliveryCount); // replay restored 4; the claim increments
         Assert.True(claimed.Redelivered);
         Assert.Equal("text/plain", claimed.Props.ContentType);
         Assert.Equal("v", claimed.Props.Headers!["k"].Raw);
@@ -573,10 +608,9 @@ public sealed class RedisStreamRouteEngineTests
 
         Assert.Equal(GetClaimOutcome.Claimed, engine.TryClaimForGet(vhost, "q", out InMemoryMessage? claimed, out _));
 
-        // The claim-side increment lands in Task 7; the mirror must carry whatever
-        // count the engine hands it.
-        InMemoryMessage redelivered = claimed! with { DeliveryCount = claimed.DeliveryCount + 1 };
-        engine.Requeue(vhost, "q", redelivered);
+        // The claim increments DeliveryCount; the mirror carries the claimed message.
+        Assert.Equal(1, claimed!.DeliveryCount);
+        engine.Requeue(vhost, "q", claimed);
 
         await WaitUntilAsync(async () =>
         {
@@ -715,7 +749,7 @@ public sealed class RedisStreamRouteEngineTests
 
         Assert.Equal(GetClaimOutcome.Claimed, replay.TryClaimForGet(vhost, "q", out InMemoryMessage? claimed, out _));
         Assert.Equal(7UL, claimed!.EnvelopeId);
-        Assert.Equal(1, claimed.DeliveryCount);
+        Assert.Equal(2, claimed.DeliveryCount); // replay restored 1; the claim increments
         Assert.True(claimed.Redelivered);
     }
 
