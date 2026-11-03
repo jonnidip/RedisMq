@@ -22,4 +22,8 @@
     <ProjectReference Include="..\..\src\RedisMQ.Broker\RedisMQ.Broker.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\RedisMQ.Broker.Tests\TestCertificates.cs" Link="TestCertificates.cs" />
+  </ItemGroup>
+
 </Project>
