@@ -9,7 +9,8 @@ using RedisMQ.Broker.Codec;
 /// the channel (ChannelContext) owns every protocol check — and it is strictly
 /// insertion-ordered and thread-safe, so the single <see cref="WireConnection"/>
 /// frame pump can share one instance with tests that poke at engine state directly.
-/// Queue deletes do not exist in M0, so the message dictionaries only ever grow.
+/// Queue deletion exists only through the reaper (x-expires) and the Redis
+/// engine's exclusive/auto-delete reconciliation.
 /// </summary>
 public sealed class InMemoryEngine : IRouteEngine
 {
@@ -19,8 +20,8 @@ public sealed class InMemoryEngine : IRouteEngine
     private readonly List<Binding> _bindings = [];
 
     // Task 7: per-queue delivery state (ready buffer, consumer registry, pump) keyed
-    // like the old message lists; created lazily on first enqueue/consume and, since
-    // queue deletes do not exist in M0, never removed again.
+    // like the old message lists; created lazily on first enqueue/consume and removed
+    // by a queue delete or the x-expires reaper.
     private readonly Dictionary<(string Vhost, string Queue), InMemoryQueue> _delivery = [];
     private ulong _lastEnvelopeId; // the highest InMemoryMessage.EnvelopeId handed out
 
@@ -396,8 +397,8 @@ public sealed class InMemoryEngine : IRouteEngine
     // ---------- consume seam (Task 7) ----------
 
     /// <summary>The per-queue delivery state, created under the engine lock on first
-    /// touch (enqueue, consume, requeue, or a claim attempt) and kept forever, since
-    /// queue deletes do not exist in M0.</summary>
+    /// touch (enqueue, consume, requeue, or a claim attempt) and removed with the
+    /// queue (explicit delete or the x-expires reaper).</summary>
     private InMemoryQueue DeliveryQueueAlreadyLocked(string vhost, string queue)
     {
         (string, string) key = (vhost, queue);
@@ -540,15 +541,42 @@ public sealed class InMemoryEngine : IRouteEngine
         return new EngineDelta(enqueued, removed, []);
     }
 
-    /// <summary>The reaper's ready-message sweep. Queue keys are snapshotted first,
-    /// so a dead-letter copy into another queue (or back into this one) does not
-    /// mutate the set being iterated. Queue expiry belongs to Task 9.</summary>
+    /// <summary>The reaper's sweep: first idle queues (x-expires) are deleted with
+    /// their messages, delivery state, bindings and last-use stamp — messages of an
+    /// expired queue are dropped, never dead-lettered; then every ready message in
+    /// the surviving queues whose deadline passed is dead-lettered or dropped. Keys
+    /// are snapshotted first, so a dead-letter copy into another queue (or back into
+    /// this one) cannot mutate the set being iterated.</summary>
     public EngineDelta Reap(DateTimeOffset now)
     {
         List<QueuedMessage> enqueued = [];
         List<QueuedMessageRef> removed = [];
+        List<(string Vhost, string Name)> deletedQueues = [];
         lock (_lock)
         {
+            (string Vhost, string Queue)[] queues = [.. _queues.Keys];
+            foreach ((string Vhost, string Queue) key in queues)
+            {
+                if (!_queues.TryGetValue(key, out QueueInfo? info)
+                    || info.Expiration is not TimeSpan idle
+                    || !_lastUsed.TryGetValue(key, out DateTimeOffset lastUsed)
+                    || now < lastUsed + idle)
+                {
+                    continue;
+                }
+
+                if (_delivery.TryGetValue(key, out InMemoryQueue? state) && state.HasConsumers)
+                {
+                    continue; // an active consumer keeps the queue alive
+                }
+
+                _queues.Remove(key);
+                _delivery.Remove(key);
+                _lastUsed.Remove(key);
+                _bindings.RemoveAll(binding => binding.Vhost == key.Vhost && binding.Queue == key.Queue);
+                deletedQueues.Add(key);
+            }
+
             (string Vhost, string Queue)[] keys = [.. _delivery.Keys];
             List<InMemoryMessage> expired = [];
             foreach ((string Vhost, string Queue) key in keys)
@@ -568,7 +596,7 @@ public sealed class InMemoryEngine : IRouteEngine
             }
         }
 
-        return new EngineDelta(enqueued, removed, []);
+        return new EngineDelta(enqueued, removed, deletedQueues);
     }
 
     /// <summary>

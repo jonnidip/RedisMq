@@ -1,5 +1,6 @@
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 using System.Text;
 using Xunit;
 
@@ -339,5 +340,40 @@ public sealed class FlowTests
 
         await done.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         Assert.Equal(100, count);
+    }
+
+    [Fact]
+    public async Task Idle_queue_with_x_expires_is_deleted_by_the_reaper()
+    {
+        await using TestBrokerHost host = TestBrokerHost.Start(
+            options => options.ReaperInterval = TimeSpan.FromMilliseconds(50));
+        await using IConnection connection = await ConnectAsync(host);
+        await using IChannel channel = await NewChannelAsync(connection);
+
+        await channel.QueueDeclareAsync(
+            "expiring-q",
+            durable: false,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-expires"] = 100 },
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        bool expired = false;
+        for (int attempt = 0; attempt < 100 && !expired; attempt++)
+        {
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+            await using IChannel poll = await NewChannelAsync(connection);
+            try
+            {
+                _ = await poll.QueueDeclarePassiveAsync(
+                    "expiring-q", cancellationToken: TestContext.Current.CancellationToken);
+            }
+            catch (OperationInterruptedException)
+            {
+                expired = true; // 404 not_found: the idle queue is gone
+            }
+        }
+
+        Assert.True(expired, "the idle queue with x-expires was never deleted");
     }
 }

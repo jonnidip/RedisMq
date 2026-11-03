@@ -777,6 +777,45 @@ public sealed class RedisStreamRouteEngineTests
     }
 
     [Fact]
+    public async Task Redis_reap_mirrors_queue_deletes()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-reap-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareExchange(new ExchangeInfo(vhost, "ex", "direct"));
+        engine.DeclareQueue(new QueueInfo(vhost, "q", Expiration: TimeSpan.FromMilliseconds(100)));
+        engine.Bind(vhost, "ex", "q", "rk");
+        EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "ex", "rk");
+        Assert.True(await receipt.Durable);
+        await WaitUntilAsync(
+            async () => await db.StreamLengthAsync(queueKey) == 1,
+            "the queue stream to exist before the reap");
+
+        EngineDelta delta = engine.Reap(DateTimeOffset.UtcNow.AddSeconds(1));
+
+        (string Vhost, string Name) deleted = Assert.Single(delta.DeletedQueues);
+        Assert.Equal(vhost, deleted.Vhost);
+        Assert.Equal("q", deleted.Name);
+        Assert.Null(engine.GetQueue(vhost, "q"));
+
+        await WaitUntilAsync(async () => !await db.KeyExistsAsync(queueKey), "the queue stream to be deleted");
+        await engine.DisposeAsync();
+
+        await using var replay = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: true, drainerCapacity: 16, enforceEvictionGate: false);
+        Assert.Null(replay.GetQueue(vhost, "q"));
+        Assert.Empty(replay.RouteTo(replay.GetExchange(vhost, "ex")!, new ContentProperties(), "rk"));
+    }
+
+    [Fact]
     public async Task Unbind_tombstone_survives_replay()
     {
         IDatabase? db = TryConnectRedis();

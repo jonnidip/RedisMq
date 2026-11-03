@@ -19,6 +19,7 @@ public sealed class AmqpBrokerServer
     private readonly object _gate = new();
     private CancellationTokenSource? _stoppingCts;
     private Task _acceptTask = Task.CompletedTask;
+    private Task _reaperTask = Task.CompletedTask;
     private bool _started;
 
     public AmqpBrokerServer(BrokerServerOptions options, IRouteEngine engine, IListenerTransport? listener = null)
@@ -46,6 +47,9 @@ public sealed class AmqpBrokerServer
         _acceptTask = _listener is null
             ? Task.CompletedTask
             : RunAcceptLoopAsync(_stoppingCts.Token);
+        _reaperTask = _options.ReaperInterval > TimeSpan.Zero
+            ? RunReaperAsync(_options.ReaperInterval, _stoppingCts.Token)
+            : Task.CompletedTask;
         return Task.CompletedTask;
     }
 
@@ -67,6 +71,15 @@ public sealed class AmqpBrokerServer
         catch
         {
             // The accept loop follows the listener's own failure surface.
+        }
+
+        try
+        {
+            await _reaperTask;
+        }
+        catch
+        {
+            // The reaper loop exits on cancellation; nothing else to observe.
         }
 
         Task[] connections;
@@ -106,6 +119,25 @@ public sealed class AmqpBrokerServer
             }
 
             TrackConnection(side, ct);
+        }
+    }
+
+    /// <summary>One shared reaper loop for the whole server (never one per listener):
+    /// it sweeps expired messages and idle queues on the configured interval until
+    /// <see cref="StopAsync"/> cancels it.</summary>
+    private async Task RunReaperAsync(TimeSpan interval, CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(interval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                _engine.Reap(DateTimeOffset.UtcNow);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // stopping
         }
     }
 
