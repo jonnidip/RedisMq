@@ -38,6 +38,9 @@ public static class RedisKeys
         public const string RoutingKey = "rk";
         public const string Body = "body";
         public const string Properties = "props";
+        public const string ExpiresAt = "expires-at";
+        public const string DeliveryCount = "delivery-count";
+        public const string Redelivered = "redelivered";
     }
 
     /// <summary>Topology operation kinds.</summary>

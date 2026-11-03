@@ -1,4 +1,3 @@
-using System.Text.Json;
 using RedisMQ.Broker.Codec;
 
 namespace RedisMQ.Redis;
@@ -37,6 +36,8 @@ public sealed record WriteCommand
     public ulong EnvelopeId { get; init; }
     public byte[]? Body { get; init; }
     public ContentProperties? Properties { get; init; }
+    public DateTimeOffset? ExpiresAt { get; init; }
+    public int DeliveryCount { get; init; }
     public bool Redelivered { get; init; }
 
     /// <summary>Completes when the drainer has written (or failed to write) this
@@ -87,7 +88,7 @@ public sealed record WriteCommand
         RoutingKey = routingKey,
     };
 
-    public static WriteCommand Enqueue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties) => new()
+    public static WriteCommand Enqueue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties, DateTimeOffset? expiresAt = null, int deliveryCount = 0) => new()
     {
         Kind = WriteCommandKind.Enqueue,
         Vhost = vhost,
@@ -97,6 +98,8 @@ public sealed record WriteCommand
         RoutingKey = routingKey,
         Body = body,
         Properties = properties,
+        ExpiresAt = expiresAt,
+        DeliveryCount = deliveryCount,
     };
 
     public static WriteCommand RegisterConsumer(string vhost, string queue, string consumerTag) => new()
@@ -122,7 +125,7 @@ public sealed record WriteCommand
         Queue = queue,
     };
 
-    public static WriteCommand Requeue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties, bool redelivered) => new()
+    public static WriteCommand Requeue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties, bool redelivered, DateTimeOffset? expiresAt = null, int deliveryCount = 0) => new()
     {
         Kind = WriteCommandKind.Requeue,
         Vhost = vhost,
@@ -133,6 +136,8 @@ public sealed record WriteCommand
         Body = body,
         Properties = properties,
         Redelivered = redelivered,
+        ExpiresAt = expiresAt,
+        DeliveryCount = deliveryCount,
     };
 
     // ---------- stream field serialization ----------
@@ -190,8 +195,7 @@ public sealed record WriteCommand
                 fields.Add(("queue", Queue ?? string.Empty));
                 fields.AddRange(StreamCodec.EncodeEnqueue(new EnvelopeRecord(
                     EnvelopeId, Exchange ?? string.Empty, RoutingKey ?? string.Empty,
-                    Body ?? [], PropertiesJson: Properties is not null ? JsonSerializer.Serialize(Properties) : string.Empty)));
-                fields.Add(("redelivered", Redelivered ? "1" : "0"));
+                    Body ?? [], Properties ?? new ContentProperties(), ExpiresAt, DeliveryCount, Redelivered)));
                 break;
         }
 
@@ -209,16 +213,12 @@ public sealed record WriteCommand
         {
             var record = StreamCodec.DecodeEnqueue(fields);
             string queue = dict.GetValueOrDefault("queue") ?? string.Empty;
-            bool redelivered = bool.TryParse(dict.GetValueOrDefault("redelivered"), out var r) && r;
-            ContentProperties? properties = null;
-            if (!string.IsNullOrEmpty(record.PropertiesJson))
-            {
-                properties = JsonSerializer.Deserialize<ContentProperties>(record.PropertiesJson);
-            }
 
             return kind == WriteCommandKind.Enqueue
-                ? Enqueue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body, properties)
-                : Requeue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body, properties, redelivered);
+                ? Enqueue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body,
+                    record.Properties, record.ExpiresAt, record.DeliveryCount)
+                : Requeue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body,
+                    record.Properties, record.Redelivered, record.ExpiresAt, record.DeliveryCount);
         }
 
         return kind switch

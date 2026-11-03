@@ -20,4 +20,5 @@ public sealed record InMemoryMessage(
     string RoutingKey,
     ulong EnvelopeId,
     bool Redelivered = false,
-    DateTimeOffset? Expiration = null);
+    DateTimeOffset? Expiration = null,
+    int DeliveryCount = 0);

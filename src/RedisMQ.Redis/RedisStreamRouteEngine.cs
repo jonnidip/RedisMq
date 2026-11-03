@@ -1,5 +1,4 @@
 using System.Linq;
-using System.Text.Json;
 using System.Threading.Channels;
 using RedisMQ.Broker.Codec;
 using RedisMQ.Broker.Memory;
@@ -419,14 +418,15 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
 
             var record = StreamCodec.DecodeEnqueue(
                 dict.Select(kv => (kv.Key, kv.Value)).ToList());
-            ContentProperties? properties = null;
-            if (!string.IsNullOrEmpty(record.PropertiesJson))
-            {
-                properties = JsonSerializer.Deserialize<ContentProperties>(record.PropertiesJson);
-            }
-
             var message = new InMemoryMessage(
-                properties ?? new ContentProperties(), record.Body, record.Exchange, record.RoutingKey, record.EnvelopeId);
+                record.Properties,
+                record.Body,
+                record.Exchange,
+                record.RoutingKey,
+                record.EnvelopeId,
+                record.Redelivered,
+                record.ExpiresAt,
+                record.DeliveryCount);
             _memory.ReplayEnqueue(vhost, queueName, message);
         }
     }

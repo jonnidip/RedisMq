@@ -19,7 +19,10 @@ public sealed class StreamCodecTests
             Exchange: "fex",
             RoutingKey: "rk",
             Body: body,
-            PropertiesJson: "{\"content-type\":\"text/plain\"}");
+            Properties: new ContentProperties(ContentType: "text/plain"),
+            ExpiresAt: null,
+            DeliveryCount: 0,
+            Redelivered: false);
 
         var fields = StreamCodec.EncodeEnqueue(record);
         var decoded = StreamCodec.DecodeEnqueue(fields);
@@ -27,14 +30,126 @@ public sealed class StreamCodecTests
         Assert.Equal(record.EnvelopeId, decoded.EnvelopeId);
         Assert.Equal(record.Exchange, decoded.Exchange);
         Assert.Equal(record.RoutingKey, decoded.RoutingKey);
-        Assert.Equal(record.PropertiesJson, decoded.PropertiesJson);
+        Assert.Equal(record.Properties.ContentType, decoded.Properties.ContentType);
         Assert.Equal(body, decoded.Body);
+    }
+
+    [Fact]
+    public void Encode_decode_round_trips_properties_in_amqp_wire_form()
+    {
+        var headers = new FieldTable([
+            new("nested", FieldValue.From(new FieldTable([
+                new("inner-key", FieldValue.From("inner-value")),
+                new("inner-count", FieldValue.From(9L)),
+            ]))),
+            new("list", FieldValue.List(FieldValue.From("a"), FieldValue.From(2), FieldValue.Null)),
+            new("when", FieldValue.From(new DateTimeOffset(2024, 5, 6, 7, 8, 9, TimeSpan.Zero))),
+            new("blob", FieldValue.From(new byte[] { 9, 8, 7 })),
+            new("money", FieldValue.From(12.34m)),
+        ]);
+        var properties = new ContentProperties(
+            ContentType: "application/json",
+            ContentEncoding: "utf-8",
+            Headers: headers,
+            DeliveryMode: 2,
+            Priority: 5,
+            CorrelationId: "corr",
+            ReplyTo: "reply",
+            Expiration: "60000",
+            MessageId: "mid",
+            Timestamp: new DateTimeOffset(2023, 1, 2, 3, 4, 5, TimeSpan.Zero),
+            Type: "event",
+            UserId: "guest",
+            AppId: "tests",
+            ClusterId: "cluster");
+
+        var record = new EnvelopeRecord(
+            EnvelopeId: 8,
+            Exchange: "fex",
+            RoutingKey: "rk",
+            Body: [1, 2, 3],
+            Properties: properties,
+            ExpiresAt: null,
+            DeliveryCount: 0,
+            Redelivered: false);
+
+        EnvelopeRecord decoded = StreamCodec.DecodeEnqueue(StreamCodec.EncodeEnqueue(record));
+        ContentProperties roundTripped = decoded.Properties;
+
+        Assert.Equal(properties.ContentType, roundTripped.ContentType);
+        Assert.Equal(properties.ContentEncoding, roundTripped.ContentEncoding);
+        Assert.Equal(properties.DeliveryMode, roundTripped.DeliveryMode);
+        Assert.Equal(properties.Priority, roundTripped.Priority);
+        Assert.Equal(properties.CorrelationId, roundTripped.CorrelationId);
+        Assert.Equal(properties.ReplyTo, roundTripped.ReplyTo);
+        Assert.Equal(properties.Expiration, roundTripped.Expiration);
+        Assert.Equal(properties.MessageId, roundTripped.MessageId);
+        Assert.Equal(properties.Timestamp, roundTripped.Timestamp);
+        Assert.Equal(properties.Type, roundTripped.Type);
+        Assert.Equal(properties.UserId, roundTripped.UserId);
+        Assert.Equal(properties.AppId, roundTripped.AppId);
+        Assert.Equal(properties.ClusterId, roundTripped.ClusterId);
+
+        Assert.NotNull(roundTripped.Headers);
+        Assert.Equal(headers.Count, roundTripped.Headers!.Count);
+        foreach ((string key, FieldValue value) in headers)
+        {
+            Assert.True(roundTripped.Headers.TryGetValue(key, out FieldValue actual));
+            Assert.Equal(value, actual);
+        }
+    }
+
+    [Fact]
+    public void Encode_decode_round_trips_expiry_delivery_count_and_redelivered()
+    {
+        var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_000_123);
+        var record = new EnvelopeRecord(
+            EnvelopeId: 5,
+            Exchange: "ex",
+            RoutingKey: "rk",
+            Body: [4, 5],
+            Properties: new ContentProperties(),
+            ExpiresAt: expiresAt,
+            DeliveryCount: 3,
+            Redelivered: true);
+
+        var fields = StreamCodec.EncodeEnqueue(record);
+        Assert.Contains((RedisKeys.QueueField.ExpiresAt, "1700000000123"), fields);
+        Assert.Contains((RedisKeys.QueueField.DeliveryCount, "3"), fields);
+        Assert.Contains((RedisKeys.QueueField.Redelivered, "1"), fields);
+
+        EnvelopeRecord decoded = StreamCodec.DecodeEnqueue(fields);
+        Assert.Equal(expiresAt, decoded.ExpiresAt);
+        Assert.Equal(3, decoded.DeliveryCount);
+        Assert.True(decoded.Redelivered);
+    }
+
+    [Fact]
+    public void Null_expiry_is_omitted_and_decodes_null()
+    {
+        var record = new EnvelopeRecord(1, "", "", [], new ContentProperties(), null, 0, false);
+        var fields = StreamCodec.EncodeEnqueue(record);
+        Assert.DoesNotContain(fields, field => field.Field == RedisKeys.QueueField.ExpiresAt);
+        Assert.Null(StreamCodec.DecodeEnqueue(fields).ExpiresAt);
+    }
+
+    [Fact]
+    public void Malformed_properties_payload_falls_back_to_empty()
+    {
+        var fields = StreamCodec.EncodeEnqueue(
+            new EnvelopeRecord(1, "", "", [], new ContentProperties(ContentType: "x"), null, 0, false));
+        var corrupted = fields
+            .Select(field => field.Field == RedisKeys.QueueField.Properties ? (field.Field, "not-base64!") : field)
+            .ToArray();
+
+        EnvelopeRecord decoded = StreamCodec.DecodeEnqueue(corrupted);
+        Assert.Equal(new ContentProperties(), decoded.Properties);
     }
 
     [Fact]
     public void Empty_body_round_trips()
     {
-        var record = new EnvelopeRecord(1, "", "", [], "{}");
+        var record = new EnvelopeRecord(1, "", "", [], new ContentProperties(), null, 0, false);
         var fields = StreamCodec.EncodeEnqueue(record);
         var decoded = StreamCodec.DecodeEnqueue(fields);
         Assert.Empty(decoded.Body);
@@ -79,6 +194,32 @@ public sealed class WriteCommandTests
             Assert.Equal(command.Vhost, roundTripped.Vhost);
             Assert.Equal(command.Body, roundTripped.Body);
         }
+    }
+
+    [Fact]
+    public void Enqueue_and_requeue_round_trip_amqp_properties_and_delivery_metadata()
+    {
+        var properties = new ContentProperties(
+            ContentType: "text/plain",
+            Headers: new FieldTable([new("tenant", FieldValue.From("acme"))]),
+            DeliveryMode: 2);
+        var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(1_800_000_000_000);
+
+        WriteCommand enqueue = WriteCommand.Enqueue(
+            "/", "q", 11, "fex", "rk", new byte[] { 1, 2 }, properties, expiresAt, deliveryCount: 2);
+        WriteCommand decodedEnqueue = WriteCommand.FromStreamFields(WriteCommandKind.Enqueue, enqueue.ToStreamFields());
+        Assert.Equal(expiresAt, decodedEnqueue.ExpiresAt);
+        Assert.Equal(2, decodedEnqueue.DeliveryCount);
+        Assert.Equal("text/plain", decodedEnqueue.Properties!.ContentType);
+        Assert.Equal("acme", decodedEnqueue.Properties.Headers!["tenant"].Raw);
+
+        WriteCommand requeue = WriteCommand.Requeue(
+            "/", "q", 11, "fex", "rk", new byte[] { 1, 2 }, properties, redelivered: true, expiresAt, deliveryCount: 3);
+        WriteCommand decodedRequeue = WriteCommand.FromStreamFields(WriteCommandKind.Requeue, requeue.ToStreamFields());
+        Assert.Equal(expiresAt, decodedRequeue.ExpiresAt);
+        Assert.Equal(3, decodedRequeue.DeliveryCount);
+        Assert.True(decodedRequeue.Redelivered);
+        Assert.Equal("text/plain", decodedRequeue.Properties!.ContentType);
     }
 }
 
@@ -266,6 +407,50 @@ public sealed class RedisStreamRouteEngineTests
         Assert.Equal(["q"], engine2.RouteTo(headers, matching, ""));
         var other = new ContentProperties { Headers = new FieldTable([new("color", FieldValue.From("blue"))]) };
         Assert.Empty(engine2.RouteTo(headers, other, ""));
+    }
+
+    [Fact]
+    public async Task Replay_restores_expiry_delivery_count_and_redelivered()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/replay-m4-{Guid.NewGuid():N}";
+        string queue = "q";
+
+        await using var engine1 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 1024);
+        engine1.DeclareQueue(new QueueInfo(vhost, queue));
+        await Task.Delay(500, TestContext.Current.CancellationToken); // let the drainer mirror the topology
+
+        var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(1_900_000_000_000);
+        var record = new EnvelopeRecord(
+            EnvelopeId: 42,
+            Exchange: "fex",
+            RoutingKey: "rk",
+            Body: [7, 8, 9],
+            Properties: new ContentProperties(
+                ContentType: "text/plain",
+                Headers: new FieldTable([new("k", FieldValue.From("v"))])),
+            ExpiresAt: expiresAt,
+            DeliveryCount: 4,
+            Redelivered: true);
+        await db.StreamAddAsync(
+            RedisKeys.QueueKey(vhost, queue),
+            StreamCodec.EncodeEnqueue(record).Select(f => new NameValueEntry(f.Field, f.Value)).ToArray());
+
+        await using var engine2 = new RedisStreamRouteEngine(db, [vhost], replayOnStart: true, drainerCapacity: 1024);
+
+        Assert.Equal(GetClaimOutcome.Claimed, engine2.TryClaimForGet(vhost, queue, out InMemoryMessage? claimed, out _));
+        Assert.NotNull(claimed);
+        Assert.Equal(42UL, claimed!.EnvelopeId);
+        Assert.Equal(expiresAt, claimed.Expiration);
+        Assert.Equal(4, claimed.DeliveryCount);
+        Assert.True(claimed.Redelivered);
+        Assert.Equal("text/plain", claimed.Props.ContentType);
+        Assert.Equal("v", claimed.Props.Headers!["k"].Raw);
     }
 
     [Fact]

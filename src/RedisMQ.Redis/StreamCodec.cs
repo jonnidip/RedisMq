@@ -1,35 +1,57 @@
-using System.Text;
+using System.Globalization;
+using RedisMQ.Broker.Codec;
 
 namespace RedisMQ.Redis;
 
 /// <summary>
-/// Encodes and decodes a single enqueue operation's stream fields. Bodies round-trip
-/// byte-exact (stored as base64 so arbitrary binary survives Redis string handling).
-/// Content properties are stored as their UTF-8 JSON form.
+/// One durable queue entry: the envelope identity, routing origin, body, AMQP-wire
+/// content properties, and the delivery metadata the mirror needs to replay the
+/// message faithfully. Bodies and properties round-trip byte-exact; properties are
+/// stored in their AMQP content-header wire form because a <see cref="ContentProperties"/>
+/// carries a <see cref="FieldTable"/> that JSON cannot represent.
 /// </summary>
 public sealed record EnvelopeRecord(
     ulong EnvelopeId,
     string Exchange,
     string RoutingKey,
     byte[] Body,
-    string PropertiesJson);
+    ContentProperties Properties,
+    DateTimeOffset? ExpiresAt,
+    int DeliveryCount,
+    bool Redelivered);
 
 public static class StreamCodec
 {
+    private const ushort BasicContentClassId = 60;
+
     /// <summary>Encodes an enqueue into stream field/value pairs.</summary>
     public static (string Field, string Value)[] EncodeEnqueue(EnvelopeRecord record)
     {
         ArgumentNullException.ThrowIfNull(record);
         byte[] body = record.Body;
         ArgumentNullException.ThrowIfNull(body);
-        return new[]
+        ContentProperties properties = record.Properties ?? new ContentProperties();
+
+        var headerWriter = new ByteWriter();
+        ContentHeaderCodec.Write(headerWriter, BasicContentClassId, body.LongLength, properties);
+
+        var fields = new List<(string Field, string Value)>
         {
-            (RedisKeys.QueueField.EnvelopeId, record.EnvelopeId.ToString()),
+            (RedisKeys.QueueField.EnvelopeId, record.EnvelopeId.ToString(CultureInfo.InvariantCulture)),
             (RedisKeys.QueueField.Exchange, record.Exchange ?? string.Empty),
             (RedisKeys.QueueField.RoutingKey, record.RoutingKey ?? string.Empty),
             (RedisKeys.QueueField.Body, Convert.ToBase64String(body)),
-            (RedisKeys.QueueField.Properties, record.PropertiesJson ?? string.Empty),
+            (RedisKeys.QueueField.Properties, Convert.ToBase64String(headerWriter.ToArray())),
+            (RedisKeys.QueueField.DeliveryCount, record.DeliveryCount.ToString(CultureInfo.InvariantCulture)),
+            (RedisKeys.QueueField.Redelivered, record.Redelivered ? "1" : "0"),
         };
+
+        if (record.ExpiresAt is DateTimeOffset expiresAt)
+        {
+            fields.Add((RedisKeys.QueueField.ExpiresAt, expiresAt.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture)));
+        }
+
+        return [.. fields];
     }
 
     /// <summary>Decodes an enqueue from stream field/value pairs.</summary>
@@ -38,17 +60,77 @@ public static class StreamCodec
         ArgumentNullException.ThrowIfNull(fields);
         var dict = fields.ToDictionary(kv => kv.Field, kv => kv.Value, StringComparer.Ordinal);
 
-        ulong envelopeId = ulong.TryParse(dict.GetValueOrDefault(RedisKeys.QueueField.EnvelopeId), out var id)
+        ulong envelopeId = ulong.TryParse(
+            dict.GetValueOrDefault(RedisKeys.QueueField.EnvelopeId),
+            NumberStyles.Integer,
+            CultureInfo.InvariantCulture,
+            out var id)
             ? id
             : 0;
+
         string exchange = dict.GetValueOrDefault(RedisKeys.QueueField.Exchange) ?? string.Empty;
         string routingKey = dict.GetValueOrDefault(RedisKeys.QueueField.RoutingKey) ?? string.Empty;
         byte[] body = TryGetBase64(dict, RedisKeys.QueueField.Body, out var bytes)
             ? bytes ?? []
             : [];
-        string propertiesJson = dict.GetValueOrDefault(RedisKeys.QueueField.Properties) ?? string.Empty;
+        ContentProperties properties = TryDecodeProperties(dict, out var decoded) ? decoded : new ContentProperties();
+        DateTimeOffset? expiresAt = TryDecodeExpiry(dict, out var expiry) ? expiry : null;
+        int deliveryCount = int.TryParse(
+            dict.GetValueOrDefault(RedisKeys.QueueField.DeliveryCount),
+            NumberStyles.Integer,
+            CultureInfo.InvariantCulture,
+            out var count) && count > 0
+            ? count
+            : 0;
+        bool redelivered = dict.GetValueOrDefault(RedisKeys.QueueField.Redelivered) == "1";
 
-        return new EnvelopeRecord(envelopeId, exchange, routingKey, body, propertiesJson);
+        return new EnvelopeRecord(envelopeId, exchange, routingKey, body, properties, expiresAt, deliveryCount, redelivered);
+    }
+
+    private static bool TryDecodeProperties(IReadOnlyDictionary<string, string> dict, out ContentProperties properties)
+    {
+        properties = new ContentProperties();
+        if (!TryGetBase64(dict, RedisKeys.QueueField.Properties, out byte[]? encoded) || encoded is null || encoded.Length == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            var reader = new ByteReader(encoded);
+            properties = ContentHeaderCodec.Read(ref reader).Properties;
+            return true;
+        }
+        catch (Exception ex) when (ex is FormatException or AmqpDecodeException or ArgumentException)
+        {
+            // Replay must never crash on a corrupt mirror entry: absent or damaged
+            // properties degrade to the empty set.
+            properties = new ContentProperties();
+            return false;
+        }
+    }
+
+    private static bool TryDecodeExpiry(IReadOnlyDictionary<string, string> dict, out DateTimeOffset expiresAt)
+    {
+        expiresAt = default;
+        if (!long.TryParse(
+                dict.GetValueOrDefault(RedisKeys.QueueField.ExpiresAt),
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out long unixMilliseconds))
+        {
+            return false;
+        }
+
+        try
+        {
+            expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(unixMilliseconds);
+            return true;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return false;
+        }
     }
 
     private static bool TryGetBase64(IReadOnlyDictionary<string, string> dict, string key, out byte[]? bytes)
