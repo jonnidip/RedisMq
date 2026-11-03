@@ -40,6 +40,16 @@ public sealed record WriteCommand
     public int DeliveryCount { get; init; }
     public bool Redelivered { get; init; }
 
+    /// <summary>Envelope ids a <see cref="WriteCommandKind.Remove"/> command drops.</summary>
+    public ulong[]? EnvelopeIds { get; init; }
+
+    /// <summary>Redis stream ids a <see cref="WriteCommandKind.RemoveStreamIds"/> command deletes.</summary>
+    public string[]? StreamIds { get; init; }
+
+    /// <summary>The ordered child commands of a <see cref="WriteCommandKind.Delta"/> batch.
+    /// Never serialized: one drainer iteration applies the whole batch.</summary>
+    public IReadOnlyList<WriteCommand>? Batch { get; init; }
+
     /// <summary>Completes when the drainer has written (or failed to write) this
     /// command. Protocol-affine: never serialized and never replayed.</summary>
     public TaskCompletionSource<bool>? Completion { get; init; }
@@ -88,7 +98,7 @@ public sealed record WriteCommand
         RoutingKey = routingKey,
     };
 
-    public static WriteCommand Enqueue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties, DateTimeOffset? expiresAt = null, int deliveryCount = 0) => new()
+    public static WriteCommand Enqueue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties, DateTimeOffset? expiresAt = null, int deliveryCount = 0, bool redelivered = false) => new()
     {
         Kind = WriteCommandKind.Enqueue,
         Vhost = vhost,
@@ -100,6 +110,34 @@ public sealed record WriteCommand
         Properties = properties,
         ExpiresAt = expiresAt,
         DeliveryCount = deliveryCount,
+        Redelivered = redelivered,
+    };
+
+    /// <summary>Removes the queue stream entries whose envelope ids the drainer's
+    /// stream-id map resolves.</summary>
+    public static WriteCommand Remove(string vhost, string queue, params ulong[] envelopeIds) => new()
+    {
+        Kind = WriteCommandKind.Remove,
+        Vhost = vhost,
+        Queue = queue,
+        EnvelopeIds = envelopeIds,
+    };
+
+    /// <summary>Removes exact stream ids: the settle path stashes ids before a
+    /// requeue's XADD can overwrite the envelope-id map entry.</summary>
+    public static WriteCommand RemoveStreamIds(string vhost, string queue, params string[] streamIds) => new()
+    {
+        Kind = WriteCommandKind.RemoveStreamIds,
+        Vhost = vhost,
+        Queue = queue,
+        StreamIds = streamIds,
+    };
+
+    /// <summary>One ordered batch the drainer applies in a single iteration.</summary>
+    public static WriteCommand Delta(params WriteCommand[] batch) => new()
+    {
+        Kind = WriteCommandKind.Delta,
+        Batch = batch,
     };
 
     public static WriteCommand RegisterConsumer(string vhost, string queue, string consumerTag) => new()
@@ -125,25 +163,15 @@ public sealed record WriteCommand
         Queue = queue,
     };
 
-    public static WriteCommand Requeue(string vhost, string queue, ulong envelopeId, string exchange, string routingKey, byte[] body, ContentProperties? properties, bool redelivered, DateTimeOffset? expiresAt = null, int deliveryCount = 0) => new()
-    {
-        Kind = WriteCommandKind.Requeue,
-        Vhost = vhost,
-        Queue = queue,
-        EnvelopeId = envelopeId,
-        Exchange = exchange,
-        RoutingKey = routingKey,
-        Body = body,
-        Properties = properties,
-        Redelivered = redelivered,
-        ExpiresAt = expiresAt,
-        DeliveryCount = deliveryCount,
-    };
-
     // ---------- stream field serialization ----------
 
     /// <summary>Serializes this command to stream field/value pairs.</summary>
     public (string Field, string Value)[] ToStreamFields()    {
+        if (Kind == WriteCommandKind.Delta)
+        {
+            throw new InvalidOperationException("delta commands are not replayed");
+        }
+
         var fields = new List<(string Field, string Value)>
         {
             (RedisKeys.TopologyField.Kind, Kind.ToString()),
@@ -191,11 +219,21 @@ public sealed record WriteCommand
                 fields.Add(("queue", Queue ?? string.Empty));
                 break;
 
-            case WriteCommandKind.Enqueue or WriteCommandKind.Requeue:
+            case WriteCommandKind.Enqueue:
                 fields.Add(("queue", Queue ?? string.Empty));
                 fields.AddRange(StreamCodec.EncodeEnqueue(new EnvelopeRecord(
                     EnvelopeId, Exchange ?? string.Empty, RoutingKey ?? string.Empty,
                     Body ?? [], Properties ?? new ContentProperties(), ExpiresAt, DeliveryCount, Redelivered)));
+                break;
+
+            case WriteCommandKind.Remove:
+                fields.Add(("queue", Queue ?? string.Empty));
+                fields.Add(("envelope-ids", string.Join(',', EnvelopeIds ?? [])));
+                break;
+
+            case WriteCommandKind.RemoveStreamIds:
+                fields.Add(("queue", Queue ?? string.Empty));
+                fields.Add(("stream-ids", string.Join(',', StreamIds ?? [])));
                 break;
         }
 
@@ -208,17 +246,13 @@ public sealed record WriteCommand
         var dict = fields.ToDictionary(kv => kv.Field, kv => kv.Value, StringComparer.Ordinal);
         string vhost = dict.GetValueOrDefault(RedisKeys.TopologyField.Vhost) ?? string.Empty;
 
-        // Enqueue and Requeue share the envelope-record encoding plus a queue field.
-        if (kind is WriteCommandKind.Enqueue or WriteCommandKind.Requeue)
+        // Enqueue carries the whole envelope record plus a queue field.
+        if (kind is WriteCommandKind.Enqueue)
         {
             var record = StreamCodec.DecodeEnqueue(fields);
             string queue = dict.GetValueOrDefault("queue") ?? string.Empty;
-
-            return kind == WriteCommandKind.Enqueue
-                ? Enqueue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body,
-                    record.Properties, record.ExpiresAt, record.DeliveryCount)
-                : Requeue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body,
-                    record.Properties, record.Redelivered, record.ExpiresAt, record.DeliveryCount);
+            return Enqueue(vhost, queue, record.EnvelopeId, record.Exchange, record.RoutingKey, record.Body,
+                record.Properties, record.ExpiresAt, record.DeliveryCount, record.Redelivered);
         }
 
         return kind switch
@@ -263,9 +297,34 @@ public sealed record WriteCommand
                 vhost,
                 dict.GetValueOrDefault("queue") ?? string.Empty),
 
+            WriteCommandKind.Remove => Remove(
+                vhost,
+                dict.GetValueOrDefault("queue") ?? string.Empty,
+                ParseEnvelopeIds(dict.GetValueOrDefault("envelope-ids"))),
+
+            WriteCommandKind.RemoveStreamIds => RemoveStreamIds(
+                vhost,
+                dict.GetValueOrDefault("queue") ?? string.Empty,
+                ParseStreamIds(dict.GetValueOrDefault("stream-ids"))),
+
+            WriteCommandKind.Delta => throw new InvalidOperationException("delta commands are not replayed"),
+
             _ => throw new InvalidOperationException($"Unknown write command kind: {kind}"),
         };
     }
+
+    private static ulong[] ParseEnvelopeIds(string? encoded) =>
+        string.IsNullOrEmpty(encoded)
+            ? []
+            : encoded.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(value => ulong.TryParse(value, out var id) ? id : 0UL)
+                .Where(id => id != 0)
+                .ToArray();
+
+    private static string[] ParseStreamIds(string? encoded) =>
+        string.IsNullOrEmpty(encoded)
+            ? []
+            : encoded.Split(',', StringSplitOptions.RemoveEmptyEntries);
 
     /// <summary>Encodes a field table in its AMQP 0-9-1 wire form (base64 for the
     /// stream value), so every FieldValue kind round-trips exactly.</summary>
@@ -304,6 +363,8 @@ public enum WriteCommandKind
     Enqueue,
     RegisterConsumer,
     UnregisterConsumer,
-    Requeue,
     DeleteQueue,
+    Remove,
+    RemoveStreamIds,
+    Delta,
 }

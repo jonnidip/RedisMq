@@ -549,6 +549,7 @@ public sealed class InMemoryEngine : IRouteEngine
         {
             _queues.Remove((vhost, queue));
             _delivery.Remove((vhost, queue));
+            _bindings.RemoveAll(binding => binding.Vhost == vhost && binding.Queue == queue);
         }
     }
 

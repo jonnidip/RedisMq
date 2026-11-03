@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Linq;
 using System.Threading.Channels;
 using RedisMQ.Broker.Codec;
@@ -28,6 +29,12 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     // teardown reconciliation.
     private readonly Dictionary<(string Vhost, string Queue), string> _exclusiveQueues = [];
     private readonly Dictionary<(string Vhost, string Queue), HashSet<string>> _autoDeleteQueues = [];
+
+    // The envelope-id -> stream-id map the settle path resolves against. Written by
+    // the drainer after each XADD, read (and stashed) by MirrorDelta before a batch
+    // can overwrite an entry for the same envelope id.
+    private readonly Dictionary<(string Vhost, string Queue, ulong EnvelopeId), RedisValue> _streamIds = [];
+    private readonly object _streamIdsLock = new();
 
     /// <summary>
     /// Creates the engine. <paramref name="redis"/> may be null (e.g. Redis
@@ -151,7 +158,8 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
 
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         WriteCommand command = WriteCommand.Enqueue(
-            vhost, queue, memoryReceipt.EnvelopeId, exchange, routingKey, body, properties)
+            vhost, queue, memoryReceipt.EnvelopeId, exchange, routingKey, body, properties,
+            ExpirationOf(properties))
             with { Completion = completion, ReservedDrainerSlot = true };
 
         if (!_channel.Writer.TryWrite(command))
@@ -159,6 +167,14 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
             _drainerSlots.Release();
             completion.TrySetResult(false);
             return new EnqueueReceipt(memoryReceipt.EnvelopeId, ValueTask.FromResult(false), memoryReceipt.DroppedEnvelopeIds);
+        }
+
+        if (memoryReceipt.DroppedEnvelopeIds.Count > 0)
+        {
+            // x-max-length evictions are mirrored best-effort: a missed removal can
+            // resurrect a dropped message on replay, but never lose a live one.
+            _ = _channel.Writer.TryWrite(WriteCommand.Remove(
+                vhost, queue, [.. memoryReceipt.DroppedEnvelopeIds]));
         }
 
         return new EnqueueReceipt(
@@ -193,14 +209,105 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         }
     }
 
-    public EngineDelta Requeue(string vhost, string queue, InMemoryMessage message) =>
-        _memory.Requeue(vhost, queue, message); // mirroring lands in Task 5
+    public EngineDelta Requeue(string vhost, string queue, InMemoryMessage message)
+    {
+        EngineDelta delta = _memory.Requeue(vhost, queue, message);
+        MirrorDelta(delta);
+        return delta;
+    }
 
-    public EngineDelta Acknowledge(string vhost, string queue, InMemoryMessage message) =>
-        _memory.Acknowledge(vhost, queue, message);
+    public EngineDelta Acknowledge(string vhost, string queue, InMemoryMessage message)
+    {
+        EngineDelta delta = _memory.Acknowledge(vhost, queue, message);
+        MirrorDelta(delta);
+        return delta;
+    }
 
-    public EngineDelta Reject(string vhost, string queue, InMemoryMessage message) =>
-        _memory.Reject(vhost, queue, message);
+    public EngineDelta Reject(string vhost, string queue, InMemoryMessage message)
+    {
+        EngineDelta delta = _memory.Reject(vhost, queue, message);
+        MirrorDelta(delta);
+        return delta;
+    }
+
+    /// <summary>
+    /// Translates one engine delta into a single drainer batch. Removed entries are
+    /// resolved to stream ids <b>before</b> the batch is queued: a requeue reuses its
+    /// envelope id, so the new XADD would otherwise overwrite the map entry and leak
+    /// the old stream entry. The batch order is enqueue first, remove second — a
+    /// crash between them duplicates on replay but never loses a message.
+    /// </summary>
+    private void MirrorDelta(EngineDelta delta)
+    {
+        if (_channel is null || delta == EngineDelta.Empty)
+        {
+            return;
+        }
+
+        List<WriteCommand> batch = [];
+
+        foreach (QueuedMessage queued in delta.Enqueued)
+        {
+            InMemoryMessage message = queued.Message;
+            batch.Add(WriteCommand.Enqueue(
+                queued.Vhost, queued.Queue, message.EnvelopeId, message.Exchange, message.RoutingKey,
+                message.Body, message.Props, message.Expiration, message.DeliveryCount, message.Redelivered));
+        }
+
+        foreach (IGrouping<(string Vhost, string Queue), QueuedMessageRef> group in
+                 delta.Removed.GroupBy(removed => (removed.Vhost, removed.Queue)))
+        {
+            List<RedisValue> streamIds = [];
+            lock (_streamIdsLock)
+            {
+                foreach (QueuedMessageRef removed in group)
+                {
+                    if (_streamIds.TryGetValue((group.Key.Vhost, group.Key.Queue, removed.EnvelopeId), out RedisValue streamId))
+                    {
+                        streamIds.Add(streamId);
+                    }
+                }
+            }
+
+            if (streamIds.Count > 0)
+            {
+                batch.Add(WriteCommand.RemoveStreamIds(
+                    group.Key.Vhost, group.Key.Queue, [.. streamIds.Select(id => id.ToString())]));
+            }
+        }
+
+        foreach ((string vhost, string name) in delta.DeletedQueues)
+        {
+            batch.Add(WriteCommand.DeleteQueue(vhost, name));
+        }
+
+        if (batch.Count == 0)
+        {
+            return;
+        }
+
+        _ = _channel.Writer.TryWrite(batch.Count == 1 ? batch[0] : WriteCommand.Delta([.. batch]));
+    }
+
+    /// <summary>The publish path's absolute deadline, mirroring the in-memory
+    /// parse (Task 7 makes the property relative to enqueue time).</summary>
+    private static DateTimeOffset? ExpirationOf(ContentProperties properties)
+    {
+        if (string.IsNullOrEmpty(properties.Expiration)
+            || !long.TryParse(properties.Expiration, out long milliseconds))
+        {
+            return null;
+        }
+
+        try
+        {
+            return DateTimeOffset.FromUnixTimeMilliseconds(milliseconds);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// Connection teardown reconciliation: deletes exclusive queues owned by this
@@ -282,26 +389,132 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     private async Task WriteCommandToRedisAsync(WriteCommand command)
     {
         ArgumentNullException.ThrowIfNull(_redis);
-        var fields = command.ToStreamFields();
+        var fields = command.Kind == WriteCommandKind.Delta ? [] : command.ToStreamFields();
 
         switch (command.Kind)
         {
             case WriteCommandKind.DeclareExchange or WriteCommandKind.DeclareQueue or
                  WriteCommandKind.Bind or WriteCommandKind.Unbind:
-                await _redis.StreamAddAsync(RedisKeys.TopologyKey(command.Vhost ?? string.Empty), fields.Select(f => new NameValueEntry(f.Field, f.Value)).ToArray());
+                await _redis.StreamAddAsync(RedisKeys.TopologyKey(command.Vhost ?? string.Empty), ToEntries(fields));
                 break;
 
-            case WriteCommandKind.Enqueue or WriteCommandKind.Requeue:
-                await _redis.StreamAddAsync(
-                    RedisKeys.QueueKey(command.Vhost ?? string.Empty, command.Queue ?? string.Empty),
-                    fields.Select(f => new NameValueEntry(f.Field, f.Value)).ToArray());
+            case WriteCommandKind.Enqueue:
+                string queueKey = RedisKeys.QueueKey(command.Vhost ?? string.Empty, command.Queue ?? string.Empty);
+                RedisValue streamId = await _redis.StreamAddAsync(queueKey, ToEntries(fields));
+                lock (_streamIdsLock)
+                {
+                    _streamIds[(command.Vhost ?? string.Empty, command.Queue ?? string.Empty, command.EnvelopeId)] = streamId;
+                }
+
+                break;
+
+            case WriteCommandKind.Remove:
+                await RemoveEnvelopeIdsAsync(command);
+                break;
+
+            case WriteCommandKind.RemoveStreamIds:
+                await RemoveStreamIdsAsync(command);
+                break;
+
+            case WriteCommandKind.DeleteQueue:
+                await _redis.StreamAddAsync(RedisKeys.TopologyKey(command.Vhost ?? string.Empty), ToEntries(fields));
+                await _redis.KeyDeleteAsync(RedisKeys.QueueKey(command.Vhost ?? string.Empty, command.Queue ?? string.Empty));
+                ForgetQueue(command.Vhost ?? string.Empty, command.Queue ?? string.Empty);
                 break;
 
             case WriteCommandKind.RegisterConsumer or WriteCommandKind.UnregisterConsumer:
                 // Consumer registration is in-memory state; mirrored to the
                 // topology log for durability.
-                await _redis.StreamAddAsync(RedisKeys.TopologyKey(command.Vhost ?? string.Empty), fields.Select(f => new NameValueEntry(f.Field, f.Value)).ToArray());
+                await _redis.StreamAddAsync(RedisKeys.TopologyKey(command.Vhost ?? string.Empty), ToEntries(fields));
                 break;
+
+            case WriteCommandKind.Delta:
+                foreach (WriteCommand child in command.Batch ?? [])
+                {
+                    await WriteCommandToRedisAsync(child);
+                }
+
+                break;
+        }
+    }
+
+    private static NameValueEntry[] ToEntries((string Field, string Value)[] fields) =>
+        fields.Select(field => new NameValueEntry(field.Field, field.Value)).ToArray();
+
+    /// <summary>Resolves envelope ids to stream ids under the map lock, forgets them,
+    /// then XDELs the resolved ids.</summary>
+    private async Task RemoveEnvelopeIdsAsync(WriteCommand command)
+    {
+        ArgumentNullException.ThrowIfNull(_redis);
+        if (command.EnvelopeIds is not { Length: > 0 } envelopeIds)
+        {
+            return;
+        }
+
+        string vhost = command.Vhost ?? string.Empty;
+        string queue = command.Queue ?? string.Empty;
+        List<RedisValue> streamIds = [];
+        lock (_streamIdsLock)
+        {
+            foreach (ulong envelopeId in envelopeIds)
+            {
+                if (_streamIds.Remove((vhost, queue, envelopeId), out RedisValue streamId))
+                {
+                    streamIds.Add(streamId);
+                }
+            }
+        }
+
+        if (streamIds.Count > 0)
+        {
+            await _redis.StreamDeleteAsync(RedisKeys.QueueKey(vhost, queue), [.. streamIds]);
+        }
+    }
+
+    /// <summary>XDELs exact stream ids and drops any map entry that still points at
+    /// one of them (a newer entry for the same envelope id is left alone).</summary>
+    private async Task RemoveStreamIdsAsync(WriteCommand command)
+    {
+        ArgumentNullException.ThrowIfNull(_redis);
+        if (command.StreamIds is not { Length: > 0 } streamIds)
+        {
+            return;
+        }
+
+        string vhost = command.Vhost ?? string.Empty;
+        string queue = command.Queue ?? string.Empty;
+        RedisValue[] values = [.. streamIds.Select(id => (RedisValue)id)];
+        await _redis.StreamDeleteAsync(RedisKeys.QueueKey(vhost, queue), values);
+
+        lock (_streamIdsLock)
+        {
+            List<(string, string, ulong)> stale = [];
+            foreach (((string Vhost, string Queue, ulong EnvelopeId) key, RedisValue value) in _streamIds)
+            {
+                if (key.Vhost == vhost && key.Queue == queue && streamIds.Contains(value.ToString()))
+                {
+                    stale.Add(key);
+                }
+            }
+
+            foreach ((string, string, ulong) key in stale)
+            {
+                _streamIds.Remove(key);
+            }
+        }
+    }
+
+    private void ForgetQueue(string vhost, string queue)
+    {
+        lock (_streamIdsLock)
+        {
+            List<(string, string, ulong)> stale = _streamIds.Keys
+                .Where(key => key.Vhost == vhost && key.Queue == queue)
+                .ToList();
+            foreach ((string, string, ulong) key in stale)
+            {
+                _streamIds.Remove(key);
+            }
         }
     }
 
@@ -331,7 +544,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
             {
                 string queueKey = RedisKeys.QueueKey(vhost, queueName);
                 var queueResult = await _redis.ExecuteAsync("XRANGE", queueKey, "-", "+");
-                ReplayQueueEntries(vhost, queueName, queueResult);
+                await ReplayQueueEntriesAsync(vhost, queueName, queueResult);
             }
         }
     }
@@ -400,15 +613,36 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
                         dict.GetValueOrDefault("routing-key") ?? string.Empty,
                         WriteCommand.DecodeArguments(dict.GetValueOrDefault("arguments")));
                     break;
+
+                case nameof(WriteCommandKind.Unbind):
+                    _memory.Unbind(
+                        vhost,
+                        dict.GetValueOrDefault("exchange") ?? string.Empty,
+                        dict.GetValueOrDefault("queue") ?? string.Empty,
+                        dict.GetValueOrDefault("routing-key") ?? string.Empty);
+                    break;
+
+                case nameof(WriteCommandKind.DeleteQueue):
+                    _memory.DeleteQueue(vhost, dict.GetValueOrDefault("queue") ?? string.Empty);
+                    break;
             }
         }
     }
 
-    private void ReplayQueueEntries(string vhost, string queueName, RedisResult result)
+    /// <summary>
+    /// Rebuilds one queue's ready buffer and collapses crash-window duplicates:
+    /// entries sharing an envelope id keep the higher delivery count (tie: the later
+    /// stream id), the stale copies are XDELed, and every survivor's stream id is
+    /// recorded so a later ack can remove it.
+    /// </summary>
+    private async Task ReplayQueueEntriesAsync(string vhost, string queueName, RedisResult result)
     {
+        ArgumentNullException.ThrowIfNull(_redis);
+        List<(string Id, EnvelopeRecord Record)> entries = [];
         for (int i = 0; i < result.Length; i++)
         {
             var entry = result[i]; // RedisResult: [id, [field1, value1, field2, value2, ...]]
+            var id = (string)entry[0]!;
             var fields = (string[])entry[1]!;
             var dict = new Dictionary<string, string>(StringComparer.Ordinal);
             for (int j = 0; j < fields.Length; j += 2)
@@ -416,19 +650,82 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
                 dict[fields[j]!] = fields[j + 1]!;
             }
 
-            var record = StreamCodec.DecodeEnqueue(
-                dict.Select(kv => (kv.Key, kv.Value)).ToList());
+            entries.Add((id, StreamCodec.DecodeEnqueue(dict.Select(kv => (kv.Key, kv.Value)).ToList())));
+        }
+
+        Dictionary<ulong, (string Id, EnvelopeRecord Record)> winners = [];
+        List<RedisValue> stale = [];
+        foreach ((string id, EnvelopeRecord record) in entries)
+        {
+            if (!winners.TryGetValue(record.EnvelopeId, out (string Id, EnvelopeRecord Record) current))
+            {
+                winners[record.EnvelopeId] = (id, record);
+                continue;
+            }
+
+            if (IsNewer((id, record), current))
+            {
+                stale.Add(current.Id);
+                winners[record.EnvelopeId] = (id, record);
+            }
+            else
+            {
+                stale.Add(id);
+            }
+        }
+
+        if (stale.Count > 0)
+        {
+            await _redis.StreamDeleteAsync(RedisKeys.QueueKey(vhost, queueName), [.. stale]);
+        }
+
+        foreach (KeyValuePair<ulong, (string Id, EnvelopeRecord Record)> winner in winners)
+        {
+            ulong envelopeId = winner.Key;
+            string streamId = winner.Value.Id;
+            EnvelopeRecord record = winner.Value.Record;
             var message = new InMemoryMessage(
                 record.Properties,
                 record.Body,
                 record.Exchange,
                 record.RoutingKey,
-                record.EnvelopeId,
+                envelopeId,
                 record.Redelivered,
                 record.ExpiresAt,
                 record.DeliveryCount);
             _memory.ReplayEnqueue(vhost, queueName, message);
+
+            lock (_streamIdsLock)
+            {
+                _streamIds[(vhost, queueName, envelopeId)] = streamId;
+            }
         }
+    }
+
+    private static bool IsNewer((string Id, EnvelopeRecord Record) candidate, (string Id, EnvelopeRecord Record) current)
+    {
+        if (candidate.Record.DeliveryCount != current.Record.DeliveryCount)
+        {
+            return candidate.Record.DeliveryCount > current.Record.DeliveryCount;
+        }
+
+        return CompareStreamId(candidate.Id, current.Id) > 0;
+    }
+
+    private static int CompareStreamId(string left, string right)
+    {
+        (long LeftMs, long LeftSeq) = ParseStreamId(left);
+        (long RightMs, long RightSeq) = ParseStreamId(right);
+        int byMillis = LeftMs.CompareTo(RightMs);
+        return byMillis != 0 ? byMillis : LeftSeq.CompareTo(RightSeq);
+    }
+
+    private static (long Milliseconds, long Sequence) ParseStreamId(string id)
+    {
+        int dash = id.IndexOf('-');
+        return dash < 0
+            ? (0, 0)
+            : (long.Parse(id[..dash], CultureInfo.InvariantCulture), long.Parse(id[(dash + 1)..], CultureInfo.InvariantCulture));
     }
 
     /// <inheritdoc/>

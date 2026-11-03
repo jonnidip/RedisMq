@@ -183,7 +183,10 @@ public sealed class WriteCommandTests
             WriteCommand.Enqueue("/", "q", 3, "fex", "rk", new byte[] { 1, 2, 3 }, new ContentProperties()),
             WriteCommand.RegisterConsumer("/", "q", "ctag"),
             WriteCommand.UnregisterConsumer("/", "q", "ctag"),
-            WriteCommand.Requeue("/", "q", 3, "fex", "rk", new byte[] { 9 }, new ContentProperties(), redelivered: true),
+            WriteCommand.Enqueue("/", "q", 3, "fex", "rk", new byte[] { 9 }, new ContentProperties(), redelivered: true),
+            WriteCommand.DeleteQueue("/", "q"),
+            WriteCommand.Remove("/", "q", 3, 4),
+            WriteCommand.RemoveStreamIds("/", "q", "1-0", "2-0"),
         };
 
         foreach (var command in commands)
@@ -197,7 +200,7 @@ public sealed class WriteCommandTests
     }
 
     [Fact]
-    public void Enqueue_and_requeue_round_trip_amqp_properties_and_delivery_metadata()
+    public void Enqueue_round_trips_amqp_properties_and_delivery_metadata()
     {
         var properties = new ContentProperties(
             ContentType: "text/plain",
@@ -206,20 +209,54 @@ public sealed class WriteCommandTests
         var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(1_800_000_000_000);
 
         WriteCommand enqueue = WriteCommand.Enqueue(
-            "/", "q", 11, "fex", "rk", new byte[] { 1, 2 }, properties, expiresAt, deliveryCount: 2);
-        WriteCommand decodedEnqueue = WriteCommand.FromStreamFields(WriteCommandKind.Enqueue, enqueue.ToStreamFields());
-        Assert.Equal(expiresAt, decodedEnqueue.ExpiresAt);
-        Assert.Equal(2, decodedEnqueue.DeliveryCount);
-        Assert.Equal("text/plain", decodedEnqueue.Properties!.ContentType);
-        Assert.Equal("acme", decodedEnqueue.Properties.Headers!["tenant"].Raw);
+            "/", "q", 11, "fex", "rk", new byte[] { 1, 2 }, properties,
+            expiresAt, deliveryCount: 3, redelivered: true);
+        WriteCommand decoded = WriteCommand.FromStreamFields(WriteCommandKind.Enqueue, enqueue.ToStreamFields());
+        Assert.Equal(expiresAt, decoded.ExpiresAt);
+        Assert.Equal(3, decoded.DeliveryCount);
+        Assert.True(decoded.Redelivered);
+        Assert.Equal("text/plain", decoded.Properties!.ContentType);
+        Assert.Equal("acme", decoded.Properties.Headers!["tenant"].Raw);
+    }
 
-        WriteCommand requeue = WriteCommand.Requeue(
-            "/", "q", 11, "fex", "rk", new byte[] { 1, 2 }, properties, redelivered: true, expiresAt, deliveryCount: 3);
-        WriteCommand decodedRequeue = WriteCommand.FromStreamFields(WriteCommandKind.Requeue, requeue.ToStreamFields());
-        Assert.Equal(expiresAt, decodedRequeue.ExpiresAt);
-        Assert.Equal(3, decodedRequeue.DeliveryCount);
-        Assert.True(decodedRequeue.Redelivered);
-        Assert.Equal("text/plain", decodedRequeue.Properties!.ContentType);
+    [Fact]
+    public void Remove_round_trips_envelope_ids()
+    {
+        WriteCommand remove = WriteCommand.Remove("/", "q", 3, 4, 5);
+        Assert.Equal([3UL, 4UL, 5UL], remove.EnvelopeIds);
+
+        var fields = remove.ToStreamFields();
+        Assert.Contains(("envelope-ids", "3,4,5"), fields);
+
+        WriteCommand decoded = WriteCommand.FromStreamFields(WriteCommandKind.Remove, fields);
+        Assert.Equal([3UL, 4UL, 5UL], decoded.EnvelopeIds);
+        Assert.Equal("q", decoded.Queue);
+    }
+
+    [Fact]
+    public void RemoveStreamIds_round_trips_stream_ids()
+    {
+        WriteCommand remove = WriteCommand.RemoveStreamIds("/", "q", "1-0", "2-9");
+        Assert.Equal(["1-0", "2-9"], remove.StreamIds);
+
+        var fields = remove.ToStreamFields();
+        Assert.Contains(("stream-ids", "1-0,2-9"), fields);
+
+        WriteCommand decoded = WriteCommand.FromStreamFields(WriteCommandKind.RemoveStreamIds, fields);
+        Assert.Equal(["1-0", "2-9"], decoded.StreamIds);
+    }
+
+    [Fact]
+    public void Delta_is_never_serialized()
+    {
+        WriteCommand delta = WriteCommand.Delta(WriteCommand.Remove("/", "q", 1));
+        Assert.Throws<InvalidOperationException>(() => delta.ToStreamFields());
+    }
+
+    [Fact]
+    public void Requeue_no_longer_exists_as_a_stream_command()
+    {
+        Assert.DoesNotContain("Requeue", Enum.GetNames<WriteCommandKind>());
     }
 }
 
@@ -451,6 +488,235 @@ public sealed class RedisStreamRouteEngineTests
         Assert.True(claimed.Redelivered);
         Assert.Equal("text/plain", claimed.Props.ContentType);
         Assert.Equal("v", claimed.Props.Headers!["k"].Raw);
+    }
+
+    // ---------- Task 5: delta mirroring, tombstones and replay dedupe ----------
+
+    [Fact]
+    public async Task Ack_returns_a_remove_delta_without_redis()
+    {
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
+        var message = new InMemoryMessage(new ContentProperties(), [1], "fex", "rk", 9);
+
+        EngineDelta delta = engine.Acknowledge("/", "q", message);
+
+        Assert.Empty(delta.Enqueued);
+        Assert.Equal(new QueuedMessageRef("/", "q", 9), Assert.Single(delta.Removed));
+    }
+
+    [Fact]
+    public async Task Ack_removes_the_stream_entry_and_replay_does_not_resurrect_it()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-ack-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+
+        await using var engine = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareQueue(new QueueInfo(vhost, "q"));
+        EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "", "q");
+        Assert.True(await receipt.Durable);
+
+        Assert.Equal(GetClaimOutcome.Claimed, engine.TryClaimForGet(vhost, "q", out InMemoryMessage? claimed, out _));
+        engine.Acknowledge(vhost, "q", claimed!);
+
+        await WaitUntilAsync(async () => await db.StreamLengthAsync(queueKey) == 0, "ack to XDEL the entry");
+        await engine.DisposeAsync();
+
+        await using var replay = new RedisStreamRouteEngine(db, [vhost], replayOnStart: true, drainerCapacity: 16, enforceEvictionGate: false);
+        Assert.Equal(GetClaimOutcome.Empty, replay.TryClaimForGet(vhost, "q", out _, out _));
+    }
+
+    [Fact]
+    public async Task Reject_without_requeue_removes_the_stream_entry()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-reject-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+
+        await using var engine = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareQueue(new QueueInfo(vhost, "q"));
+        EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "", "q");
+        Assert.True(await receipt.Durable);
+
+        Assert.Equal(GetClaimOutcome.Claimed, engine.TryClaimForGet(vhost, "q", out InMemoryMessage? claimed, out _));
+        engine.Reject(vhost, "q", claimed!);
+
+        await WaitUntilAsync(async () => await db.StreamLengthAsync(queueKey) == 0, "reject to XDEL the entry");
+    }
+
+    [Fact]
+    public async Task Requeue_replaces_the_entry()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-requeue-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+
+        await using var engine = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareQueue(new QueueInfo(vhost, "q"));
+        EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "", "q");
+        Assert.True(await receipt.Durable);
+
+        Assert.Equal(GetClaimOutcome.Claimed, engine.TryClaimForGet(vhost, "q", out InMemoryMessage? claimed, out _));
+
+        // The claim-side increment lands in Task 7; the mirror must carry whatever
+        // count the engine hands it.
+        InMemoryMessage redelivered = claimed! with { DeliveryCount = claimed.DeliveryCount + 1 };
+        engine.Requeue(vhost, "q", redelivered);
+
+        await WaitUntilAsync(async () =>
+        {
+            StreamEntry[] entries = await db.StreamRangeAsync(queueKey);
+            if (entries.Length != 1)
+            {
+                return false;
+            }
+
+            EnvelopeRecord record = DecodeEntry(entries[0]);
+            return record.Redelivered && record.DeliveryCount == 1 && record.EnvelopeId == receipt.EnvelopeId;
+        }, "requeue to replace the entry with the redelivered copy");
+
+        await WaitUntilAsync(async () => await db.StreamLengthAsync(queueKey) == 1, "old stream id XDELed");
+    }
+
+    [Fact]
+    public async Task Max_length_drops_are_xdel_ed()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-maxlen-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+
+        await using var engine = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareQueue(new QueueInfo(vhost, "q", MaxLength: 1));
+
+        EnqueueReceipt first = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "", "q");
+        Assert.True(await first.Durable);
+        EnqueueReceipt second = engine.Enqueue(vhost, "q", new ContentProperties(), [2], "", "q");
+        Assert.True(await second.Durable);
+
+        Assert.Equal([first.EnvelopeId], second.DroppedEnvelopeIds);
+
+        await WaitUntilAsync(async () => await db.StreamLengthAsync(queueKey) == 1, "max-length drop to XDEL the oldest entry");
+        EnvelopeRecord survivor = DecodeEntry(Assert.Single(await db.StreamRangeAsync(queueKey)));
+        Assert.Equal(second.EnvelopeId, survivor.EnvelopeId);
+    }
+
+    [Fact]
+    public async Task DeleteQueue_removes_the_stream_and_replays_as_deleted()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-delete-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+
+        await using var engine = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareExchange(new ExchangeInfo(vhost, "ex", "direct"));
+        engine.DeclareQueue(new QueueInfo(vhost, "q"));
+        engine.Bind(vhost, "ex", "q", "rk");
+        EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "ex", "rk");
+        Assert.True(await receipt.Durable);
+        await WaitUntilAsync(
+            async () => await db.StreamLengthAsync(RedisKeys.TopologyKey(vhost)) >= 3,
+            "topology to mirror before the delete");
+
+        engine.RegisterExclusiveQueueOwner(vhost, "q", "conn-1");
+        engine.ReconcileConnection("conn-1");
+
+        await WaitUntilAsync(async () => !await db.KeyExistsAsync(queueKey), "queue stream to be deleted");
+        await engine.DisposeAsync();
+
+        await using var replay = new RedisStreamRouteEngine(db, [vhost], replayOnStart: true, drainerCapacity: 16, enforceEvictionGate: false);
+        Assert.Null(replay.GetQueue(vhost, "q"));
+        Assert.Empty(replay.RouteTo(replay.GetExchange(vhost, "ex")!, new ContentProperties(), "rk"));
+    }
+
+    [Fact]
+    public async Task Unbind_tombstone_survives_replay()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-unbind-{Guid.NewGuid():N}";
+
+        await using var engine = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareExchange(new ExchangeInfo(vhost, "ex", "direct"));
+        engine.DeclareQueue(new QueueInfo(vhost, "q"));
+        engine.Bind(vhost, "ex", "q", "rk");
+        await WaitUntilAsync(
+            async () => await db.StreamLengthAsync(RedisKeys.TopologyKey(vhost)) >= 3,
+            "bind to mirror");
+
+        engine.Unbind(vhost, "ex", "q", "rk");
+        await WaitUntilAsync(
+            async () => await db.StreamLengthAsync(RedisKeys.TopologyKey(vhost)) >= 4,
+            "unbind tombstone to mirror");
+        await engine.DisposeAsync();
+
+        await using var replay = new RedisStreamRouteEngine(db, [vhost], replayOnStart: true, drainerCapacity: 16, enforceEvictionGate: false);
+        Assert.NotNull(replay.GetQueue(vhost, "q"));
+        Assert.Empty(replay.RouteTo(replay.GetExchange(vhost, "ex")!, new ContentProperties(), "rk"));
+    }
+
+    [Fact]
+    public async Task Crash_window_duplicate_is_collapsed_and_stale_entry_xdel_ed()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-dedupe-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+
+        await using var engine = new RedisStreamRouteEngine(db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareQueue(new QueueInfo(vhost, "q"));
+        await WaitUntilAsync(
+            async () => await db.StreamLengthAsync(RedisKeys.TopologyKey(vhost)) >= 1,
+            "queue declare to mirror");
+
+        // A crash between XADD and XDEL leaves the old and new copies of one envelope.
+        await db.StreamAddAsync(queueKey, Fields(new EnvelopeRecord(
+            7, "", "q", [1], new ContentProperties(), null, 0, false)));
+        await db.StreamAddAsync(queueKey, Fields(new EnvelopeRecord(
+            7, "", "q", [2], new ContentProperties(), null, 1, true)));
+        Assert.Equal(2, await db.StreamLengthAsync(queueKey));
+
+        await engine.DisposeAsync();
+
+        await using var replay = new RedisStreamRouteEngine(db, [vhost], replayOnStart: true, drainerCapacity: 16, enforceEvictionGate: false);
+        Assert.Equal(1, await db.StreamLengthAsync(queueKey));
+
+        Assert.Equal(GetClaimOutcome.Claimed, replay.TryClaimForGet(vhost, "q", out InMemoryMessage? claimed, out _));
+        Assert.Equal(7UL, claimed!.EnvelopeId);
+        Assert.Equal(1, claimed.DeliveryCount);
+        Assert.True(claimed.Redelivered);
     }
 
     [Fact]
@@ -705,6 +971,28 @@ public sealed class RedisStreamRouteEngineTests
         // Engine B should no longer see the queue.
         Assert.Null(engine2.GetQueue(vhost, "excl-q"));
     }
+
+    private static async Task WaitUntilAsync(Func<Task<bool>> condition, string description)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (await condition())
+            {
+                return;
+            }
+
+            await Task.Delay(25, TestContext.Current.CancellationToken);
+        }
+
+        throw new TimeoutException($"Timed out waiting for {description}");
+    }
+
+    private static EnvelopeRecord DecodeEntry(StreamEntry entry) =>
+        StreamCodec.DecodeEnqueue(entry.Values.Select(value => (value.Name.ToString(), value.Value.ToString())).ToList());
+
+    private static NameValueEntry[] Fields(EnvelopeRecord record) =>
+        StreamCodec.EncodeEnqueue(record).Select(field => new NameValueEntry(field.Field, field.Value)).ToArray();
 
     private sealed class TestConsumer(string tag) : IQueueConsumer
     {
