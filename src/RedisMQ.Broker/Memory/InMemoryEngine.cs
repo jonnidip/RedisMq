@@ -317,10 +317,12 @@ public sealed class InMemoryEngine : IRouteEngine
     /// per (queue, enqueue) call with its own defensive body copy and its own
     /// engine-global envelope id, assigned under the engine lock; then the queue's
     /// pump is armed so a registered consumer serves it immediately.</summary>
-    public void Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey)
+    public EnqueueReceipt Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey)
     {
         ArgumentNullException.ThrowIfNull(properties);
         ArgumentNullException.ThrowIfNull(body);
+        ulong envelopeId;
+        List<InMemoryMessage> dropped = [];
         lock (_lock)
         {
             // Parse AMQP expiration (milliseconds as string) to DateTimeOffset.
@@ -332,15 +334,20 @@ public sealed class InMemoryEngine : IRouteEngine
             }
 
             InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
-            delivery.AppendAlreadyLocked(new InMemoryMessage(properties, DefensiveCopy(body), exchange, routingKey, ++_lastEnvelopeId, Expiration: expiration));
+            envelopeId = ++_lastEnvelopeId;
+            delivery.AppendAlreadyLocked(new InMemoryMessage(properties, DefensiveCopy(body), exchange, routingKey, envelopeId, Expiration: expiration));
             delivery.WakeAlreadyLocked();
 
             // Enforce x-max-length if set
             if (_queues.TryGetValue((vhost, queue), out var qi) && qi.MaxLength is int maxLen && maxLen > 0)
             {
-                delivery.RemoveOldestMessages(maxLen);
+                dropped = delivery.RemoveOldestMessages(maxLen);
             }
         }
+
+        return EnqueueReceipt.Immediate(
+            envelopeId,
+            dropped.Count == 0 ? [] : dropped.Select(message => message.EnvelopeId).ToList());
     }
 
     /// <summary>[internal] Test introspection of a queue's stored messages: a fresh
@@ -397,6 +404,7 @@ public sealed class InMemoryEngine : IRouteEngine
         ArgumentNullException.ThrowIfNull(message);
         lock (_lock)
         {
+            _lastEnvelopeId = Math.Max(_lastEnvelopeId, message.EnvelopeId);
             InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
             delivery.AppendAlreadyLocked(message);
         }

@@ -88,7 +88,7 @@ public sealed class RedisStreamRouteEngineTests
     {
         try
         {
-            var connectTask = ConnectionMultiplexer.ConnectAsync("localhost:6379");
+            var connectTask = ConnectionMultiplexer.ConnectAsync("127.0.0.1:6379");
             if (connectTask.Wait(TimeSpan.FromSeconds(2)))
             {
                 return connectTask.Result.GetDatabase();
@@ -308,6 +308,69 @@ public sealed class RedisStreamRouteEngineTests
         }
 
         Assert.True(claimed > 0);
+    }
+
+    [Fact]
+    public async Task Null_redis_receipt_completes_true_and_assigns_ids()
+    {
+        await using var engine = new RedisStreamRouteEngine(null!, ["/"], replayOnStart: false);
+        engine.DeclareQueue(new QueueInfo("/", "q"));
+
+        EnqueueReceipt receipt = engine.Enqueue("/", "q", new ContentProperties(), [1], "fex", "rk");
+
+        Assert.Equal(1UL, receipt.EnvelopeId);
+        Assert.True(await receipt.Durable);
+        Assert.Empty(receipt.DroppedEnvelopeIds);
+    }
+
+    [Fact]
+    public async Task Drainer_exhaustion_returns_false_without_enqueuing()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/slots-{Guid.NewGuid():N}";
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 1, enforceEvictionGate: false);
+        engine.DeclareQueue(new QueueInfo(vhost, "q"));
+
+        SemaphoreSlim slots = engine.DrainerSlotsForTest!;
+        Assert.True(slots.Wait(0)); // the idle drainer has not reserved a slot
+        try
+        {
+            EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "fex", "rk");
+
+            Assert.Equal(0UL, receipt.EnvelopeId);
+            Assert.False(await receipt.Durable);
+            Assert.Equal(GetClaimOutcome.Empty, engine.TryClaimForGet(vhost, "q", out _, out _));
+        }
+        finally
+        {
+            slots.Release();
+        }
+    }
+
+    [Fact]
+    public async Task Receipt_completes_only_after_xadd()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/receipt-{Guid.NewGuid():N}";
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 8, enforceEvictionGate: false);
+        engine.DeclareQueue(new QueueInfo(vhost, "q"));
+
+        EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1, 2, 3], "fex", "rk");
+
+        Assert.True(await receipt.Durable.AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, await db.StreamLengthAsync(RedisKeys.QueueKey(vhost, "q")));
     }
 
     [Fact]

@@ -69,6 +69,29 @@ public enum GetClaimOutcome
 }
 
 /// <summary>
+/// What one <see cref="IRouteEngine.Enqueue"/> call delivered: the engine-global
+/// envelope id, a durability signal for the Redis mirror, and the ids the
+/// <c>x-max-length</c> sweeper evicted while landing this message.
+/// <para>
+/// <see cref="Durable"/> completes <c>true</c> only after the durable store has
+/// accepted this message (Redis <c>XADD</c> returned); a memory-only engine hands
+/// back an already-completed <c>true</c> because it makes no durability promise.
+/// It completes <c>false</c> when the store refused or the drainer could not write
+/// it. Await it at most once.
+/// </para>
+/// </summary>
+public readonly record struct EnqueueReceipt(
+    ulong EnvelopeId,
+    ValueTask<bool> Durable,
+    IReadOnlyList<ulong> DroppedEnvelopeIds)
+{
+    /// <summary>The memory-only receipt: already durable by contract, with any
+    /// max-length evictions reported.</summary>
+    public static EnqueueReceipt Immediate(ulong envelopeId, IReadOnlyList<ulong>? dropped = null) =>
+        new(envelopeId, ValueTask.FromResult(true), dropped ?? []);
+}
+
+/// <summary>
 /// The seam between the wire server (WireConnection/ChannelContext) and whatever
 /// backs topology and routing. The channel owns every protocol check (naming,
 /// equivalence, not-found, refused); the engine only stores declarations, holds
@@ -116,9 +139,10 @@ public interface IRouteEngine
     /// fan-out to N queues never aliases one byte array across messages, and callers
     /// owning the assembled bytes are free to hand them over as-is. The engine
     /// assigns the 1-based monotonic <see cref="InMemoryMessage.EnvelopeId"/>
-    /// (queue deletes do not exist in M0, so ids never recycle).
+    /// (queue deletes do not exist in M0, so ids never recycle) and returns the
+    /// receipt the confirm loop awaits.
     /// </summary>
-    void Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey);
+    EnqueueReceipt Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey);
 
     /// <summary>
     /// Registers a consumer on the named queue (Task 7 consume seam). Every call is

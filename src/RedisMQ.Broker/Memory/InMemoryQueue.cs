@@ -89,13 +89,18 @@ internal sealed class InMemoryQueue
     }
 
     /// <summary>Removes the oldest messages from the ready buffer until the count
-    /// is at most maxLength. Used for x-max-length enforcement.</summary>
-    internal void RemoveOldestMessages(int maxLength)
+    /// is at most maxLength, returning the evicted messages so the mirror can
+    /// delete their durable entries. Used for x-max-length enforcement.</summary>
+    internal List<InMemoryMessage> RemoveOldestMessages(int maxLength)
     {
+        List<InMemoryMessage> removed = [];
         while (_ready.Count > maxLength)
         {
+            removed.Add(_ready[0]);
             _ready.RemoveAt(0);
         }
+
+        return removed;
     }
 
     /// <summary>Registers a consumer at the registry tail (registration order = the

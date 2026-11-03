@@ -39,6 +39,14 @@ public sealed record WriteCommand
     public ContentProperties? Properties { get; init; }
     public bool Redelivered { get; init; }
 
+    /// <summary>Completes when the drainer has written (or failed to write) this
+    /// command. Protocol-affine: never serialized and never replayed.</summary>
+    public TaskCompletionSource<bool>? Completion { get; init; }
+
+    /// <summary>True when the producer reserved one drainer slot for this command,
+    /// so the drainer releases it when the command finishes. Never serialized.</summary>
+    public bool ReservedDrainerSlot { get; init; }
+
     // ---------- factory methods ----------
 
     public static WriteCommand DeclareExchange(string vhost, string name, string type) => new()

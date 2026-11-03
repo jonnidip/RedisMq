@@ -22,6 +22,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     private readonly InMemoryEngine _memory;
     private readonly Channel<WriteCommand>? _channel;
     private readonly Task? _drainerTask;
+    private readonly SemaphoreSlim? _drainerSlots;
     private readonly CancellationTokenSource _stopCts = new();
 
     // Exclusive queue ownership and auto-delete consumer tracking for connection
@@ -53,6 +54,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         {
             _channel = Channel.CreateBounded<WriteCommand>(
                 new BoundedChannelOptions(drainerCapacity) { FullMode = BoundedChannelFullMode.Wait });
+            _drainerSlots = new SemaphoreSlim(drainerCapacity, drainerCapacity);
             _drainerTask = Task.Run(() => DrainAsync(_stopCts.Token));
         }
 
@@ -68,6 +70,10 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     }
 
     // ---------- IRouteEngine reads (delegate to memory, synchronous) ----------
+
+    /// <summary>Test seam: the drainer's slot semaphore, exposed so a test can
+    /// exhaust it deterministically. Null when Redis is absent.</summary>
+    internal SemaphoreSlim? DrainerSlotsForTest => _drainerSlots;
 
     public ExchangeInfo? GetExchange(string vhost, string name) => _memory.GetExchange(vhost, name);
 
@@ -119,10 +125,47 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         EnqueueCommand(WriteCommand.Unbind(vhost, exchange, queue, routingKey));
     }
 
-    public void Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey)
+    public EnqueueReceipt Enqueue(string vhost, string queue, ContentProperties properties, byte[] body, string exchange, string routingKey)
     {
-        _memory.Enqueue(vhost, queue, properties, body, exchange, routingKey);
-        EnqueueCommand(WriteCommand.Enqueue(vhost, queue, 0, exchange, routingKey, body, properties));
+        if (_channel is null || _drainerSlots is null)
+        {
+            return _memory.Enqueue(vhost, queue, properties, body, exchange, routingKey);
+        }
+
+        if (!_drainerSlots.Wait(0))
+        {
+            // Backpressure contract: no slot means the mirror cannot promise
+            // durability, so the publish is refused before it touches memory.
+            return new EnqueueReceipt(0, ValueTask.FromResult(false), []);
+        }
+
+        EnqueueReceipt memoryReceipt;
+        try
+        {
+            memoryReceipt = _memory.Enqueue(vhost, queue, properties, body, exchange, routingKey);
+        }
+        catch
+        {
+            _drainerSlots.Release();
+            throw;
+        }
+
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        WriteCommand command = WriteCommand.Enqueue(
+            vhost, queue, memoryReceipt.EnvelopeId, exchange, routingKey, body, properties)
+            with { Completion = completion, ReservedDrainerSlot = true };
+
+        if (!_channel.Writer.TryWrite(command))
+        {
+            _drainerSlots.Release();
+            completion.TrySetResult(false);
+            return new EnqueueReceipt(memoryReceipt.EnvelopeId, ValueTask.FromResult(false), memoryReceipt.DroppedEnvelopeIds);
+        }
+
+        return new EnqueueReceipt(
+            memoryReceipt.EnvelopeId,
+            new ValueTask<bool>(completion.Task),
+            memoryReceipt.DroppedEnvelopeIds);
     }
 
     public ConsumeRegisterOutcome RegisterConsumer(string vhost, string queue, IQueueConsumer consumer)
@@ -210,6 +253,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     {
         await foreach (var command in _channel!.Reader.ReadAllAsync(ct))
         {
+            bool succeeded = true;
             try
             {
                 await WriteCommandToRedisAsync(command);
@@ -218,7 +262,18 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
             {
                 // Drainer is best-effort: memory is the system of record. A
                 // transient Redis failure drops the mirrored write; the in-memory
-                // state is already updated.
+                // state is already updated, and a waiting publisher is told the
+                // truth (confirm.nack) rather than a lie.
+                succeeded = false;
+            }
+            finally
+            {
+                if (command.ReservedDrainerSlot)
+                {
+                    _drainerSlots!.Release();
+                }
+
+                command.Completion?.TrySetResult(succeeded);
             }
         }
     }
