@@ -209,6 +209,60 @@ public sealed class SettleMirroringTests
         }
     }
 
+    [Fact]
+    public async Task Reject_without_requeue_delivers_x_death_on_the_dlx_target()
+    {
+        (AmqpBrokerServer server, WireClient client, RecordingEngine engine) = SpawnServer();
+        try
+        {
+            await HandshakeAsync(client);
+            _ = await client.ReadMethodAsync(10, 41);
+            await client.SendAsync(MethodFrameOn(1, ChannelOpenFrame()));
+            _ = await client.ReadMethodOnChannelAsync(1, 20, 11);
+
+            var dlxArgs = new FieldTable([
+                new("x-dead-letter-exchange", FieldValue.From("")),
+                new("x-dead-letter-routing-key", FieldValue.From("target")),
+            ]);
+            await DeclareAsync(client, 1, QueueDeclareFrame(1, "source", arguments: dlxArgs), (50, 11));
+            await DeclareAsync(client, 1, QueueDeclareFrame(1, "target"), (50, 11));
+
+            await client.SendAsync(MethodFrameOn(1, PublishFrame(1, "", "source")));
+            await client.SendAsync(ContentHeaderFrameOn(
+                1, body: 1, new ContentProperties(ContentType: "text/plain")));
+            await client.SendAsync(BodyFrameOn(1, [42]));
+            await FenceAsync(client, 1, "source");
+
+            await client.SendAsync(MethodFrameOn(1, ConsumeFrame(1, "source", consumerTag: "ct-source")));
+            _ = await client.ReadMethodOnChannelAsync(1, 60, 21);
+            _ = await ReadDeliverAsync(client, 1);
+
+            await client.SendAsync(MethodFrameOn(1, RejectFrame(1, requeue: false)));
+            await FenceAsync(client, 1, "source");
+
+            // The dead-letter copy is a normal ready message in the target queue.
+            await client.SendAsync(MethodFrameOn(1, ConsumeFrame(1, "target", consumerTag: "ct-target")));
+            _ = await client.ReadMethodOnChannelAsync(1, 60, 21);
+            (AmqpMethod _, ContentHeader header, byte[] body) = await ReadDeliverAsync(client, 1);
+            Assert.Equal(new byte[] { 42 }, body);
+
+            var deaths = (FieldValue[])header.Properties.Headers!["x-death"].Raw!;
+            var death = (FieldTable)deaths[0].Raw!;
+            Assert.Equal("source", death["queue"].Raw);
+            Assert.Equal("rejected", death["reason"].Raw);
+            Assert.Equal(1L, death["count"].Raw);
+            Assert.Equal(string.Empty, death["exchange"].Raw); // published on the default exchange
+            Assert.IsType<DateTimeOffset>(death["time"].Raw);
+            Assert.Equal("source", header.Properties.Headers!["x-first-death-queue"].Raw);
+
+            Assert.Contains("Reject:source:1", engine.Settles);
+        }
+        finally
+        {
+            await ShakeDownAsync(server, client);
+        }
+    }
+
     // ---------- harness (the per-file M0 pattern mirrors ConsumeTests) ----------
 
     private static BrokerServerOptions NewOptions() => new()

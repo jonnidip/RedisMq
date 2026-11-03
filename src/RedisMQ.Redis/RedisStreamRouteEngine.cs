@@ -242,6 +242,13 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         return delta;
     }
 
+    public EngineDelta Reap(DateTimeOffset now)
+    {
+        EngineDelta delta = _memory.Reap(now);
+        MirrorDelta(delta);
+        return delta;
+    }
+
     /// <summary>
     /// Translates one engine delta into a single drainer batch. Removed entries are
     /// resolved to stream ids <b>before</b> the batch is queued: a requeue reuses its

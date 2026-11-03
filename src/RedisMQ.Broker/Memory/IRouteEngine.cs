@@ -216,6 +216,16 @@ public interface IRouteEngine
     EngineDelta Reject(string vhost, string queue, InMemoryMessage message);
 
     /// <summary>
+    /// The reaper's sweep (M4 Task 9 owns queue expiry; Task 8 lands ready-message
+    /// expiry): every ready message whose <see cref="InMemoryMessage.Expiration"/>
+    /// is at or before <paramref name="now"/> is removed, dead-lettered when its
+    /// queue has a DLX. Unacked messages are not touched (RabbitMQ semantics).
+    /// The returned delta carries the dead-letter copies first and the removals
+    /// second, so the mirror can never lose a message to a crash in between.
+    /// </summary>
+    EngineDelta Reap(DateTimeOffset now);
+
+    /// <summary>
     /// The basic.get claim: atomically pops the queue head (and reports the messages
     /// remaining after it) under the engine lock, after the same exclusive-consumer
     /// arbitration a competing consume would face. <paramref name="message"/> is only

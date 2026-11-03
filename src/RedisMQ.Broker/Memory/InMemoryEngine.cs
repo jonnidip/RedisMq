@@ -129,24 +129,31 @@ public sealed class InMemoryEngine : IRouteEngine
     {
         lock (_lock)
         {
-            List<string> queues = [];
-            foreach (Binding binding in _bindings)
-            {
-                if (binding.Vhost == exchange.Vhost
-                    && binding.Exchange == exchange.Name
-                    && MatchesRoutingKey(binding.RoutingKey, routingKey, exchange.Type))
-                {
-                    // Headers exchange: match message headers against binding arguments
-                    if (exchange.Type == "headers" && !HeadersMatch(binding.Arguments, properties.Headers))
-                    {
-                        continue;
-                    }
-                    queues.Add(binding.Queue);
-                }
-            }
-
-            return queues;
+            return RouteToAlreadyLocked(exchange, properties, routingKey);
         }
+    }
+
+    /// <summary>The routing pass without taking the engine gate (the caller already
+    /// holds it — dead-letter construction and the reaper route under the lock).</summary>
+    private List<string> RouteToAlreadyLocked(ExchangeInfo exchange, ContentProperties properties, string routingKey)
+    {
+        List<string> queues = [];
+        foreach (Binding binding in _bindings)
+        {
+            if (binding.Vhost == exchange.Vhost
+                && binding.Exchange == exchange.Name
+                && MatchesRoutingKey(binding.RoutingKey, routingKey, exchange.Type))
+            {
+                // Headers exchange: match message headers against binding arguments
+                if (exchange.Type == "headers" && !HeadersMatch(binding.Arguments, properties.Headers))
+                {
+                    continue;
+                }
+                queues.Add(binding.Queue);
+            }
+        }
+
+        return queues;
     }
 
     /// <summary>
@@ -470,25 +477,35 @@ public sealed class InMemoryEngine : IRouteEngine
         }
     }
 
-    /// <summary>Back to the ready tail with the redelivered flag set; the pump is
-    /// armed under the same lock, so the requeued message can be claimed the moment
-    /// the gate is released. The delta appends the redelivered copy first, then
-    /// removes the settled stream entry.</summary>
+    /// <summary>Back to the ready tail with the redelivered flag set, unless the
+    /// queue's delivery limit is exhausted: then the message is dead-lettered with
+    /// reason <c>rejected</c> (delivery-limit overflow). The delta appends the copy
+    /// first, then removes the settled entry.</summary>
     public EngineDelta Requeue(string vhost, string queue, InMemoryMessage message)
     {
         ArgumentNullException.ThrowIfNull(message);
-        InMemoryMessage redelivered = message with { Redelivered = true };
+        List<QueuedMessage> enqueued = [];
+        List<QueuedMessageRef> removed = [];
         lock (_lock)
         {
+            if (_queues.TryGetValue((vhost, queue), out QueueInfo? info)
+                && info.DeliveryLimit is int limit
+                && message.DeliveryCount >= limit)
+            {
+                DeadLetterAlreadyLocked(
+                    vhost, queue, message, reason: "rejected", DateTimeOffset.UtcNow, enqueued, removed);
+                return new EngineDelta(enqueued, removed, []);
+            }
+
+            InMemoryMessage redelivered = message with { Redelivered = true };
             InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
             delivery.AppendAlreadyLocked(redelivered);
             delivery.WakeAlreadyLocked();
+            enqueued.Add(new QueuedMessage(vhost, queue, redelivered));
+            removed.Add(new QueuedMessageRef(vhost, queue, message.EnvelopeId));
         }
 
-        return new EngineDelta(
-            [new QueuedMessage(vhost, queue, redelivered)],
-            [new QueuedMessageRef(vhost, queue, message.EnvelopeId)],
-            []);
+        return new EngineDelta(enqueued, removed, []);
     }
 
     /// <summary>The pump popped the message at claim time, so acknowledging only
@@ -499,12 +516,252 @@ public sealed class InMemoryEngine : IRouteEngine
         return RemovedDelta(vhost, queue, message);
     }
 
-    /// <summary>Reject-without-requeue also only removes the durable entry in this
-    /// task; dead-letter copies arrive as enqueues in the same delta in Task 8.</summary>
+    /// <summary>Reject-without-requeue: dead-letter when the queue has a DLX (reason
+    /// <c>rejected</c>), otherwise remove only. The copy lands in the same delta as
+    /// the removal, enqueue first.</summary>
     public EngineDelta Reject(string vhost, string queue, InMemoryMessage message)
     {
         ArgumentNullException.ThrowIfNull(message);
-        return RemovedDelta(vhost, queue, message);
+        List<QueuedMessage> enqueued = [];
+        List<QueuedMessageRef> removed = [];
+        lock (_lock)
+        {
+            if (_queues.TryGetValue((vhost, queue), out QueueInfo? info) && info.DeadLetterExchange is not null)
+            {
+                DeadLetterAlreadyLocked(
+                    vhost, queue, message, reason: "rejected", DateTimeOffset.UtcNow, enqueued, removed);
+            }
+            else
+            {
+                removed.Add(new QueuedMessageRef(vhost, queue, message.EnvelopeId));
+            }
+        }
+
+        return new EngineDelta(enqueued, removed, []);
+    }
+
+    /// <summary>The reaper's ready-message sweep. Queue keys are snapshotted first,
+    /// so a dead-letter copy into another queue (or back into this one) does not
+    /// mutate the set being iterated. Queue expiry belongs to Task 9.</summary>
+    public EngineDelta Reap(DateTimeOffset now)
+    {
+        List<QueuedMessage> enqueued = [];
+        List<QueuedMessageRef> removed = [];
+        lock (_lock)
+        {
+            (string Vhost, string Queue)[] keys = [.. _delivery.Keys];
+            List<InMemoryMessage> expired = [];
+            foreach ((string Vhost, string Queue) key in keys)
+            {
+                if (!_delivery.TryGetValue(key, out InMemoryQueue? delivery))
+                {
+                    continue; // a dead-letter copy may have deleted nothing yet; be safe
+                }
+
+                expired.Clear();
+                delivery.CollectExpiredMessages(now, expired);
+                foreach (InMemoryMessage message in expired)
+                {
+                    DeadLetterAlreadyLocked(
+                        key.Vhost, key.Queue, message, reason: "expired", now, enqueued, removed);
+                }
+            }
+        }
+
+        return new EngineDelta(enqueued, removed, []);
+    }
+
+    /// <summary>
+    /// Builds the dead-letter delta entry for one unacked-but-settled message: the
+    /// original is always removed; when the queue names a resolvable DLX with at
+    /// least one target, a copy is appended to each target (new envelope id, reset
+    /// delivery count, cleared expiry, x-death headers). A missing exchange, an
+    /// unroutable copy, or the loop guard leaves the original removed with no copy.
+    /// Caller holds the engine gate.
+    /// </summary>
+    private void DeadLetterAlreadyLocked(
+        string vhost,
+        string queue,
+        InMemoryMessage message,
+        string reason,
+        DateTimeOffset now,
+        List<QueuedMessage> enqueued,
+        List<QueuedMessageRef> removed)
+    {
+        removed.Add(new QueuedMessageRef(vhost, queue, message.EnvelopeId));
+
+        if (HasDeathFor(message.Props.Headers, queue, reason))
+        {
+            return; // loop guard: this queue already dead-lettered this message this way
+        }
+
+        if (!_queues.TryGetValue((vhost, queue), out QueueInfo? origin)
+            || origin.DeadLetterExchange is not string deadLetterExchange)
+        {
+            return; // no DLX: drop
+        }
+
+        ContentProperties properties = WithDeath(message.Props, queue, message.Exchange, reason, now);
+        string routingKey = origin.DeadLetterRoutingKey ?? message.RoutingKey;
+
+        List<string> targets;
+        if (deadLetterExchange.Length == 0)
+        {
+            // The default exchange addresses a queue by name; "" is the default
+            // exchange itself, not "no DLX".
+            targets = _queues.ContainsKey((vhost, routingKey)) ? [routingKey] : [];
+        }
+        else if (_exchanges.TryGetValue((vhost, deadLetterExchange), out ExchangeInfo? exchange))
+        {
+            targets = RouteToAlreadyLocked(exchange, properties, routingKey);
+        }
+        else
+        {
+            return; // named DLX does not exist: the copy is silently dropped
+        }
+
+        foreach (string target in targets)
+        {
+            ulong envelopeId = ++_lastEnvelopeId;
+            InMemoryMessage copy = new(
+                properties,
+                DefensiveCopy(message.Body),
+                deadLetterExchange,
+                routingKey,
+                envelopeId,
+                DeliveryCount: 0,
+                Expiration: null);
+
+            InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, target);
+            delivery.AppendAlreadyLocked(copy);
+            delivery.WakeAlreadyLocked();
+            enqueued.Add(new QueuedMessage(vhost, target, copy));
+
+            if (_queues.TryGetValue((vhost, target), out QueueInfo? targetInfo)
+                && targetInfo.MaxLength is int maxLength
+                && maxLength > 0)
+            {
+                foreach (InMemoryMessage evicted in delivery.RemoveOldestMessages(maxLength))
+                {
+                    removed.Add(new QueuedMessageRef(vhost, target, evicted.EnvelopeId));
+                }
+            }
+        }
+    }
+
+    /// <summary>True when the headers already carry an x-death entry for this
+    /// (queue, reason) pair — the loop guard's check.</summary>
+    private static bool HasDeathFor(FieldTable? headers, string queue, string reason)
+    {
+        if (headers is null
+            || !headers.TryGetValue("x-death", out FieldValue deaths)
+            || deaths.Raw is not FieldValue[] entries)
+        {
+            return false;
+        }
+
+        foreach (FieldValue entry in entries)
+        {
+            if (entry.Raw is FieldTable table
+                && table.TryGetValue("queue", out FieldValue deathQueue)
+                && deathQueue.Raw as string == queue
+                && table.TryGetValue("reason", out FieldValue deathReason)
+                && deathReason.Raw as string == reason)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns the properties a dead-letter copy carries: a cloned header table with
+    /// x-death updated (newest first: the matching (queue, reason) entry's count is
+    /// incremented and its time refreshed, or a fresh entry is prepended), the
+    /// x-first-death fields set once, and the AMQP expiration property cleared.
+    /// Internal so the header shape is unit-testable without a routing topology.
+    /// </summary>
+    internal static ContentProperties WithDeath(
+        ContentProperties properties,
+        string queue,
+        string exchange,
+        string reason,
+        DateTimeOffset now)
+    {
+        var headers = new FieldTable();
+        if (properties.Headers is not null)
+        {
+            foreach ((string key, FieldValue value) in properties.Headers)
+            {
+                headers.Add(key, value);
+            }
+        }
+
+        List<FieldValue> deaths = [];
+        if (headers.TryGetValue("x-death", out FieldValue existing) && existing.Raw is FieldValue[] entries)
+        {
+            deaths.AddRange(entries);
+        }
+
+        int match = -1;
+        for (int index = 0; index < deaths.Count; index++)
+        {
+            if (deaths[index].Raw is FieldTable table
+                && table.TryGetValue("queue", out FieldValue deathQueue)
+                && deathQueue.Raw as string == queue
+                && table.TryGetValue("reason", out FieldValue deathReason)
+                && deathReason.Raw as string == reason)
+            {
+                match = index;
+                break;
+            }
+        }
+
+        if (match >= 0)
+        {
+            var updated = new FieldTable();
+            foreach ((string key, FieldValue value) in (FieldTable)deaths[match].Raw!)
+            {
+                updated.Add(key, value);
+            }
+
+            long count = updated.TryGetValue("count", out FieldValue countValue)
+                && countValue.Raw is long parsed
+                ? parsed + 1
+                : 2;
+            updated.Add("count", FieldValue.From(count));
+            updated.Add("time", FieldValue.From(now));
+            deaths[match] = FieldValue.From(updated);
+        }
+        else
+        {
+            deaths.Insert(0, FieldValue.From(new FieldTable([
+                new("queue", FieldValue.From(queue)),
+                new("reason", FieldValue.From(reason)),
+                new("count", FieldValue.From(1L)),
+                new("time", FieldValue.From(now)),
+                new("exchange", FieldValue.From(exchange)),
+            ])));
+        }
+
+        headers.Add("x-death", FieldValue.List([.. deaths]));
+        if (!headers.ContainsKey("x-first-death-queue"))
+        {
+            headers.Add("x-first-death-queue", FieldValue.From(queue));
+        }
+
+        if (!headers.ContainsKey("x-first-death-reason"))
+        {
+            headers.Add("x-first-death-reason", FieldValue.From(reason));
+        }
+
+        if (!headers.ContainsKey("x-first-death-exchange"))
+        {
+            headers.Add("x-first-death-exchange", FieldValue.From(exchange));
+        }
+
+        return properties with { Headers = headers, Expiration = null };
     }
 
     private static EngineDelta RemovedDelta(string vhost, string queue, InMemoryMessage message) =>
@@ -591,22 +848,6 @@ public sealed class InMemoryEngine : IRouteEngine
         lock (_lock)
         {
             return _lastUsed.TryGetValue((vhost, queue), out DateTimeOffset lastUsed) ? lastUsed : null;
-        }
-    }
-
-    /// <summary>Removes expired messages from all queues' ready buffers.
-    /// Messages whose <see cref="InMemoryMessage.Expiration"/> is in the past
-    /// are dropped. Used by M1's reaper. Unacked-ledger expiry is handled
-    /// per-channel in ChannelContext, not here.</summary>
-    internal void RemoveExpiredReadyMessages()
-    {
-        var now = DateTimeOffset.UtcNow;
-        lock (_lock)
-        {
-            foreach ((string Vhost, string Queue) key in _delivery.Keys)
-            {
-                _delivery[key].RemoveExpiredMessages(now);
-            }
         }
     }
 

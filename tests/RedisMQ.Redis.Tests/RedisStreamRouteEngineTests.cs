@@ -482,6 +482,95 @@ public sealed class RedisStreamRouteEngineTests
     }
 
     [Fact]
+    public async Task Dead_letter_copy_is_mirrored_with_x_death()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-dlx-{Guid.NewGuid():N}";
+        string targetKey = RedisKeys.QueueKey(vhost, "target");
+
+        await using (var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false))
+        {
+            engine.DeclareQueue(new QueueInfo(
+                vhost, "source", DeadLetterExchange: "", DeadLetterRoutingKey: "target"));
+            engine.DeclareQueue(new QueueInfo(vhost, "target"));
+            EnqueueReceipt receipt = engine.Enqueue(
+                vhost, "source", new ContentProperties { Expiration = "60000" }, [1, 2], "origin-ex", "rk");
+            Assert.True(await receipt.Durable);
+            Assert.Equal(GetClaimOutcome.Claimed, engine.TryClaimForGet(vhost, "source", out InMemoryMessage? claimed, out _));
+
+            engine.Reject(vhost, "source", claimed!);
+
+            await WaitUntilAsync(
+                async () => await db.StreamLengthAsync(targetKey) == 1,
+                "the dead-letter copy to be mirrored");
+        }
+
+        await using var replay = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: true, drainerCapacity: 16, enforceEvictionGate: false);
+
+        Assert.Equal(GetClaimOutcome.Claimed, replay.TryClaimForGet(vhost, "target", out InMemoryMessage? copy, out _));
+        Assert.Equal(new byte[] { 1, 2 }, copy!.Body);
+
+        var deaths = (FieldValue[])copy.Props.Headers!["x-death"].Raw!;
+        var death = (FieldTable)deaths[0].Raw!;
+        Assert.Equal("source", death["queue"].Raw);
+        Assert.Equal("rejected", death["reason"].Raw);
+        Assert.Equal(1L, death["count"].Raw);
+        Assert.Equal("origin-ex", death["exchange"].Raw);
+        Assert.IsType<DateTimeOffset>(death["time"].Raw);
+        Assert.Equal("source", copy.Props.Headers!["x-first-death-queue"].Raw);
+        Assert.Null(copy.Expiration);
+        Assert.Null(copy.Props.Expiration);
+    }
+
+    [Fact]
+    public async Task Dead_letter_copy_resets_expiry_in_redis()
+    {
+        var db = TryConnectRedis();
+        if (db is null)
+        {
+            return; // Redis unavailable: skip gracefully
+        }
+
+        string vhost = $"/m4-dlx-expiry-{Guid.NewGuid():N}";
+        string targetKey = RedisKeys.QueueKey(vhost, "target");
+
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 16, enforceEvictionGate: false);
+        engine.DeclareQueue(new QueueInfo(
+            vhost, "source", DeadLetterExchange: "", DeadLetterRoutingKey: "target"));
+        engine.DeclareQueue(new QueueInfo(vhost, "target"));
+        EnqueueReceipt receipt = engine.Enqueue(
+            vhost, "source", new ContentProperties { Expiration = "60000" }, [1], "ex", "rk");
+        Assert.True(await receipt.Durable);
+        Assert.Equal(GetClaimOutcome.Claimed, engine.TryClaimForGet(vhost, "source", out InMemoryMessage? claimed, out _));
+
+        engine.Reject(vhost, "source", claimed!);
+
+        await WaitUntilAsync(
+            async () => await db.StreamLengthAsync(targetKey) == 1,
+            "the dead-letter copy to be mirrored");
+
+        StreamEntry entry = (await db.StreamRangeAsync(targetKey))[0];
+        bool hasExpiry = false;
+        foreach (NameValueEntry field in entry.Values)
+        {
+            if (field.Name == RedisKeys.QueueField.ExpiresAt)
+            {
+                hasExpiry = true;
+            }
+        }
+
+        Assert.False(hasExpiry);
+    }
+
+    [Fact]
     public async Task Replay_restores_expiry_delivery_count_and_redelivered()
     {
         var db = TryConnectRedis();
@@ -947,7 +1036,7 @@ public sealed class RedisStreamRouteEngineTests
         engine.Enqueue("/", "q", new ContentProperties() { Expiration = "0" }, new byte[] { 2 }, "fex", "rk");
         engine.Enqueue("/", "q", new ContentProperties(), new byte[] { 3 }, "fex", "rk");
 
-        engine.RemoveExpiredReadyMessages();
+        engine.Reap(DateTimeOffset.UtcNow);
 
         // Only non-expired messages remain.
         var claim1 = engine.TryClaimForGet("/", "q", out var m1, out var _);

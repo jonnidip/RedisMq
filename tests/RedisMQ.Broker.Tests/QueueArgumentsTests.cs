@@ -175,7 +175,7 @@ public sealed class QueueArgumentsTests
         engine.DeclareQueue(new QueueInfo("/", "q"));
 
         engine.Enqueue("/", "q", new ContentProperties { Expiration = "0" }, [1], "", "q");
-        engine.RemoveExpiredReadyMessages();
+        engine.Reap(DateTimeOffset.UtcNow);
 
         Assert.Equal(GetClaimOutcome.Empty, engine.TryClaimForGet("/", "q", out _, out _));
     }

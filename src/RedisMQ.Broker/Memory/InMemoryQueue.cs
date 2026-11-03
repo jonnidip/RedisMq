@@ -75,14 +75,17 @@ internal sealed class InMemoryQueue
         return true;
     }
 
-    /// <summary>Removes expired messages from the ready buffer. Messages whose
-    /// <see cref="InMemoryMessage.Expiration"/> is in the past are dropped.</summary>
-    internal void RemoveExpiredMessages(DateTimeOffset now)
+    /// <summary>Removes expired messages from the ready buffer and appends them to
+    /// <paramref name="into"/> for the reaper to dead-letter or drop. Messages whose
+    /// <see cref="InMemoryMessage.Expiration"/> is at or before <paramref name="now"/>
+    /// are collected.</summary>
+    internal void CollectExpiredMessages(DateTimeOffset now, List<InMemoryMessage> into)
     {
         for (int i = _ready.Count - 1; i >= 0; i--)
         {
             if (_ready[i].Expiration is DateTimeOffset exp && exp <= now)
             {
+                into.Add(_ready[i]);
                 _ready.RemoveAt(i);
             }
         }

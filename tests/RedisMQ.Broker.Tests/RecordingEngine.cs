@@ -90,6 +90,8 @@ public sealed class RecordingEngine : IRouteEngine
         return _memory.Reject(vhost, queue, message);
     }
 
+    public EngineDelta Reap(DateTimeOffset now) => _memory.Reap(now);
+
     public GetClaimOutcome TryClaimForGet(string vhost, string queue, out InMemoryMessage? message, out int remaining) =>
         _memory.TryClaimForGet(vhost, queue, out message, out remaining);
 
