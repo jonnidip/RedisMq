@@ -455,17 +455,43 @@ public sealed class InMemoryEngine : IRouteEngine
 
     /// <summary>Back to the ready tail with the redelivered flag set; the pump is
     /// armed under the same lock, so the requeued message can be claimed the moment
-    /// the gate is released.</summary>
-    public void Requeue(string vhost, string queue, InMemoryMessage message)
+    /// the gate is released. The delta appends the redelivered copy first, then
+    /// removes the settled stream entry.</summary>
+    public EngineDelta Requeue(string vhost, string queue, InMemoryMessage message)
     {
         ArgumentNullException.ThrowIfNull(message);
+        InMemoryMessage redelivered = message with { Redelivered = true };
         lock (_lock)
         {
             InMemoryQueue delivery = DeliveryQueueAlreadyLocked(vhost, queue);
-            delivery.AppendAlreadyLocked(message with { Redelivered = true });
+            delivery.AppendAlreadyLocked(redelivered);
             delivery.WakeAlreadyLocked();
         }
+
+        return new EngineDelta(
+            [new QueuedMessage(vhost, queue, redelivered)],
+            [new QueuedMessageRef(vhost, queue, message.EnvelopeId)],
+            []);
     }
+
+    /// <summary>The pump popped the message at claim time, so acknowledging only
+    /// describes the durable removal. No memory mutation.</summary>
+    public EngineDelta Acknowledge(string vhost, string queue, InMemoryMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        return RemovedDelta(vhost, queue, message);
+    }
+
+    /// <summary>Reject-without-requeue also only removes the durable entry in this
+    /// task; dead-letter copies arrive as enqueues in the same delta in Task 8.</summary>
+    public EngineDelta Reject(string vhost, string queue, InMemoryMessage message)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        return RemovedDelta(vhost, queue, message);
+    }
+
+    private static EngineDelta RemovedDelta(string vhost, string queue, InMemoryMessage message) =>
+        new([], [new QueuedMessageRef(vhost, queue, message.EnvelopeId)], []);
 
     /// <summary>The basic.get claim, fully atomic: existence, exclusive arbitration,
     /// the head pop and the remaining count run inside one engine-lock hold, so a

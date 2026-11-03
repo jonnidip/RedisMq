@@ -92,6 +92,32 @@ public readonly record struct EnqueueReceipt(
 }
 
 /// <summary>
+/// One message that a mutation put on a queue and the durable mirror must append.
+/// </summary>
+public sealed record QueuedMessage(string Vhost, string Queue, InMemoryMessage Message);
+
+/// <summary>
+/// One durable entry a mutation removed (ack, reject, or the original of a
+/// requeue), identified by the queue and envelope id the mirror's stream-id map
+/// resolves.
+/// </summary>
+public sealed record QueuedMessageRef(string Vhost, string Queue, ulong EnvelopeId);
+
+/// <summary>
+/// What one mutating engine call changed, expressed as the durable mirror's
+/// operations. The ordering contract is enqueue/mutate first, then remove: a
+/// crash between the two can duplicate a message but never lose one.
+/// </summary>
+public sealed record EngineDelta(
+    IReadOnlyList<QueuedMessage> Enqueued,
+    IReadOnlyList<QueuedMessageRef> Removed,
+    IReadOnlyList<(string Vhost, string Name)> DeletedQueues)
+{
+    /// <summary>The no-op delta.</summary>
+    public static EngineDelta Empty { get; } = new([], [], []);
+}
+
+/// <summary>
 /// The seam between the wire server (WireConnection/ChannelContext) and whatever
 /// backs topology and routing. The channel owns every protocol check (naming,
 /// equivalence, not-found, refused); the engine only stores declarations, holds
@@ -164,9 +190,24 @@ public interface IRouteEngine
     /// <see cref="InMemoryMessage.Redelivered"/> set (the M0 stream-consonant
     /// requeue-to-tail placement; RabbitMQ distinguishes placements and the M0
     /// simplification is recorded in the Task 7 report). The pump is armed: a waiting
-    /// or returning consumer may claim it immediately.
+    /// or returning consumer may claim it immediately. The returned delta tells the
+    /// durable mirror to append the redelivered copy and remove the settled entry.
     /// </summary>
-    void Requeue(string vhost, string queue, InMemoryMessage message);
+    EngineDelta Requeue(string vhost, string queue, InMemoryMessage message);
+
+    /// <summary>
+    /// Settles an unacked message as acknowledged: the durable mirror must remove
+    /// its entry. The pump already popped it from the ready buffer, so memory is
+    /// unchanged; the return value is the mirror instruction.
+    /// </summary>
+    EngineDelta Acknowledge(string vhost, string queue, InMemoryMessage message);
+
+    /// <summary>
+    /// Settles an unacked message as rejected without requeue: the durable mirror
+    /// must remove its entry (DLX copies, when a queue has a dead-letter exchange,
+    /// are expressed as enqueues in the same delta). Memory is otherwise unchanged.
+    /// </summary>
+    EngineDelta Reject(string vhost, string queue, InMemoryMessage message);
 
     /// <summary>
     /// The basic.get claim: atomically pops the queue head (and reports the messages

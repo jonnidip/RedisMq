@@ -194,12 +194,14 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         }
     }
 
-    public void Requeue(string vhost, string queue, InMemoryMessage message)
-    {
-        _memory.Requeue(vhost, queue, message);
-        EnqueueCommand(WriteCommand.Requeue(vhost, queue, message.EnvelopeId, message.Exchange, message.RoutingKey,
-            message.Body, message.Props, message.Redelivered));
-    }
+    public EngineDelta Requeue(string vhost, string queue, InMemoryMessage message) =>
+        _memory.Requeue(vhost, queue, message); // mirroring lands in Task 5
+
+    public EngineDelta Acknowledge(string vhost, string queue, InMemoryMessage message) =>
+        _memory.Acknowledge(vhost, queue, message);
+
+    public EngineDelta Reject(string vhost, string queue, InMemoryMessage message) =>
+        _memory.Reject(vhost, queue, message);
 
     /// <summary>
     /// Connection teardown reconciliation: deletes exclusive queues owned by this
