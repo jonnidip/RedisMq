@@ -65,6 +65,9 @@ public sealed class BrokerServerOptions
     /// reaper is one shared loop for every listener; zero disables it.</summary>
     public TimeSpan ReaperInterval { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>The TLS listener settings; null or disabled means no TLS listener.</summary>
+    public BrokerTlsOptions? Tls { get; set; }
+
     /// <summary>
     /// Validates the account list at startup: every user names exactly one credential
     /// form, every PBKDF2 hash is well formed, every permission regex compiles, and no

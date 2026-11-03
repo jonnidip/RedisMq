@@ -69,5 +69,9 @@ public sealed class TransportPair
 /// </summary>
 public interface IListenerTransport
 {
+    /// <summary>The port the listener is reachable on, when it binds one; in-proc
+    /// test listeners and other portless transports report null.</summary>
+    int? AnnouncedPort => null;
+
     ValueTask<TransportSide?> AcceptAsync(CancellationToken cancellationToken = default);
 }

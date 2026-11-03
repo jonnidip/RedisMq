@@ -22,32 +22,14 @@ public sealed class SocketListener : IListenerTransport, IAsyncDisposable
     /// would observe them (in use → SocketException).</summary>
     public SocketListener(int AnnouncedPort) // named for the ctor-facing announced-port argument
     {
-        // Dual-mode IPv6 covers both ::1 and 127.0.0.1 on the loopback; a fallback
-        // to plain IPv4 keeps it usable where v6 is unavailable.
-        Socket socket = NewDualModeSocket();
-        try
-        {
-            socket.Bind(new IPEndPoint(IPAddress.IPv6Any, AnnouncedPort));
-        }
-        catch (SocketException ex) when (ex.SocketErrorCode is SocketError.AddressFamilyNotSupported or SocketError.ProtocolNotSupported or SocketError.AddressNotAvailable)
-        {
-            socket.Dispose();
-            socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            socket.Bind(new IPEndPoint(IPAddress.Loopback, AnnouncedPort));
-        }
-
-        socket.Listen();
-        _socket = socket;
-        _announcedPort = ((IPEndPoint)socket.LocalEndPoint!).Port;
+        (_socket, _announcedPort) = SocketBinder.Bind(AnnouncedPort);
     }
-
-    private static Socket NewDualModeSocket() => new(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp)
-    {
-        DualMode = true,
-    };
 
     /// <summary>The port the bound listener is reachable on (0 requested → OS-assigned).</summary>
     public int AnnouncedPort => _announcedPort;
+
+    /// <inheritdoc/>
+    int? IListenerTransport.AnnouncedPort => _announcedPort;
 
     /// <inheritdoc/>
     public async ValueTask<TransportSide?> AcceptAsync(CancellationToken cancellationToken = default)
@@ -100,4 +82,37 @@ public sealed class SocketListener : IListenerTransport, IAsyncDisposable
 
         return ValueTask.CompletedTask;
     }
+}
+
+/// <summary>
+/// The socket-binding step shared by the plaintext and TLS listeners: try a dual-mode
+/// IPv6 socket on the wildcard address, fall back to IPv4 loopback where IPv6 is
+/// unavailable, then listen and report the port the OS actually bound.
+/// </summary>
+internal static class SocketBinder
+{
+    internal static (Socket Socket, int Port) Bind(int port)
+    {
+        // Dual-mode IPv6 covers both ::1 and 127.0.0.1 on the loopback; a fallback
+        // to plain IPv4 keeps it usable where v6 is unavailable.
+        Socket socket = NewDualModeSocket();
+        try
+        {
+            socket.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode is SocketError.AddressFamilyNotSupported or SocketError.ProtocolNotSupported or SocketError.AddressNotAvailable)
+        {
+            socket.Dispose();
+            socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            socket.Bind(new IPEndPoint(IPAddress.Loopback, port));
+        }
+
+        socket.Listen();
+        return (socket, ((IPEndPoint)socket.LocalEndPoint!).Port);
+    }
+
+    private static Socket NewDualModeSocket() => new(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp)
+    {
+        DualMode = true,
+    };
 }
