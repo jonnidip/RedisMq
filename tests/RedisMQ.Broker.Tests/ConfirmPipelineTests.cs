@@ -257,7 +257,7 @@ public sealed class ConfirmPipelineTests
 
     private static BrokerServerOptions NewOptions() => new()
     {
-        Users = [new BrokerUser("guest", "guest")],
+        Users = [BrokerUser.FullAccess("guest", "guest", "/")],
         Vhosts = ["/"],
         FrameMax = 131072,
         Heartbeat = 60,

@@ -42,6 +42,7 @@ public sealed class AmqpBrokerServer
             throw new InvalidOperationException("The server is already started");
         }
 
+        _options.Validate();
         _started = true;
         _stoppingCts = new CancellationTokenSource();
         _acceptTask = _listener is null

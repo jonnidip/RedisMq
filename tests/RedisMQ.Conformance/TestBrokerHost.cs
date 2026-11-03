@@ -30,9 +30,10 @@ public sealed class TestBrokerHost : IAsyncDisposable, IDisposable
         {
             Port = 0, // ephemeral: the announced port comes off the bound socket
             Vhosts = ["/"],
-            Users = [new BrokerUser("guest", "guest")],
+            Users = [BrokerUser.FullAccess("guest", "guest", "/")],
         };
         configure?.Invoke(options);
+        options.Validate();
 
         var listener = new SocketListener(options.Port);
         // The listener de dicto port (0 → OS-assigned); the server negotiates through
@@ -51,9 +52,10 @@ public sealed class TestBrokerHost : IAsyncDisposable, IDisposable
         {
             Port = 0,
             Vhosts = ["/"],
-            Users = [new BrokerUser("guest", "guest")],
+            Users = [BrokerUser.FullAccess("guest", "guest", "/")],
         };
         configure?.Invoke(options);
+        options.Validate();
 
         var listener = new SocketListener(options.Port);
         var server = new AmqpBrokerServer(options, engine, listener);

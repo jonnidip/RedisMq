@@ -143,7 +143,7 @@ public sealed class ReaperTests
 
     private static BrokerServerOptions NewOptions(TimeSpan reaperInterval) => new()
     {
-        Users = [new BrokerUser("guest", "guest")],
+        Users = [BrokerUser.FullAccess("guest", "guest", "/")],
         Vhosts = ["/"],
         FrameMax = 131072,
         Heartbeat = 60,

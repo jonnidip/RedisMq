@@ -1,7 +1,33 @@
 namespace RedisMQ.Broker.Server;
 
-/// <summary>One broker-side SASL account: the PLAIN username/password pair.</summary>
-public sealed record BrokerUser(string Name, string Password);
+/// <summary>One per-vhost permission triple: regexes matching the configure, write
+/// and read names the account may touch. An empty pattern matches only the empty
+/// name (effectively deny); <c>.*</c> grants everything.</summary>
+public sealed record BrokerPermission(string Vhost, string Configure, string Write, string Read);
+
+/// <summary>
+/// One broker-side SASL account: the PLAIN username plus exactly one credential form
+/// (a development-only plaintext password or a PBKDF2 hash) and the per-vhost
+/// permissions. Null or empty permissions deny every vhost; a vhost the list does not
+/// mention is not openable at all.
+/// </summary>
+public sealed record BrokerUser(
+    string Name,
+    string? Password = null,
+    string? PasswordHash = null,
+    IReadOnlyList<BrokerPermission>? Permissions = null)
+{
+    /// <summary>The explicit full-access helper for tests and samples: configure,
+    /// write and read everything on each named vhost.</summary>
+    public static BrokerUser FullAccess(string name, string password, params string[] vhosts)
+    {
+        ArgumentNullException.ThrowIfNull(vhosts);
+        return new BrokerUser(
+            name,
+            password,
+            Permissions: [.. vhosts.Select(vhost => new BrokerPermission(vhost, ".*", ".*", ".*"))]);
+    }
+}
 
 /// <summary>
 /// Broker-wide settings: the TCP port for the Task-8 listener, the virtual hosts the
@@ -38,4 +64,42 @@ public sealed class BrokerServerOptions
     /// <summary>How often the server sweeps expired messages and idle queues. The
     /// reaper is one shared loop for every listener; zero disables it.</summary>
     public TimeSpan ReaperInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Validates the account list at startup: every user names exactly one credential
+    /// form, every PBKDF2 hash is well formed, every permission regex compiles, and no
+    /// two users share a name. Throws <see cref="BrokerConfigurationException"/> when
+    /// the broker cannot safely start.
+    /// </summary>
+    public void Validate()
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (BrokerUser user in Users)
+        {
+            ArgumentNullException.ThrowIfNull(user);
+            if (!names.Add(user.Name))
+            {
+                throw new BrokerConfigurationException($"Duplicate broker user '{user.Name}'");
+            }
+
+            bool hasPassword = user.Password is not null;
+            bool hasHash = user.PasswordHash is not null;
+            if (hasPassword == hasHash)
+            {
+                throw new BrokerConfigurationException(
+                    $"Broker user '{user.Name}' must set exactly one of Password or PasswordHash");
+            }
+
+            if (hasHash && !BrokerPassword.IsWellFormed(user.PasswordHash!))
+            {
+                throw new BrokerConfigurationException(
+                    $"Broker user '{user.Name}' has a malformed PasswordHash " +
+                    "(expected pbkdf2-sha256$<iterations>$<base64 salt>$<base64 hash>)");
+            }
+
+            // Compiles every permission triple; it throws BrokerConfigurationException
+            // for an invalid pattern, which is exactly the startup contract.
+            _ = new BrokerPrincipal(user.Name, user.Permissions ?? []);
+        }
+    }
 }
