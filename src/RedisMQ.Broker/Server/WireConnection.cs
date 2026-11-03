@@ -85,6 +85,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
     private ConnectionState _state = ConnectionState.AwaitStartOk;
     private uint _frameMax; // the negotiated frame-max; starts at the broker's offer
     private string _vhost = string.Empty; // captured at connection.open for channel dispatch
+    private BrokerPrincipal? _principal; // the authenticated account's resolved permissions
     private readonly Dictionary<ushort, ChannelContext> _channels = []; // Running and Mourning channels
     private bool _disposed;
 
@@ -668,7 +669,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
         // The connection is the channel's delivery host: every consumer-path write
         // (obligated by the queue pumps) funnels through this instance's gated writers.
-        var fresh = new ChannelContext(channel, _vhost, Routes, this, _connectionId);
+        var fresh = new ChannelContext(channel, _vhost, Routes, this, _connectionId, _principal);
         _channels[channel] = fresh;
         return fresh;
     }
@@ -864,6 +865,8 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
                 10, 11, ct);
         }
 
+        _principal = new BrokerPrincipal(user.Name, user.Permissions ?? []);
+
         await SendMethodAsync(Method(tune =>
         {
             tune.Set("channel-max", (short)DefaultChannelMax);
@@ -887,7 +890,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         foreach (var user in _options.Users)
         {
             if (string.Equals(user.Name, username, StringComparison.Ordinal)
-                && string.Equals(user.Password, password, StringComparison.Ordinal))
+                && BrokerPassword.Verify(password, user))
             {
                 return user;
             }
@@ -950,6 +953,18 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             return await CloseConnectionAsync(
                 AmqpConstants.InvalidPath,
                 $"INVALID_PATH - invalid virtual host '{vhost}'",
+                10, 40, ct);
+        }
+
+        // Default-deny: a vhost is openable only when the account has a permission
+        // entry for it (a deny-all entry is still a listed, openable vhost).
+        if (_principal is null || !_principal.IsKnownVhost(vhost))
+        {
+            return await CloseConnectionAsync(
+                AmqpConstants.AccessRefused,
+                _principal is null
+                    ? $"ACCESS_REFUSED - access to vhost '{vhost}' refused"
+                    : $"ACCESS_REFUSED - access to vhost '{vhost}' refused for user '{_principal.Name}'",
                 10, 40, ct);
         }
 

@@ -206,14 +206,22 @@ public sealed class ChannelContext
     private readonly Queue<Func<ValueTask>> _writerJobs = [];
 
     private readonly string _connectionId;
+    private readonly BrokerPrincipal? _principal; // null = internal test channel, full access
 
-    internal ChannelContext(ushort channel, string vhost, IRouteEngine engine, IChannelDeliveryHost host, string? connectionId = null)
+    internal ChannelContext(
+        ushort channel,
+        string vhost,
+        IRouteEngine engine,
+        IChannelDeliveryHost host,
+        string? connectionId = null,
+        BrokerPrincipal? principal = null)
     {
         _channel = channel;
         _vhost = vhost;
         _engine = engine;
         _host = host;
         _connectionId = connectionId ?? Guid.NewGuid().ToString("N");
+        _principal = principal;
     }
 
     public bool IsMourning => _state == ChannelState.Mourning;
@@ -455,6 +463,13 @@ public sealed class ChannelContext
         string exchangeName = method.Get("exchange") as string ?? string.Empty;
         string routingKey = method.Get("routing-key") as string ?? string.Empty;
 
+        // check_write_permitted runs before lookup_or_die. On the default exchange
+        // the routing key names the queue the write is checked against.
+        if (!CanWrite(exchangeName.Length == 0 ? routingKey : exchangeName))
+        {
+            return PermissionRefused("exchange", exchangeName.Length == 0 ? routingKey : exchangeName, method);
+        }
+
         // lookup_or_die happens after the full content assembly (it receives the
         // content), not-found being the ordinary soft 404.
         ExchangeInfo? exchange = _engine.GetExchange(_vhost, exchangeName);
@@ -574,6 +589,11 @@ public sealed class ChannelContext
                 return DefaultExchangeRefused(method);
             }
 
+            if (!CanConfigure(name))
+            {
+                return PermissionRefused("exchange", name, method);
+            }
+
             ExchangeInfo? existing = _engine.GetExchange(_vhost, name);
             if (existing is null)
             {
@@ -594,6 +614,12 @@ public sealed class ChannelContext
         if (name.Length == 0)
         {
             return DefaultExchangeRefused(method);
+        }
+
+        // check_configure_permitted runs before any existence/equivalence lookup.
+        if (!CanConfigure(name))
+        {
+            return PermissionRefused("exchange", name, method);
         }
 
         ExchangeInfo? declared = _engine.GetExchange(_vhost, name);
@@ -695,6 +721,11 @@ public sealed class ChannelContext
         {
             // No "" shortcut on declares: an empty name looks up the empty queue and
             // reports the ordinary not-found ("/" vhost wording with '' quoted).
+            if (!CanConfigure(name))
+            {
+                return PermissionRefused("queue", name, method);
+            }
+
             QueueInfo? existing = _engine.GetQueue(_vhost, name);
             if (existing is null)
             {
@@ -720,6 +751,13 @@ public sealed class ChannelContext
         if (actual.Length == 0)
         {
             actual = $"amq.gen-{Guid.NewGuid().ToString("N")}"; // rabbit_guid's amq.gen + token
+        }
+
+        // A generated name is checked after generation, exactly like RabbitMQ's
+        // check_configure_permitted(QueueName).
+        if (!CanConfigure(actual))
+        {
+            return PermissionRefused("queue", actual, method);
         }
 
         QueueInfo? declared = _engine.GetQueue(_vhost, actual);
@@ -992,11 +1030,23 @@ public sealed class ChannelContext
             key = _mostRecentlyDeclaredQueue; // reached only when the queue expansion succeeded
         }
 
+        // check_configure_permitted(queue) then check_write_permitted(exchange),
+        // both before any resource lookup.
+        if (!CanConfigure(queueName))
+        {
+            return PermissionRefused("queue", queueName, method);
+        }
+
         // check_not_default_exchange: refused before any resource lookup — even when
         // the queue named does not exist either.
         if (exchange.Length == 0)
         {
             return DefaultExchangeRefused(method);
+        }
+
+        if (!CanWrite(exchange))
+        {
+            return PermissionRefused("exchange", exchange, method);
         }
 
         ExchangeInfo? source = _engine.GetExchange(_vhost, exchange);
@@ -1065,6 +1115,12 @@ public sealed class ChannelContext
         bool noAck = method.Get("no-ack") is true;
         bool exclusive = method.Get("exclusive") is true;
         bool nowait = method.Get("nowait") is true;
+
+        // check_read_permitted runs before the lookup_or_die.
+        if (!CanRead(queue))
+        {
+            return PermissionRefused("queue", queue, method);
+        }
 
         // rabbit_channel's lookup_or_die runs before any consumer mapping work.
         if (_engine.GetQueue(_vhost, queue) is null)
@@ -1150,6 +1206,12 @@ public sealed class ChannelContext
     {
         string queue = method.Get("queue") as string ?? string.Empty;
         bool noAck = method.Get("no-ack") is true;
+
+        // check_read_permitted runs before the claim.
+        if (!CanRead(queue))
+        {
+            return PermissionRefused("queue", queue, method);
+        }
 
         GetClaimOutcome outcome = _engine.TryClaimForGet(_vhost, queue, out InMemoryMessage? message, out int remaining);
         switch (outcome)
@@ -1601,6 +1663,22 @@ public sealed class ChannelContext
 
     private ChannelOutcome NotFound(string kind, string name, AmqpMethod method) =>
         Soft(method, AmqpConstants.NotFound, $"NOT_FOUND - no {kind} '{name}' in vhost '{_vhost}'");
+
+    // ---------- permissions (M4 Task 11) ----------
+    // A null principal means an internal test channel with full access; production
+    // channels always carry the authenticated account's principal.
+
+    private bool CanConfigure(string name) => _principal is null || _principal.CanConfigure(_vhost, name);
+
+    private bool CanWrite(string name) => _principal is null || _principal.CanWrite(_vhost, name);
+
+    private bool CanRead(string name) => _principal is null || _principal.CanRead(_vhost, name);
+
+    private ChannelOutcome PermissionRefused(string kind, string name, AmqpMethod method) =>
+        Soft(
+            method,
+            AmqpConstants.AccessRefused,
+            $"ACCESS_REFUSED - access to {kind} '{name}' in vhost '{_vhost}' refused for user '{_principal?.Name}'");
 
     /// <summary>A successful declare-ok; <paramref name="updateMrdq"/> records the
     /// most-recently-declared-queue hint for every successful declare, nowait
