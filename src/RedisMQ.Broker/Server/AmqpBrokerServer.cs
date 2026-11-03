@@ -4,35 +4,51 @@ using RedisMQ.Broker.Transport;
 namespace RedisMQ.Broker.Server;
 
 /// <summary>
-/// The broker's connection lifecycle: an accept loop over an optional
+/// The broker's connection lifecycle: one accept loop per
 /// <see cref="IListenerTransport"/>, handing every accepted transport side to a fresh
-/// <see cref="WireConnection"/>. Task 8 supplies the TCP listener (and the
-/// <see cref="BrokerServerOptions.Port"/> bind); M0 tests inject listeners over
-/// <see cref="TransportPair"/>s, and with no listener StartAsync simply starts nothing.
+/// <see cref="WireConnection"/>. Task 8 supplies the TCP listeners (and
+/// <see cref="BrokerServerOptions.Port"/>); Task 13 adds the TLS listener and the
+/// factory, while M0 tests inject listeners over <see cref="TransportPair"/>s. With no
+/// listener StartAsync simply starts nothing.
 /// </summary>
 public sealed class AmqpBrokerServer
 {
     private readonly BrokerServerOptions _options;
     private readonly IRouteEngine _engine;
-    private readonly IListenerTransport? _listener;
+    private readonly IReadOnlyList<IListenerTransport> _listeners;
     private readonly List<Task> _connectionTasks = [];
     private readonly object _gate = new();
     private CancellationTokenSource? _stoppingCts;
-    private Task _acceptTask = Task.CompletedTask;
+    private Task[] _acceptTasks = [];
     private Task _reaperTask = Task.CompletedTask;
     private bool _started;
 
+    /// <summary>The single-listener constructor: M0/M1 test harnesses and callers that
+    /// run one transport. A null listener starts no accept loop.</summary>
     public AmqpBrokerServer(BrokerServerOptions options, IRouteEngine engine, IListenerTransport? listener = null)
+        : this(
+            options,
+            engine,
+            listener is null ? Array.Empty<IListenerTransport>() : new[] { listener })
+    {
+    }
+
+    /// <summary>The multi-listener constructor: one accept loop per listener, all
+    /// sharing the server's engine and reaper. The caller owns the listeners.</summary>
+    public AmqpBrokerServer(
+        BrokerServerOptions options,
+        IRouteEngine engine,
+        IReadOnlyList<IListenerTransport> listeners)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _engine = engine ?? throw new ArgumentNullException(nameof(engine));
-        _listener = listener;
+        _listeners = listeners ?? throw new ArgumentNullException(nameof(listeners));
     }
 
     /// <summary>
-    /// Starts the accept loop. Returns as soon as accepting is armed (the loop itself
-    /// runs in the background); no-op when the server was constructed without a
-    /// listener. The stop call <see cref="StopAsync"/> ends the loop and drains
+    /// Starts every accept loop. Returns as soon as accepting is armed (the loops
+    /// themselves run in the background); no-op when the server was constructed without
+    /// a listener. The stop call <see cref="StopAsync"/> ends the loops and drains
     /// connections.
     /// </summary>
     public Task StartAsync()
@@ -45,16 +61,15 @@ public sealed class AmqpBrokerServer
         _options.Validate();
         _started = true;
         _stoppingCts = new CancellationTokenSource();
-        _acceptTask = _listener is null
-            ? Task.CompletedTask
-            : RunAcceptLoopAsync(_stoppingCts.Token);
+        CancellationToken ct = _stoppingCts.Token;
+        _acceptTasks = [.. _listeners.Select(listener => RunAcceptLoopAsync(listener, ct))];
         _reaperTask = _options.ReaperInterval > TimeSpan.Zero
-            ? RunReaperAsync(_options.ReaperInterval, _stoppingCts.Token)
+            ? RunReaperAsync(_options.ReaperInterval, ct)
             : Task.CompletedTask;
         return Task.CompletedTask;
     }
 
-    /// <summary>Cancels accepting and waits for the accept loop plus every accepted
+    /// <summary>Cancels accepting and waits for every accept loop plus every accepted
     /// connection task. Exceptions observed there are swallowed per-connection.</summary>
     public async Task StopAsync()
     {
@@ -67,11 +82,11 @@ public sealed class AmqpBrokerServer
         _stoppingCts!.Cancel();
         try
         {
-            await _acceptTask;
+            await Task.WhenAll(_acceptTasks);
         }
         catch
         {
-            // The accept loop follows the listener's own failure surface.
+            // Each accept loop follows its listener's own failure surface.
         }
 
         try
@@ -99,15 +114,16 @@ public sealed class AmqpBrokerServer
         }
     }
 
-    /// <summary>The accept loop: hands each transport side to a connection task.</summary>
-    private async Task RunAcceptLoopAsync(CancellationToken ct)
+    /// <summary>One accept loop per listener: hands each transport side to a connection
+    /// task.</summary>
+    private async Task RunAcceptLoopAsync(IListenerTransport listener, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             TransportSide? side;
             try
             {
-                side = await _listener!.AcceptAsync(ct);
+                side = await listener.AcceptAsync(ct);
             }
             catch (OperationCanceledException)
             {
