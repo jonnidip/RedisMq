@@ -470,14 +470,19 @@ public sealed class ChannelContext
             ? (_engine.GetQueue(_vhost, routingKey) is null ? [] : [routingKey])
             : _engine.RouteTo(exchange, header.Properties, routingKey);
 
+        ChannelOutcomeBasicReturn? returnFirst = null;
+        List<EnqueueReceipt> receipts = [];
+
         if (targets.Count == 0)
         {
-            // process_routing_mandatory: mandatory + nothing routed → basic_return
+            // process_routing_mandatory: mandatory + nothing routed → basic.return
             // (no_route) carrying the publishing origin and the full content back;
-            // non-mandatory → messages_unroutable_dropped, silence.
+            // non-mandatory → messages_unroutable_dropped, just an ack. In confirm
+            // mode the return rides the confirm loop so it stays ordered with the
+            // ack for the same sequence; otherwise it goes out inline.
             if (method.Get("mandatory") is true)
             {
-                return new ChannelOutcomeBasicReturn(
+                returnFirst = new ChannelOutcomeBasicReturn(
                     NewMethod("basic.return", basicReturn =>
                     {
                         basicReturn.Set("reply-code", (short)AmqpConstants.NoRoute); // NO_ROUTE
@@ -488,38 +493,28 @@ public sealed class ChannelContext
                     header.Properties,
                     body);
             }
-
-            // Non-mandatory unroutable: message is dropped. Confirm if confirm mode.
-            if (_confirmMode && pendingConfirmSequence is long droppedSeq)
+        }
+        else
+        {
+            foreach (string queue in targets)
             {
-                return ChainReply("confirm.ack", ack =>
-                {
-                    ack.Set("delivery-tag", droppedSeq);
-                    ack.Set("multiple", false);
-                });
+                // One engine entry per routed queue, in binding-insertion order; the
+                // body ownership may move because the engine stores its own defensive copy.
+                receipts.Add(_engine.Enqueue(_vhost, queue, header.Properties, body, exchangeName, routingKey));
             }
-
-            return new ChannelOutcomeSilent();
         }
 
-        foreach (string queue in targets)
+        if (!_confirmMode)
         {
-            // One engine entry per routed queue, in binding-insertion order; the body
-            // ownership may move because the engine stores its own defensive copy.
-            _engine.Enqueue(_vhost, queue, header.Properties, body, exchangeName, routingKey);
+            // Non-confirm channel: today's inline basic.return (or silence) and no confirms.
+            return (ChannelOutcome?)returnFirst ?? new ChannelOutcomeSilent();
         }
 
-        // Publisher confirms: confirm.ack when the message has been handled (enqueued
-        // to all bound queues, or dropped as non-mandatory unroutable).
-        if (_confirmMode && pendingConfirmSequence is long seq)
-        {
-            return ChainReply("confirm.ack", ack =>
-            {
-                ack.Set("delivery-tag", seq);
-                ack.Set("multiple", false);
-            });
-        }
-
+        // One ordered outcome for every publish on a confirm-mode channel: the
+        // connection's confirm loop awaits the receipts, then writes the return
+        // (if any) followed by confirm.ack/nack for this sequence.
+        long sequence = pendingConfirmSequence ?? ++_confirmSequence;
+        _host.EnqueueConfirm(new PendingConfirm(this, _channel, sequence, receipts, returnFirst));
         return new ChannelOutcomeSilent(); // basic.publish never replies on success
     }
 
@@ -1255,6 +1250,39 @@ public sealed class ChannelContext
     }
 
     // ---------- the serialized writer chain (Task 7) ----------
+
+    /// <summary>True while the channel is Running; the confirm loop discards entries
+    /// for channels that mourned, retired or were replaced under the same number.</summary>
+    internal bool IsOpen => _state == ChannelState.Running;
+
+    /// <summary>Schedules the confirm outcome on the channel's writer chain, so an
+    /// async confirm interleaves with deliveries and replies in schedule order.</summary>
+    internal void ScheduleConfirmResult(long sequence, bool ack)
+    {
+        AmqpMethod method = ack
+            ? NewMethod("confirm.ack", confirm =>
+            {
+                confirm.Set("delivery-tag", sequence);
+                confirm.Set("multiple", false);
+            })
+            : NewMethod("confirm.nack", confirm =>
+            {
+                confirm.Set("delivery-tag", sequence);
+                confirm.Set("multiple", false);
+                confirm.Set("requeue", false);
+            });
+
+        ScheduleWriterJob(() => _host.WriteMethodToWireAsync(_channel, method, default));
+    }
+
+    /// <summary>Schedules a mandatory-unroutable basic.return (with its content) on
+    /// the same chain the confirm for that sequence rides.</summary>
+    internal void ScheduleConfirmReturn(ChannelOutcomeBasicReturn returned) =>
+        ScheduleWriterJob(() => _host.WriteReturnToWireAsync(_channel, returned, default));
+
+    /// <summary>Drains everything scheduled so far; the confirm loop calls this after
+    /// scheduling its return/ack/nack pair.</summary>
+    internal Task FlushWriterChainAsync(CancellationToken ct) => RunWriterChainAsync(ct);
 
     /// <summary>Schedules one job on the channel's writer chain: pure synchronous
     /// enqueue, safe under the engine gate and _deliveryLock alike (the drains run

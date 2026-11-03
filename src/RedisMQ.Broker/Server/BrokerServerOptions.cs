@@ -25,4 +25,13 @@ public sealed class BrokerServerOptions
 
     /// <summary>The heartbeat the broker offers at connection.tune, in seconds.</summary>
     public ushort Heartbeat { get; set; } = 60;
+
+    /// <summary>The number of publisher confirmations that may be outstanding on a
+    /// connection before the frame pump blocks (deliberate backpressure, never a
+    /// drop or an invented nack).</summary>
+    public int ConfirmQueueCapacity { get; set; } = 4096;
+
+    /// <summary>How long the confirm loop waits for a publish's durability receipts
+    /// before answering confirm.nack.</summary>
+    public TimeSpan ConfirmTimeout { get; set; } = TimeSpan.FromSeconds(5);
 }

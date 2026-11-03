@@ -211,11 +211,10 @@ public sealed class M0RegressionTests
         var options = new CreateChannelOptions(true, true);
         await using IChannel channel = await connection.CreateChannelAsync(options, TestContext.Current.CancellationToken);
 
-        // Channel is open with confirms enabled. basic.publish would hang client-side
-        // because RabbitMQ.Client 7.x awaits confirm.ack frames that it does not
-        // surface via BasicAcksAsync. The confirm.ack wire path is implemented in
-        // ChannelContext (FinishPublish schedules confirm.ack via the writer chain);
-        // this test pins the confirm.select → confirm.select-ok handshake.
+        // Channel is open with confirms enabled. basic.publish outcomes ride the
+        // connection's ordered confirm loop: the loop awaits the engine's durability
+        // receipts and then writes confirm.ack/nack on the channel's writer chain.
+        // This test pins the confirm.select → confirm.select-ok handshake.
         Assert.True(channel.IsOpen);
     }
 

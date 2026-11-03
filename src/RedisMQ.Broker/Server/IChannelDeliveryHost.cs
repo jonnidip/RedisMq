@@ -27,4 +27,13 @@ public interface IChannelDeliveryHost
     /// header, body re-chunked) as ONE atomic write — the gated whole that keeps a
     /// deliver's frames interleaving with nothing else but other whole frames.</summary>
     ValueTask WriteDeliveryToWireAsync(ushort channel, AmqpMethod deliver, ContentProperties properties, byte[] body, CancellationToken ct);
+
+    /// <summary>Hands one publish outcome to the connection's ordered confirm loop.
+    /// Blocks the frame pump when the bounded confirm queue is full — that is
+    /// deliberate backpressure, never a drop and never an invented answer.</summary>
+    void EnqueueConfirm(PendingConfirm confirm);
+
+    /// <summary>Writes a mandatory-unroutable basic.return (method, content header,
+    /// body re-chunked) as one atomic write, preserving return-before-confirm order.</summary>
+    ValueTask WriteReturnToWireAsync(ushort channel, ChannelOutcomeBasicReturn returned, CancellationToken ct);
 }

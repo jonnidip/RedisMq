@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.IO.Pipelines;
 using System.Text;
+using System.Threading.Channels;
 using RedisMQ.Broker.Codec;
 using RedisMQ.Broker.Memory;
 using RedisMQ.Broker.Protocol;
@@ -87,6 +88,15 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
     private readonly Dictionary<ushort, ChannelContext> _channels = []; // Running and Mourning channels
     private bool _disposed;
 
+    // The single ordered confirm pipeline (M4 Task 6): one bounded handoff queue plus
+    // a slot gate whose permits are released only after each entry's outcome is
+    // flushed, so "capacity" means outstanding confirms — not just queued ones.
+    private Channel<PendingConfirm>? _confirmQueue;
+    private SemaphoreSlim? _confirmSlots;
+    private Task? _confirmLoop;
+    private CancellationTokenSource? _confirmCts;
+    private CancellationToken _runToken; // the RunAsync lifetime token, used by the blocking handoff
+
     private readonly string _connectionId;
 
     public WireConnection(BrokerServerOptions options, IRouteEngine routes, TransportSide transport, string? connectionId = null)
@@ -120,6 +130,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken, _stopCts.Token, _heartbeatCts.Token);
         var ct = linked.Token;
+        _runToken = ct;
         try
         {
             if (await RunHandshakeAsync(ct))
@@ -190,6 +201,34 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         _timer?.Dispose();
         _stopCts.Cancel();
         _heartbeatCts.Cancel();
+
+        // Confirm loop: stop admitting, unblock a pump parked in EnqueueConfirm, then
+        // let the loop observe cancellation before the transport goes away.
+        _confirmCts?.Cancel();
+        _confirmQueue?.Writer.TryComplete();
+        try
+        {
+            _confirmSlots?.Release(int.MaxValue / 2);
+        }
+        catch (Exception ex) when (ex is SemaphoreFullException or ObjectDisposedException)
+        {
+            // Already released or torn down: nothing left to unblock.
+        }
+
+        if (_confirmLoop is { } loop)
+        {
+            try
+            {
+                await loop;
+            }
+            catch
+            {
+                // The loop guards its own cancellation; observe it only.
+            }
+        }
+
+        _confirmSlots?.Dispose();
+        _confirmCts?.Dispose();
         _writeGate.Dispose();
         await _transport.CompleteAsync();
     }
@@ -599,14 +638,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
                 return await CloseConnectionAsync(hard.Code, hard.Text, hard.ClassId, hard.MethodId, ct);
 
             case ChannelOutcomeBasicReturn returned:
-                await SendMethodAsync(returned.ReturnMethod, channel, ct);
-                var returnHeader = new ByteWriter();
-                FrameWriter.WriteContentHeader(
-                    ref returnHeader, channel, classId: 60, returned.Body.LongLength, returned.Properties);
-                await WriteAsync(returnHeader.ToArray(), ct);
-                var returnBody = new ByteWriter();
-                FrameWriter.WriteBody(ref returnBody, channel, returned.Body, _frameMax);
-                await WriteAsync(returnBody.ToArray(), ct);
+                await WriteReturnToWireAsync(channel, returned, ct);
                 return true;
 
             default:
@@ -639,6 +671,150 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         var fresh = new ChannelContext(channel, _vhost, Routes, this, _connectionId);
         _channels[channel] = fresh;
         return fresh;
+    }
+
+    // ---------- the ordered confirm pipeline (M4 Task 6) ----------
+
+    /// <summary>Starts the connection's single confirm loop when it enters Serving.
+    /// The bounded queue hands entries over in publish order; the slot gate makes a
+    /// full pipeline block <see cref="EnqueueConfirm"/> (pump backpressure) until an
+    /// earlier entry's outcome has been flushed.</summary>
+    private void StartConfirmLoop()
+    {
+        if (_confirmQueue is not null)
+        {
+            return;
+        }
+
+        int capacity = Math.Max(1, _options.ConfirmQueueCapacity);
+        _confirmCts = CancellationTokenSource.CreateLinkedTokenSource(_stopCts.Token);
+        _confirmSlots = new SemaphoreSlim(capacity, int.MaxValue);
+        _confirmQueue = Channel.CreateBounded<PendingConfirm>(new BoundedChannelOptions(capacity)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+        _confirmLoop = RunConfirmLoopAsync(_confirmQueue.Reader, _confirmCts.Token);
+    }
+
+    /// <summary>Hands one publish outcome to the confirm loop. The deliberate blocking
+    /// wait is the backpressure contract: when every slot is held the frame pump stops
+    /// reading, so Redis receives no new publishes and no confirm is invented. A
+    /// cancelled connection drops the entry silently.</summary>
+    void IChannelDeliveryHost.EnqueueConfirm(PendingConfirm confirm)
+    {
+        ArgumentNullException.ThrowIfNull(confirm);
+
+        SemaphoreSlim? slots = _confirmSlots;
+        Channel<PendingConfirm>? queue = _confirmQueue;
+        if (slots is null || queue is null)
+        {
+            return;
+        }
+
+        try
+        {
+            slots.Wait(_runToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return; // connection ending: no outcome can be observed
+        }
+
+        if (!queue.Writer.TryWrite(confirm))
+        {
+            slots.Release(); // loop gone (shutdown): do not leak the permit
+        }
+    }
+
+    private async Task RunConfirmLoopAsync(ChannelReader<PendingConfirm> reader, CancellationToken ct)
+    {
+        try
+        {
+            while (await reader.WaitToReadAsync(ct))
+            {
+                while (reader.TryRead(out PendingConfirm? confirm))
+                {
+                    try
+                    {
+                        await ProcessConfirmAsync(confirm, ct);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch
+                    {
+                        // A dead transport/pump must never strand the stream's slots.
+                    }
+                    finally
+                    {
+                        _confirmSlots?.Release();
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Connection teardown: pending outcomes are intentionally discarded.
+        }
+    }
+
+    /// <summary>Waits for every receipt in the entry, then writes the outcome in publish
+    /// order: the mandatory return first, then confirm.ack (all durable/empty) or
+    /// confirm.nack (any refusal, fault or timeout). Timeout is not cancellation: a
+    /// timed-out XADD may still land, which is documented at-least-once behavior.</summary>
+    private async Task ProcessConfirmAsync(PendingConfirm confirm, CancellationToken ct)
+    {
+        bool ack;
+        try
+        {
+            if (confirm.Receipts.Count == 0)
+            {
+                ack = true; // nothing to persist (unroutable): it is handled by turn order
+            }
+            else
+            {
+                Task<bool>[] pending = new Task<bool>[confirm.Receipts.Count];
+                for (int index = 0; index < pending.Length; index++)
+                {
+                    pending[index] = confirm.Receipts[index].Durable.AsTask();
+                }
+
+                bool[] results = await Task.WhenAll(pending).WaitAsync(_options.ConfirmTimeout, ct);
+                ack = Array.TrueForAll(results, static durable => durable);
+            }
+        }
+        catch (TimeoutException)
+        {
+            ack = false;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw; // teardown: discard rather than answer
+        }
+        catch
+        {
+            ack = false; // faulted receipt: never a false ack
+        }
+
+        // Liveness: channels are retired and re-created under the same number, so the
+        // entry is only valid for the same live context it was created on.
+        if (!_channels.TryGetValue(confirm.ChannelNumber, out ChannelContext? current)
+            || !ReferenceEquals(current, confirm.Channel)
+            || !current.IsOpen)
+        {
+            return;
+        }
+
+        if (confirm.ReturnFirst is { } returned)
+        {
+            confirm.Channel.ScheduleConfirmReturn(returned);
+        }
+
+        confirm.Channel.ScheduleConfirmResult(confirm.Sequence, ack);
+        await confirm.Channel.FlushWriterChainAsync(ct);
     }
 
     /// <summary>Sends the server's channel.close for a soft error; the channel stays
@@ -783,6 +959,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         }, "connection.open-ok"), 0, ct);
         _vhost = vhost; // channel dispatch binds declarations to the connection's vhost
         _state = ConnectionState.Serving;
+        StartConfirmLoop(); // the one ordered confirm pipeline for this connection
         return true;
     }
 
@@ -1011,6 +1188,26 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         FrameWriter.WriteBody(ref frame, channel, body, _frameMax);
         await WriteAsync(frame.ToArray(), ct);
     }
+
+    /// <summary>Method + header + body re-chunked per the negotiated frame-max, one
+    /// gated write: a mandatory return's frames never interleave with anything else.</summary>
+    private async ValueTask WriteReturnToWireAsync(
+        ushort channel, ChannelOutcomeBasicReturn returned, CancellationToken ct)
+    {
+        var payloadWriter = new ByteWriter();
+        MethodCodec.WriteMethod(ref payloadWriter, returned.ReturnMethod);
+        byte[] payload = payloadWriter.ToArray();
+
+        var frame = new ByteWriter();
+        FrameWriter.WriteMethod(ref frame, channel, returned.ReturnMethod.ClassId, returned.ReturnMethod.MethodId, payload.AsSpan(4));
+        FrameWriter.WriteContentHeader(ref frame, channel, classId: 60, returned.Body.LongLength, returned.Properties);
+        FrameWriter.WriteBody(ref frame, channel, returned.Body, _frameMax);
+        await WriteAsync(frame.ToArray(), ct);
+    }
+
+    ValueTask IChannelDeliveryHost.WriteReturnToWireAsync(
+        ushort channel, ChannelOutcomeBasicReturn returned, CancellationToken ct) =>
+        WriteReturnToWireAsync(channel, returned, ct);
 
     /// <summary>Method + header + body re-chunked per the negotiated frame-max, one
     /// gated write: a deliver's frames never interleave with anything else.</summary>
