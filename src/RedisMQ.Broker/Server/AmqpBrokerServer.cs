@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using RedisMQ.Broker.Diagnostics;
 using RedisMQ.Broker.Memory;
 using RedisMQ.Broker.Transport;
 
@@ -16,20 +19,29 @@ public sealed class AmqpBrokerServer
     private readonly BrokerServerOptions _options;
     private readonly IRouteEngine _engine;
     private readonly IReadOnlyList<IListenerTransport> _listeners;
+    private readonly BrokerDiagnostics _diagnostics;
+    private readonly BrokerRuntimeState _runtime = new();
+    private readonly List<IDisposable> _gaugeHandles = [];
     private readonly List<Task> _connectionTasks = [];
     private readonly object _gate = new();
     private CancellationTokenSource? _stoppingCts;
     private Task[] _acceptTasks = [];
     private Task _reaperTask = Task.CompletedTask;
     private bool _started;
+    private int _acceptFaulted;
 
     /// <summary>The single-listener constructor: M0/M1 test harnesses and callers that
     /// run one transport. A null listener starts no accept loop.</summary>
-    public AmqpBrokerServer(BrokerServerOptions options, IRouteEngine engine, IListenerTransport? listener = null)
+    public AmqpBrokerServer(
+        BrokerServerOptions options,
+        IRouteEngine engine,
+        IListenerTransport? listener = null,
+        BrokerDiagnostics? diagnostics = null)
         : this(
             options,
             engine,
-            listener is null ? Array.Empty<IListenerTransport>() : new[] { listener })
+            listener is null ? Array.Empty<IListenerTransport>() : new[] { listener },
+            diagnostics)
     {
     }
 
@@ -38,12 +50,21 @@ public sealed class AmqpBrokerServer
     public AmqpBrokerServer(
         BrokerServerOptions options,
         IRouteEngine engine,
-        IReadOnlyList<IListenerTransport> listeners)
+        IReadOnlyList<IListenerTransport> listeners,
+        BrokerDiagnostics? diagnostics = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _engine = engine ?? throw new ArgumentNullException(nameof(engine));
         _listeners = listeners ?? throw new ArgumentNullException(nameof(listeners));
+        _diagnostics = diagnostics ?? new BrokerDiagnostics();
     }
+
+    /// <summary>The connection/channel/unacked counters the health snapshot and the
+    /// observable gauges read.</summary>
+    internal BrokerRuntimeState RuntimeState => _runtime;
+
+    /// <summary>The diagnostics instance this server emits to (never disposed here).</summary>
+    public BrokerDiagnostics Diagnostics => _diagnostics;
 
     /// <summary>
     /// Starts every accept loop. Returns as soon as accepting is armed (the loops
@@ -60,8 +81,26 @@ public sealed class AmqpBrokerServer
 
         _options.Validate();
         _started = true;
+        _acceptFaulted = 0;
         _stoppingCts = new CancellationTokenSource();
         CancellationToken ct = _stoppingCts.Token;
+
+        _gaugeHandles.Add(_diagnostics.RegisterObservableGauge(
+            "redismq.connections.active",
+            "{connection}",
+            "Connections currently serving.",
+            ObserveActiveConnections));
+        _gaugeHandles.Add(_diagnostics.RegisterObservableGauge(
+            "redismq.channels.active",
+            "{channel}",
+            "Channels currently open.",
+            ObserveActiveChannels));
+        _gaugeHandles.Add(_diagnostics.RegisterObservableGauge(
+            "redismq.messages.unacked",
+            "{message}",
+            "Unacknowledged deliveries per queue.",
+            ObserveUnacked));
+
         _acceptTasks = [.. _listeners.Select(listener => RunAcceptLoopAsync(listener, ct))];
         _reaperTask = _options.ReaperInterval > TimeSpan.Zero
             ? RunReaperAsync(_options.ReaperInterval, ct)
@@ -112,12 +151,20 @@ public sealed class AmqpBrokerServer
         {
             // Connection tasks guard their own failures; this only observes stragglers.
         }
+
+        foreach (IDisposable handle in _gaugeHandles)
+        {
+            handle.Dispose();
+        }
+
+        _gaugeHandles.Clear();
     }
 
     /// <summary>One accept loop per listener: hands each transport side to a connection
     /// task.</summary>
     private async Task RunAcceptLoopAsync(IListenerTransport listener, CancellationToken ct)
     {
+        string listenerKind = listener is TlsSocketListener ? "tls" : "plaintext";
         while (!ct.IsCancellationRequested)
         {
             TransportSide? side;
@@ -129,13 +176,23 @@ public sealed class AmqpBrokerServer
             {
                 return; // stopping
             }
+            catch (Exception ex)
+            {
+                Interlocked.Exchange(ref _acceptFaulted, 1);
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Error,
+                    BrokerLogEvent.ListenerFailed,
+                    "listener accept failed",
+                    ex);
+                return;
+            }
 
             if (side is null)
             {
                 return; // listener closed: no more connections
             }
 
-            TrackConnection(side, ct);
+            TrackConnection(side, listenerKind, ct);
         }
     }
 
@@ -162,9 +219,14 @@ public sealed class AmqpBrokerServer
     /// stopping token flows into the connection, so a server with live (even idle,
     /// heartbeat-0) connections can stop promptly: the run ends without a close frame
     /// and the transport completes (RabbitMQ-parity wire kill; the client sees EOF).</summary>
-    private void TrackConnection(TransportSide side, CancellationToken ct)
+    private void TrackConnection(TransportSide side, string listenerKind, CancellationToken ct)
     {
-        Task task = RunConnectionAsync(side, ct);
+        _runtime.ConnectionStarted();
+        _diagnostics.Count(
+            _diagnostics.ConnectionsOpened,
+            new TagList { { "listener", listenerKind } });
+
+        Task task = RunConnectionAsync(side, listenerKind, ct);
         bool added;
         lock (_gate)
         {
@@ -191,21 +253,50 @@ public sealed class AmqpBrokerServer
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    private async Task RunConnectionAsync(TransportSide side, CancellationToken ct)
+    private async Task RunConnectionAsync(
+        TransportSide side,
+        string listenerKind,
+        CancellationToken ct)
     {
         try
         {
-            var connection = new WireConnection(_options, _engine, side);
+            var connection = new WireConnection(
+                _options,
+                _engine,
+                side,
+                _diagnostics,
+                _runtime,
+                listenerKind);
             await connection.RunAsync(ct); // server shutdown cancels this token
         }
         catch
         {
             // WireConnection guards its own protocol failures; a transport-level break
-            // here just ends that connection. M0 has no logging surface to record it.
+            // here just ends that connection.
         }
         finally
         {
             await CloseQuietlyAsync(side);
+        }
+    }
+
+    private IEnumerable<Measurement<long>> ObserveActiveConnections()
+    {
+        yield return new Measurement<long>(_runtime.ActiveConnections);
+    }
+
+    private IEnumerable<Measurement<long>> ObserveActiveChannels()
+    {
+        yield return new Measurement<long>(_runtime.ActiveChannels);
+    }
+
+    private IEnumerable<Measurement<long>> ObserveUnacked()
+    {
+        foreach (KeyValuePair<(string Vhost, string Queue), long> entry in _runtime.UnackedSnapshot())
+        {
+            yield return new Measurement<long>(
+                entry.Value,
+                new TagList { { "vhost", entry.Key.Vhost }, { "queue", entry.Key.Queue } });
         }
     }
 

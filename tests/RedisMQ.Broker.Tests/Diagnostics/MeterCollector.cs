@@ -54,12 +54,25 @@ internal sealed class MeterCollector : IDisposable
         }
     }
 
-    /// <summary>Pulls every observable instrument, then returns the named gauge's
-    /// measurements (the listener delivers them synchronously).</summary>
+    /// <summary>Pulls every observable instrument, then returns only the measurements
+    /// this observation produced (the listener delivers them synchronously), so a test
+    /// can sample the same gauge before and after a change without summing history.</summary>
     public IReadOnlyList<MeasurementRecord> ObserveGauges(string instrumentName)
     {
+        int start;
+        lock (_lock)
+        {
+            start = _measurements.Count;
+        }
+
         _listener.RecordObservableInstruments();
-        return For(instrumentName);
+
+        lock (_lock)
+        {
+            return [.. _measurements.Skip(start).Where(measurement =>
+                instrumentName.Length == 0
+                || string.Equals(measurement.Instrument, instrumentName, StringComparison.Ordinal))];
+        }
     }
 
     public void Dispose() => _listener.Dispose();

@@ -1,8 +1,10 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Text;
 using System.Threading.Channels;
 using RedisMQ.Broker.Codec;
+using RedisMQ.Broker.Diagnostics;
 using RedisMQ.Broker.Memory;
 using RedisMQ.Broker.Protocol;
 using RedisMQ.Broker.Transport;
@@ -99,15 +101,49 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
     private CancellationToken _runToken; // the RunAsync lifetime token, used by the blocking handoff
 
     private readonly string _connectionId;
+    private readonly BrokerDiagnostics _diagnostics;
+    private readonly BrokerRuntimeState _runtime;
+    private string _closeReason = "server";
 
-    public WireConnection(BrokerServerOptions options, IRouteEngine routes, TransportSide transport, string? connectionId = null)
+    public WireConnection(
+        BrokerServerOptions options,
+        IRouteEngine routes,
+        TransportSide transport,
+        string? connectionId = null,
+        BrokerDiagnostics? diagnostics = null)
+        : this(
+            options,
+            routes,
+            transport,
+            diagnostics ?? new BrokerDiagnostics(),
+            new BrokerRuntimeState(),
+            "plaintext",
+            connectionId)
+    {
+    }
+
+    /// <summary>The server's constructor: it shares the one runtime the health snapshot
+    /// reads and names the listener kind (<c>plaintext</c>/<c>tls</c>) for the opened
+    /// counter.</summary>
+    internal WireConnection(
+        BrokerServerOptions options,
+        IRouteEngine routes,
+        TransportSide transport,
+        BrokerDiagnostics diagnostics,
+        BrokerRuntimeState runtime,
+        string listenerKind,
+        string? connectionId = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(routes);
         ArgumentNullException.ThrowIfNull(transport);
+        ArgumentNullException.ThrowIfNull(diagnostics);
+        ArgumentNullException.ThrowIfNull(runtime);
 
         _options = options;
         _transport = transport;
+        _diagnostics = diagnostics;
+        _runtime = runtime;
         _connectionId = connectionId ?? Guid.NewGuid().ToString("N");
         _frameMax = options.FrameMax; // pre-TuneOk bound: the broker's own configured max
         // The topology engine backs Task 5's channel dispatch: every channel context
@@ -149,32 +185,47 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         catch (OperationCanceledException) when (_heartbeatCts.IsCancellationRequested && _watchdog?.TimedOut == true)
         {
             // Heartbeat silence: RabbitMQ closes the socket without a close frame.
+            _closeReason = "heartbeat";
         }
         catch (OperationCanceledException)
         {
-            // Stopped externally (server shutdown, transport completion).
+            // Stopped externally (server shutdown, transport completion). A cancellation
+            // the server did not ask for is an error for the closed-reason tag.
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                _closeReason = "error";
+            }
         }
         catch (AmqpProtocolException ex)
         {
             // Frame-layer hard error: frame-error close carrying the decoder's message.
+            _closeReason = "error";
             await SendCloseReplyThenCompleteAsync(AmqpConstants.FrameError, "FRAME_ERROR - " + ex.Message, ct);
         }
         catch (AmqpDecodeException ex)
         {
+            _closeReason = "error";
             await SendCloseReplyThenCompleteAsync(AmqpConstants.SyntaxError, "SYNTAX_ERROR - " + ex.Message, ct);
         }
         catch (AmqpEncodeException ex)
         {
+            _closeReason = "error";
             await SendCloseReplyThenCompleteAsync(AmqpConstants.InternalError, "INTERNAL_ERROR - " + ex.Message, ct);
         }
         catch (IOException)
         {
             // Transport faulted mid-wait/write; nothing left to say on it.
+            _closeReason = "error";
         }
         finally
         {
             // Connection end sweeps the survivors: every live channel's consumers die
             // and requeue their unacked deliveries (RabbitMQ's connection-cleanup).
+            foreach (ChannelContext channel in _channels.Values)
+            {
+                channel.MarkClosed("connection");
+            }
+
             if (!_disposed)
             {
                 foreach (ChannelContext channel in _channels.Values)
@@ -184,6 +235,19 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
                 // Reconcile exclusive/auto-delete queue ownership on connection end.
                 Routes.ReconcileConnection(_connectionId);
+            }
+
+            _runtime.ConnectionClosed();
+            _diagnostics.Count(
+                _diagnostics.ConnectionsClosed,
+                new TagList { { "reason", _closeReason } });
+            if (_closeReason is not ("auth_refused" or "vhost_refused" or "heartbeat" or "error"))
+            {
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Information,
+                    BrokerLogEvent.ConnectionClosed,
+                    "connection closed",
+                    data: [new KeyValuePair<string, object?>("reason", _closeReason)]);
             }
 
             await DisposeAsync();
@@ -608,7 +672,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
                 await SendMethodAsync(reply.Reply, channel, ct);
                 if (reply.RetireAfter)
                 {
-                    await RetireChannelAsync(context, channel); // close-ok retire with the consumer sweep
+                    await RetireChannelAsync(context, channel, "client"); // close-ok retire with the consumer sweep
                 }
 
                 return true;
@@ -616,7 +680,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             case ChannelOutcomeSilent silent:
                 if (silent.RetireChannel)
                 {
-                    await RetireChannelAsync(context, channel); // channel.close_ok performs channel_cleanup
+                    await RetireChannelAsync(context, channel, "server"); // channel.close_ok performs channel_cleanup
                 }
 
                 return true;
@@ -635,6 +699,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
             case ChannelOutcomeHardError hard:
                 context.TearDownActiveConsumers();
+                context.MarkClosed("server");
                 _channels.Remove(channel);
                 return await CloseConnectionAsync(hard.Code, hard.Text, hard.ClassId, hard.MethodId, ct);
 
@@ -650,8 +715,9 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
     /// <summary>Retires a channel number after its close-ok (or a silent
     /// retire-on-completion): the consumer sweep runs first, then the number frees.</summary>
-    private Task RetireChannelAsync(ChannelContext context, ushort channel)
+    private Task RetireChannelAsync(ChannelContext context, ushort channel, string reason)
     {
+        context.MarkClosed(reason);
         context.TearDownActiveConsumers();
         _channels.Remove(channel);
         return Task.CompletedTask;
@@ -669,7 +735,8 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
         // The connection is the channel's delivery host: every consumer-path write
         // (obligated by the queue pumps) funnels through this instance's gated writers.
-        var fresh = new ChannelContext(channel, _vhost, Routes, this, _connectionId, _principal);
+        var fresh = new ChannelContext(
+            channel, _vhost, Routes, this, _connectionId, _principal, _diagnostics, _runtime);
         _channels[channel] = fresh;
         return fresh;
     }
@@ -843,26 +910,57 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
     private async Task<bool> OnStartOkAsync(AmqpMethod method, CancellationToken ct)
     {
         string mechanism = (string)(method.Get("mechanism") ?? string.Empty);
-        if (!string.Equals(mechanism, "PLAIN", StringComparison.Ordinal))
+        byte[] response = Cast<byte[]>(method.Get("response"), "response", "connection.start-ok");
+
+        // PLAIN only. A non-PLAIN mechanism or a non-three-part PLAIN response is
+        // "malformed"; a name no configured user has is "unknown_user"; a known name
+        // that fails verification is "bad_credentials".
+        (string username, string password)? credentials =
+            string.Equals(mechanism, "PLAIN", StringComparison.Ordinal)
+                ? ParsePlainResponse(response)
+                : null;
+
+        string? failure = null;
+        BrokerUser? user = null;
+        if (credentials is { } presented)
         {
-            return await CloseConnectionAsync(
-                AmqpConstants.AccessRefused,
-                $"ACCESS_REFUSED - PLAIN is the only supported authentication mechanism (got '{mechanism}')",
-                10, 11, ct);
+            BrokerUser? named = FindUserNamed(presented.username);
+            if (named is null)
+            {
+                failure = "unknown_user";
+            }
+            else if (!BrokerPassword.Verify(presented.password, named))
+            {
+                failure = "bad_credentials";
+            }
+            else
+            {
+                user = named;
+            }
+        }
+        else
+        {
+            failure = "malformed";
         }
 
-        byte[] response = Cast<byte[]>(method.Get("response"), "response", "connection.start-ok");
-        (string username, string password)? credentials = ParsePlainResponse(response);
-        BrokerUser? user = credentials is null
-            ? null
-            : FindUser(credentials.Value.username, credentials.Value.password);
         if (user is null)
         {
-            // RabbitMQ's exact wire wording for a refused PLAIN login.
+            _diagnostics.Count(
+                _diagnostics.AuthFailures,
+                new TagList { { "reason", failure } });
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Warning,
+                BrokerLogEvent.AuthenticationFailed,
+                "authentication failed",
+                data: [new KeyValuePair<string, object?>("reason", failure)]);
+
+            // RabbitMQ's exact wire wording for a refused PLAIN login. The message never
+            // carries the username, password or mechanism input.
             return await CloseConnectionAsync(
                 AmqpConstants.AccessRefused,
                 "ACCESS_REFUSED - Login was refused using authentication mechanism PLAIN. For details see the broker logfile.",
-                10, 11, ct);
+                10, 11, ct,
+                reason: "auth_refused");
         }
 
         _principal = new BrokerPrincipal(user.Name, user.Permissions ?? []);
@@ -885,12 +983,11 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         return parts.Length != 3 ? null : (parts[1], parts[2]);
     }
 
-    private BrokerUser? FindUser(string username, string password)
+    private BrokerUser? FindUserNamed(string username)
     {
         foreach (var user in _options.Users)
         {
-            if (string.Equals(user.Name, username, StringComparison.Ordinal)
-                && BrokerPassword.Verify(password, user))
+            if (string.Equals(user.Name, username, StringComparison.Ordinal))
             {
                 return user;
             }
@@ -950,22 +1047,42 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         string vhost = (string)(method.Get("virtual-host") ?? string.Empty);
         if (!Array.Exists(_options.Vhosts, v => string.Equals(v, vhost, StringComparison.Ordinal)))
         {
+            _diagnostics.Count(
+                _diagnostics.VhostRefusals,
+                new TagList { { "reason", "unknown" } });
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Warning,
+                BrokerLogEvent.VhostAccessDenied,
+                "virtual host refused",
+                data: [new KeyValuePair<string, object?>("vhost", vhost)]);
+
             return await CloseConnectionAsync(
                 AmqpConstants.InvalidPath,
                 $"INVALID_PATH - invalid virtual host '{vhost}'",
-                10, 40, ct);
+                10, 40, ct,
+                reason: "vhost_refused");
         }
 
         // Default-deny: a vhost is openable only when the account has a permission
         // entry for it (a deny-all entry is still a listed, openable vhost).
         if (_principal is null || !_principal.IsKnownVhost(vhost))
         {
+            _diagnostics.Count(
+                _diagnostics.VhostRefusals,
+                new TagList { { "reason", "denied" } });
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Warning,
+                BrokerLogEvent.VhostAccessDenied,
+                "virtual host refused",
+                data: [new KeyValuePair<string, object?>("vhost", vhost)]);
+
             return await CloseConnectionAsync(
                 AmqpConstants.AccessRefused,
                 _principal is null
                     ? $"ACCESS_REFUSED - access to vhost '{vhost}' refused"
                     : $"ACCESS_REFUSED - access to vhost '{vhost}' refused for user '{_principal.Name}'",
-                10, 40, ct);
+                10, 40, ct,
+                reason: "vhost_refused");
         }
 
         await SendMethodAsync(Method(openOk =>
@@ -974,6 +1091,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         }, "connection.open-ok"), 0, ct);
         _vhost = vhost; // channel dispatch binds declarations to the connection's vhost
         _state = ConnectionState.Serving;
+        _diagnostics.Count(_diagnostics.ConnectionsAuthenticated, new TagList());
         StartConfirmLoop(); // the one ordered confirm pipeline for this connection
         return true;
     }
@@ -981,6 +1099,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
     /// <summary>Client-initiated connection.close: reply close-ok and finish.</summary>
     private async Task<bool> OnClientCloseAsync(CancellationToken ct)
     {
+        _closeReason = "client";
         await SendMethodAsync(Method(null, "connection.close-ok"), ct);
         return false;
     }
@@ -994,8 +1113,10 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         string replyText,
         ushort classId,
         ushort methodId,
-        CancellationToken ct)
+        CancellationToken ct,
+        string reason = "server")
     {
+        _closeReason = reason;
         _state = ConnectionState.ClosingByServer;
         await SendMethodAsync(Method(close =>
         {

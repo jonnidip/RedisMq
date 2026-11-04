@@ -1,8 +1,10 @@
 namespace RedisMQ.Broker.Server;
 
 using System;
+using System.Diagnostics;
 using System.IO;
 using RedisMQ.Broker.Codec;
+using RedisMQ.Broker.Diagnostics;
 using RedisMQ.Broker.Memory;
 using RedisMQ.Broker.Protocol;
 
@@ -207,6 +209,10 @@ public sealed class ChannelContext
 
     private readonly string _connectionId;
     private readonly BrokerPrincipal? _principal; // null = internal test channel, full access
+    private readonly BrokerDiagnostics _diagnostics;
+    private readonly BrokerRuntimeState _runtime;
+    private bool _openedCounted;
+    private bool _closed;
 
     internal ChannelContext(
         ushort channel,
@@ -214,7 +220,9 @@ public sealed class ChannelContext
         IRouteEngine engine,
         IChannelDeliveryHost host,
         string? connectionId = null,
-        BrokerPrincipal? principal = null)
+        BrokerPrincipal? principal = null,
+        BrokerDiagnostics? diagnostics = null,
+        BrokerRuntimeState? runtime = null)
     {
         _channel = channel;
         _vhost = vhost;
@@ -222,6 +230,8 @@ public sealed class ChannelContext
         _host = host;
         _connectionId = connectionId ?? Guid.NewGuid().ToString("N");
         _principal = principal;
+        _diagnostics = diagnostics ?? new BrokerDiagnostics();
+        _runtime = runtime ?? new BrokerRuntimeState();
     }
 
     public bool IsMourning => _state == ChannelState.Mourning;
@@ -233,6 +243,37 @@ public sealed class ChannelContext
     /// <summary>Enters the mourning state after a soft error's channel.close is (or is
     /// being) sent: traffic is discarded, close re-answered, close-ok retires.</summary>
     internal void Mourn() => _state = ChannelState.Mourning;
+
+    /// <summary>Records the channel's end exactly once. Only a channel that actually
+    /// opened contributes to the opened/active/closed counters; a lazily created
+    /// context for a stray frame on a never-opened number is simply marked closed.</summary>
+    internal void MarkClosed(string reason)
+    {
+        if (_closed)
+        {
+            return;
+        }
+
+        _closed = true;
+        if (!_openedCounted)
+        {
+            return;
+        }
+
+        _runtime.ChannelClosed();
+        _diagnostics.Count(
+            _diagnostics.ChannelsClosed,
+            new TagList { { "vhost", _vhost }, { "reason", reason } });
+        _diagnostics.WriteLog(
+            BrokerLogLevel.Debug,
+            BrokerLogEvent.ChannelClosed,
+            "channel closed",
+            data:
+            [
+                new KeyValuePair<string, object?>("vhost", _vhost),
+                new KeyValuePair<string, object?>("reason", reason),
+            ]);
+    }
 
     /// <summary>Dispatches one fully-decoded method by the channel's current state.</summary>
     public ChannelOutcome OnMethod(AmqpMethod method) => _state switch
@@ -249,6 +290,24 @@ public sealed class ChannelContext
         if (method.ClassId == 20 && method.MethodId == 10)
         {
             _state = ChannelState.Running;
+            if (!_openedCounted)
+            {
+                _openedCounted = true;
+                _runtime.ChannelOpened();
+                _diagnostics.Count(
+                    _diagnostics.ChannelsOpened,
+                    new TagList { { "vhost", _vhost } });
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Debug,
+                    BrokerLogEvent.ChannelOpened,
+                    "channel opened",
+                    data:
+                    [
+                        new KeyValuePair<string, object?>("vhost", _vhost),
+                        new KeyValuePair<string, object?>("channel", _channel),
+                    ]);
+            }
+
             return new ChannelOutcomeReply(NewMethod("channel.open-ok", openOk =>
                 openOk.Set("channel-id", Array.Empty<byte>()))); // RabbitMQ sends an empty binary
         }
@@ -467,7 +526,7 @@ public sealed class ChannelContext
         // the routing key names the queue the write is checked against.
         if (!CanWrite(exchangeName.Length == 0 ? routingKey : exchangeName))
         {
-            return PermissionRefused("exchange", exchangeName.Length == 0 ? routingKey : exchangeName, method);
+            return PermissionRefused("write", "exchange", exchangeName.Length == 0 ? routingKey : exchangeName, method);
         }
 
         // lookup_or_die happens after the full content assembly (it receives the
@@ -591,7 +650,7 @@ public sealed class ChannelContext
 
             if (!CanConfigure(name))
             {
-                return PermissionRefused("exchange", name, method);
+                return PermissionRefused("configure", "exchange", name, method);
             }
 
             ExchangeInfo? existing = _engine.GetExchange(_vhost, name);
@@ -619,7 +678,7 @@ public sealed class ChannelContext
         // check_configure_permitted runs before any existence/equivalence lookup.
         if (!CanConfigure(name))
         {
-            return PermissionRefused("exchange", name, method);
+            return PermissionRefused("configure", "exchange", name, method);
         }
 
         ExchangeInfo? declared = _engine.GetExchange(_vhost, name);
@@ -723,7 +782,7 @@ public sealed class ChannelContext
             // reports the ordinary not-found ("/" vhost wording with '' quoted).
             if (!CanConfigure(name))
             {
-                return PermissionRefused("queue", name, method);
+                return PermissionRefused("configure", "queue", name, method);
             }
 
             QueueInfo? existing = _engine.GetQueue(_vhost, name);
@@ -757,7 +816,7 @@ public sealed class ChannelContext
         // check_configure_permitted(QueueName).
         if (!CanConfigure(actual))
         {
-            return PermissionRefused("queue", actual, method);
+            return PermissionRefused("configure", "queue", actual, method);
         }
 
         QueueInfo? declared = _engine.GetQueue(_vhost, actual);
@@ -1034,7 +1093,7 @@ public sealed class ChannelContext
         // both before any resource lookup.
         if (!CanConfigure(queueName))
         {
-            return PermissionRefused("queue", queueName, method);
+            return PermissionRefused("configure", "queue", queueName, method);
         }
 
         // check_not_default_exchange: refused before any resource lookup — even when
@@ -1046,7 +1105,7 @@ public sealed class ChannelContext
 
         if (!CanWrite(exchange))
         {
-            return PermissionRefused("exchange", exchange, method);
+            return PermissionRefused("write", "exchange", exchange, method);
         }
 
         ExchangeInfo? source = _engine.GetExchange(_vhost, exchange);
@@ -1119,7 +1178,7 @@ public sealed class ChannelContext
         // check_read_permitted runs before the lookup_or_die.
         if (!CanRead(queue))
         {
-            return PermissionRefused("queue", queue, method);
+            return PermissionRefused("read", "queue", queue, method);
         }
 
         // rabbit_channel's lookup_or_die runs before any consumer mapping work.
@@ -1210,7 +1269,7 @@ public sealed class ChannelContext
         // check_read_permitted runs before the claim.
         if (!CanRead(queue))
         {
-            return PermissionRefused("queue", queue, method);
+            return PermissionRefused("read", "queue", queue, method);
         }
 
         GetClaimOutcome outcome = _engine.TryClaimForGet(_vhost, queue, out InMemoryMessage? message, out int remaining);
@@ -1674,11 +1733,31 @@ public sealed class ChannelContext
 
     private bool CanRead(string name) => _principal is null || _principal.CanRead(_vhost, name);
 
-    private ChannelOutcome PermissionRefused(string kind, string name, AmqpMethod method) =>
-        Soft(
+    private ChannelOutcome PermissionRefused(
+        string operation,
+        string kind,
+        string name,
+        AmqpMethod method)
+    {
+        _diagnostics.Count(
+            _diagnostics.PermissionDenials,
+            new TagList { { "operation", operation } });
+        _diagnostics.WriteLog(
+            BrokerLogLevel.Warning,
+            BrokerLogEvent.PermissionDenied,
+            "permission denied",
+            data:
+            [
+                new KeyValuePair<string, object?>("operation", operation),
+                new KeyValuePair<string, object?>("kind", kind),
+                new KeyValuePair<string, object?>("name", name),
+            ]);
+
+        return Soft(
             method,
             AmqpConstants.AccessRefused,
             $"ACCESS_REFUSED - access to {kind} '{name}' in vhost '{_vhost}' refused for user '{_principal?.Name}'");
+    }
 
     /// <summary>A successful declare-ok; <paramref name="updateMrdq"/> records the
     /// most-recently-declared-queue hint for every successful declare, nowait

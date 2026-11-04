@@ -50,8 +50,8 @@ public sealed class EngineDiagnosticsTests
         engine.Enqueue("/", "q", new ContentProperties(), [1], "", "q");
 
         MeasurementRecord ready = Assert.Single(
-            meter.ObserveGauges("redismq.messages.ready")
-                .Where(r => r.Tags["broker.instance"] is "engine3" && r.Tags["queue"] is "q"));
+            meter.ObserveGauges("redismq.messages.ready"),
+            r => r.Tags["broker.instance"] is "engine3" && r.Tags["queue"] is "q");
 
         Assert.Equal(1, ready.LongValue);
     }
@@ -86,8 +86,9 @@ public sealed class EngineDiagnosticsTests
 
         engine.Dispose();
 
-        Assert.Empty(meter.ObserveGauges("redismq.messages.ready")
-            .Where(r => r.Tags["broker.instance"] is "engine5"));
+        Assert.DoesNotContain(
+            meter.ObserveGauges("redismq.messages.ready"),
+            r => r.Tags["broker.instance"] is "engine5");
     }
 
     private sealed class RefusingConsumer : IQueueConsumer
