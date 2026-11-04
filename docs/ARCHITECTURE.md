@@ -133,6 +133,31 @@ The lowest layer. Turns raw bytes into AMQP frames and back.
 
 ---
 
+## Diagnostics and Observability
+
+A cross-cutting layer (`RedisMQ.Broker.Diagnostics`) instruments the protocol path
+without adding a wire surface or a package dependency:
+
+- `BrokerDiagnostics` owns the process-shared BCL `Meter` and `ActivitySource` (both
+  named `RedisMQ.Broker`), a host-attached `IBrokerLogSink`, and one gauge registry so
+  the server and engine can contribute to the same observable instrument. Every
+  measurement carries `broker.instance`.
+- The server records connection/channel/auth/vhost/permission counts, active gauges,
+  publish/confirm/delivery/settlement telemetry, reaper ticks, TLS handshakes and
+  `amqp.publish` / `amqp.deliver` spans.
+- `AmqpBrokerServer.GetHealth()` assembles a synchronous `BrokerHealth` from the
+  runtime counters, the engine's `IEngineDiagnostics` snapshot and an overlay of live
+  unacked counts. Readiness follows Redis connectivity for a durable engine.
+- `RedisStreamRouteEngine` emits **mirror and replay metrics only**; the inner
+  `InMemoryEngine` remains the sole emitter of message-level counters (enqueue,
+  expiry, dead-lettering, queue depth/consumers). This split keeps one series per
+  event when the Redis wrapper delegates to memory.
+- The host owns HTTP endpoints, OTLP/Prometheus exporters and log shipping. RedisMQ
+  deliberately ships none of them, so a scrape interval, exporter choice and
+  label-cardinality policy stay deployment concerns.
+
+---
+
 ## Connection Lifecycle
 
 `WireConnection.RunAsync(ct)`:

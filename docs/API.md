@@ -13,6 +13,7 @@ there).
 | `RedisMQ.Broker.Codec` | `ByteReader`, `ByteWriter`, `FieldTable`, `FieldValue`, `AmqpFrame`, `FrameDecoder`, `FrameWriter`, `ContentHeaderCodec`, `ContentProperties`, `ContentHeader`, `MethodCodec`, `AmqpMethod`, `AmqpDecodeException`, `AmqpEncodeException`, `AmqpProtocolException` |
 | `RedisMQ.Broker.Protocol` | `MethodRegistry`, `MethodSchema`, `AmqpField`, `ContentProperty`, `AmqpConstants`, `WireType`, `Direction` |
 | `RedisMQ.Broker.Transport` | `TransportSide`, `TransportPair`, `IListenerTransport`, `SocketListener`, `TlsSocketListener`, `BrokerCertificate`, `BrokerListeners` |
+| `RedisMQ.Broker.Diagnostics` | `BrokerDiagnostics`, `IBrokerLogSink`, `NullBrokerLogSink`, `BrokerLogLevel`, `BrokerLogEvent`, `BrokerLogEntry`, `BrokerHealth`, `EngineHealth`, `QueueSnapshot`, `IEngineDiagnostics` |
 | `RedisMQ.Redis` | `RedisStreamRouteEngine`, `RedisKeys`, `WriteCommand`, `WriteCommandKind`, `StreamCodec` |
 
 ---
@@ -29,14 +30,18 @@ public sealed class AmqpBrokerServer
 {
     // Single-listener form (tests, simple hosts):
     public AmqpBrokerServer(BrokerServerOptions options, IRouteEngine engine,
-                            IListenerTransport? listener = null);
+                            IListenerTransport? listener = null,
+                            BrokerDiagnostics? diagnostics = null);
 
     // Multi-listener form (plaintext + TLS):
     public AmqpBrokerServer(BrokerServerOptions options, IRouteEngine engine,
-                            IReadOnlyList<IListenerTransport> listeners);
+                            IReadOnlyList<IListenerTransport> listeners,
+                            BrokerDiagnostics? diagnostics = null);
 
+    public BrokerDiagnostics Diagnostics { get; }
     public Task StartAsync();
     public Task StopAsync();
+    public BrokerHealth GetHealth();
 }
 ```
 
@@ -47,6 +52,11 @@ public sealed class AmqpBrokerServer
   connection tasks. Server shutdown cancels the per-connection token, ending the run
   without a close frame (client sees EOF).
 - The server **does not dispose the listeners**; the caller owns them.
+- A null `diagnostics` creates a private `BrokerDiagnostics` for this server. See
+  [Diagnostics and observability](#diagnostics-and-observability).
+- `GetHealth()` returns a synchronous [health snapshot](#diagnostics-and-observability)
+  covering liveness, readiness, active connections/channels, per-queue depth/unacked
+  counts, and engine durability.
 
 ### `BrokerServerOptions`
 
@@ -403,9 +413,9 @@ lose one.
 ### `InMemoryEngine`
 
 ```csharp
-public sealed class InMemoryEngine : IRouteEngine
+public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposable
 {
-    public InMemoryEngine(IReadOnlyList<string> vhosts);
+    public InMemoryEngine(IReadOnlyList<string> vhosts, BrokerDiagnostics? diagnostics = null);
     // predeclares "" (default) and "amq.direct" exchanges per vhost
     public IEnumerable<string> QueueNamesOfVhost(string vhost);     // test introspection
     public IReadOnlyList<InMemoryMessage> PeekQueue(string queue);  // ready-only introspection
@@ -514,14 +524,15 @@ when the channel has no credit (the message stays queued).
 ### `RedisStreamRouteEngine`
 
 ```csharp
-public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
+public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, IAsyncDisposable
 {
     public RedisStreamRouteEngine(
         IDatabase? redis,
         IReadOnlyList<string> vhosts,
         bool replayOnStart = true,
         int drainerCapacity = 1024,
-        bool enforceEvictionGate = true);
+        bool enforceEvictionGate = true,
+        BrokerDiagnostics? diagnostics = null);
 
     public ValueTask DisposeAsync();
 }
@@ -805,7 +816,7 @@ public sealed class SocketListener : IListenerTransport, IAsyncDisposable
 ```csharp
 public sealed class TlsSocketListener : IListenerTransport, IAsyncDisposable
 {
-    public TlsSocketListener(BrokerTlsOptions options);
+    public TlsSocketListener(BrokerTlsOptions options, BrokerDiagnostics? diagnostics = null);
     public int AnnouncedPort { get; }
     public ValueTask<TransportSide?> AcceptAsync(CancellationToken ct = default);
     public ValueTask DisposeAsync();
@@ -816,6 +827,9 @@ public sealed class TlsSocketListener : IListenerTransport, IAsyncDisposable
   certificate.
 - A failed, timed-out or mTLS-rejected handshake disposes only that socket; the
   accept stream continues. Only cancellation/listener disposal ends the stream.
+- Each handshake records `redismq.tls.handshakes` and
+  `redismq.tls.handshake.duration` (tagged `result=success|failure`); a failure logs
+  `TlsHandshakeFailed` at **Debug** with only the exception type.
 
 ### `BrokerCertificate`
 
@@ -837,15 +851,191 @@ TLS) imports the CA bundle used to chain client certificates.
 ```csharp
 public static class BrokerListeners
 {
-    public static IReadOnlyList<IListenerTransport> Create(BrokerServerOptions options);
+    public static IReadOnlyList<IListenerTransport> Create(
+        BrokerServerOptions options,
+        BrokerDiagnostics? diagnostics = null);
 }
 ```
 
 - Adds `SocketListener(options.Port)` when `options.Port >= 0`.
-- Adds `TlsSocketListener(options.Tls)` when `options.Tls is { Enabled: true }`.
+- Adds `TlsSocketListener(options.Tls, diagnostics)` when
+  `options.Tls is { Enabled: true }`.
 - If a later listener fails to bind (for example a bad certificate), already-bound
   listeners are disposed before the exception propagates. The caller owns the
   returned listeners.
+
+---
+
+## Diagnostics and observability
+
+The library emits BCL diagnostics; the host owns HTTP endpoints, exporters and
+dashboard wiring. No HTTP server, Prometheus writer or new package dependency is
+added. The supported production shape is **one shared `BrokerDiagnostics` per
+process**, passed to both the engine and the server, so every measurement carries the
+same `broker.instance` tag.
+
+### `BrokerDiagnostics`
+
+```csharp
+public sealed class BrokerDiagnostics : IDisposable
+{
+    public const string SourceName = "RedisMQ.Broker";
+
+    public BrokerDiagnostics(
+        string? instanceId = null,
+        IBrokerLogSink? logSink = null,
+        string? serviceVersion = null);
+
+    public string InstanceId { get; }
+    public Meter Meter { get; }
+    public ActivitySource ActivitySource { get; }
+    public IBrokerLogSink Log { get; }
+    public void Dispose();
+}
+```
+
+`Meter` and `ActivitySource` are both named `RedisMQ.Broker`; subscribe a
+`MeterListener` or an OpenTelemetry exporter to that name. A null `instanceId` gets a
+random 8-hex value; a null `logSink` uses `NullBrokerLogSink.Instance`.
+
+### Logging seam
+
+```csharp
+public enum BrokerLogLevel { Trace, Debug, Information, Warning, Error, Critical }
+
+public enum BrokerLogEvent
+{
+    ServerStarted, ServerStopped, ListenerFailed, ReaperFailed,
+    ConnectionOpened, ConnectionClosed, AuthenticationFailed, VhostAccessDenied,
+    ChannelOpened, ChannelClosed, PermissionDenied, PublishRefused,
+    PublishUnroutable, ConfirmNack, ConfirmTimeout, DeliveryFailed,
+    DeadLetterDropped, QueueExpired, MessageExpired, RedisMirrorFailed,
+    RedisMirrorRecovered, DrainerSaturated, TlsHandshakeFailed,
+}
+
+public readonly record struct BrokerLogEntry(
+    BrokerLogLevel Level,
+    BrokerLogEvent Event,
+    string Message,
+    Exception? Exception = null,
+    IReadOnlyList<KeyValuePair<string, object?>>? Data = null);
+
+public interface IBrokerLogSink
+{
+    bool IsEnabled(BrokerLogLevel level);
+    void Log(in BrokerLogEntry entry);
+}
+
+public sealed class NullBrokerLogSink : IBrokerLogSink
+{
+    public static readonly NullBrokerLogSink Instance;
+}
+```
+
+Call sites test `IsEnabled` before building a message, and `BrokerDiagnostics`
+swallows sink exceptions. The event id is the stable contract; message text is not.
+Secrets and message contents never appear in an entry.
+
+### Health snapshot
+
+```csharp
+public sealed record QueueSnapshot(
+    string Vhost, string Name, int Ready, int Consumers, int Unacked = 0);
+
+public sealed record EngineHealth(
+    string Kind,
+    bool Durable,
+    bool? RedisConnected,
+    long DrainerDepth,
+    long MirrorFailures,
+    long MirrorDropped,
+    DateTimeOffset? LastMirrorFailureUtc,
+    DateTimeOffset? LastMirrorDropUtc,
+    string? LastError);
+
+public sealed record BrokerHealth(
+    bool Live,
+    bool Ready,
+    string? Detail,
+    DateTimeOffset Timestamp,
+    int ActiveConnections,
+    int ActiveChannels,
+    IReadOnlyList<QueueSnapshot> Queues,
+    EngineHealth Engine);
+
+public interface IEngineDiagnostics
+{
+    EngineHealth GetEngineHealth();
+    IReadOnlyList<QueueSnapshot> QueueSnapshots();
+}
+```
+
+- `Live`: started and every accept loop healthy. A server with no listeners is live.
+- `Ready`: live **and** the engine ready. The memory engine is always ready with
+  `Durable=false`; a Redis engine with a null `IDatabase` is ready and memory-only; a
+  Redis engine with a database is ready only while `IDatabase.Multiplexer.IsConnected`
+  is true. A disconnected Redis makes the broker not ready and sets `Detail` to the
+  last sanitized mirror error (or `"redis disconnected"`).
+- `Queues` comes from `IEngineDiagnostics.QueueSnapshots()`; `GetHealth()` overlays the
+  server runtime's per-queue unacked count and prunes entries for deleted queues.
+- A third-party engine that does not implement `IEngineDiagnostics` reports
+  `Kind="custom"`, `Durable=false` and an empty queue list.
+
+### Metric catalog
+
+Every instrument also carries `broker.instance`. Durations are seconds.
+
+| Instrument | Type | Unit | Tags |
+|---|---|---|---|
+| `redismq.connections.opened` | Counter | `{connection}` | `listener` |
+| `redismq.connections.closed` | Counter | `{connection}` | `reason` |
+| `redismq.connections.active` | ObservableGauge | `{connection}` | — |
+| `redismq.connections.authenticated` | Counter | `{connection}` | — |
+| `redismq.channels.opened` | Counter | `{channel}` | `vhost` |
+| `redismq.channels.closed` | Counter | `{channel}` | `vhost`, `reason` |
+| `redismq.channels.active` | ObservableGauge | `{channel}` | — |
+| `redismq.auth.failures` | Counter | `{failure}` | `reason` |
+| `redismq.vhost.refusals` | Counter | `{refusal}` | `reason` |
+| `redismq.permission.denials` | Counter | `{denial}` | `operation` |
+| `redismq.tls.handshakes` | Counter | `{handshake}` | `result` |
+| `redismq.tls.handshake.duration` | Histogram | `s` | `result` |
+| `redismq.publishes` | Counter | `{message}` | `vhost`, `exchange`, `exchange_type`, `outcome` |
+| `redismq.publish.size` | Histogram | `By` | `vhost` |
+| `redismq.confirms` | Counter | `{confirm}` | `outcome` |
+| `redismq.confirm.duration` | Histogram | `s` | `outcome` |
+| `redismq.deliveries` | Counter | `{message}` | `vhost`, `queue`, `auto_ack` |
+| `redismq.settlements` | Counter | `{settlement}` | `vhost`, `queue`, `kind`, `method` |
+| `redismq.messages.ready` | ObservableGauge | `{message}` | `vhost`, `queue` |
+| `redismq.consumers` | ObservableGauge | `{consumer}` | `vhost`, `queue` |
+| `redismq.messages.unacked` | ObservableGauge | `{message}` | `vhost`, `queue` |
+| `redismq.messages.dropped` | Counter | `{message}` | `vhost`, `queue`, `reason` |
+| `redismq.messages.expired` | Counter | `{message}` | `vhost`, `queue` |
+| `redismq.queues.expired` | Counter | `{queue}` | `vhost` |
+| `redismq.messages.deadlettered` | Counter | `{message}` | `vhost`, `queue`, `reason` |
+| `redismq.deadletters.dropped` | Counter | `{message}` | `vhost`, `queue`, `reason` |
+| `redismq.reaper.sweeps` | Counter | `{sweep}` | — |
+| `redismq.reaper.duration` | Histogram | `s` | — |
+| `redismq.reaper.failures` | Counter | `{failure}` | — |
+| `redismq.redis.mirror.commands` | Counter | `{command}` | `kind`, `outcome` |
+| `redismq.redis.mirror.duration` | Histogram | `s` | `kind` |
+| `redismq.redis.mirror.dropped` | Counter | `{command}` | `kind`, `reason` |
+| `redismq.redis.drainer.depth` | ObservableGauge | `{command}` | — |
+| `redismq.redis.drainer.saturated` | Counter | `{publish}` | — |
+| `redismq.redis.replay.messages` | Counter | `{message}` | — |
+| `redismq.redis.replay.failures` | Counter | `{failure}` | — |
+
+Publish outcomes are `routed`, `unroutable`, `mandatory_return`, `refused` and
+`error`; confirm outcomes are `ack`, `nack` and `timeout`; settlement `kind` is
+`ack`/`requeue`/`reject` and `method` is `ack`/`nack`/`reject`. The Redis wrapper
+emits mirror/replay metrics only; the inner memory engine emits the message-level
+counters.
+
+### Tracing
+
+Only two in-process spans are produced, both from the `RedisMQ.Broker` activity
+source: `amqp.publish` (producer) and `amqp.deliver` (consumer). Neither propagates
+`traceparent` across the wire. A publish span carries both the dispatch outcome
+(`redismq.publish.outcome`) and the final confirm outcome (`redismq.outcome`).
 
 ---
 

@@ -41,17 +41,23 @@ dotnet exec tests\RedisMQ.Broker.Tests\bin\Debug\net10.0\RedisMQ.Broker.Tests.dl
 ## Build
 
 ```bash
-dotnet build RedisMQ.sln          # all projects, 0 warnings expected
+dotnet build RedisMQ.sln          # all projects, 0 errors
 dotnet test RedisMQ.sln           # CI path (ubuntu-latest)
 ```
+
+The analyzer baseline is **86 warnings** (mostly the pre-existing xUnit1051 set
+inherited with the test project). A change must not add a new warning; compare
+`dotnet build RedisMQ.sln --no-incremental` warning counts rather than expecting zero.
+(`--no-incremental` also prints `MSB3061` file-lock warnings for the test executables;
+those are not analyzer warnings and do not count.)
 
 ## Test targets
 
 | Suite | Project | Expected |
 |-------|---------|----------|
-| Codec/FSM/engine/server unit tests | `RedisMQ.Broker.Tests` | 319 passed |
+| Codec/FSM/engine/server unit tests | `RedisMQ.Broker.Tests` | 357 passed |
 | Real-client conformance | `RedisMQ.Conformance` | 19 passed |
-| Redis mirror/replay | `RedisMQ.Redis.Tests` | 60 passed (or skipped without Redis) |
+| Redis mirror/replay | `RedisMQ.Redis.Tests` | 66 passed (or skipped without Redis) |
 
 Run the broker and conformance suites twice after touching TLS or confirm timing to
 catch handshake and backpressure flakes.
@@ -171,10 +177,42 @@ Types: `feat`, `fix`, `test`, `chore`, `refactor`, `docs`.
 - **The confirm loop is the only place a confirm is written.** Publish paths hand it a
   `PendingConfirm`; they never answer confirms inline.
 
+## Instrumentation conventions
+
+Diagnostics are part of the public contract (`RedisMQ.Broker.Diagnostics`), so changes
+there follow the same review bar as protocol changes.
+
+- **Share one `BrokerDiagnostics` per process.** Pass the same instance to the engine
+  and the server; a private per-component instance gives every measurement a different
+  `broker.instance` and splits your series. The Redis engine forwards it to its inner
+  `InMemoryEngine` — never create a second one inside the wrapper.
+- **Guard log work before building it.** Test `diagnostics.Log.IsEnabled(level)` at the
+  call site so a disabled host pays nothing, and prefer `BrokerLogEvent` plus small
+  structured `Data` fields over formatted strings.
+- **Event ids are the contract; message text is not.** Never renumber or repurpose a
+  `BrokerLogEvent` value, and never make a host depend on the wording of
+  `BrokerLogEntry.Message`.
+- **No PII, secrets or message contents.** No routing keys, message ids, bodies,
+  connection strings, passwords or certificate subjects in metrics, logs or health.
+  Health exposes a sanitized single-line error only.
+- **Metrics are cardinality-bounded.** Tag values must come from a fixed set (outcomes,
+  reasons, kinds, vhost/queue names). Never tag with an unbounded value such as a
+  message id or an exception message.
+- **Every measurement carries `broker.instance`.** Use the `BrokerDiagnostics`
+  helpers (`Count`, `Measure`, `RegisterObservableGauge`) rather than calling
+  `Counter.Add` directly, so the tag is never forgotten.
+- **Gauges are registered once per name and aggregated.** Symptom of a bug: one
+  callback per server registration. The shared registry sums identical tag sets; a
+  component that registers a gauge disposes the handle when it stops.
+- **Sinks never throw into the protocol path.** `BrokerDiagnostics` already contains a
+  throwing sink; do not add a second `try`/`catch` around every `WriteLog` call, and do
+  not let instrumentation failures change an AMQP reply.
+- **Instrumentation must not add a wire surface.** No new frames, methods or fields:
+  observability observes the existing protocol, it does not extend it.
+
 ## Remaining work toward production v1
 
 - Connection/channel profiles and tuning beyond RabbitMQ defaults.
-- Metrics, structured logging and health endpoints.
 - Throughput work: pipelining, mirror batching, benchmarks.
 - Client compatibility beyond RabbitMQ.Client 7.x (Pika and others).
 - Packaging: NuGet packages, container image, configuration binding.

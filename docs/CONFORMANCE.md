@@ -95,6 +95,11 @@ The self-signed test certificate requires
 
 ## Beyond the conformance suite
 
+Observability added **no wire surface**: no new frames, methods or content-property
+fields, so the 19 conformance tests above are unchanged and still describe the whole
+protocol contract. Metrics, structured logs and the health snapshot are in-process
+library seams only; see [API.md](API.md#diagnostics-and-observability).
+
 Some M4 behavior is pinned by the broker and Redis suites rather than by a real client,
 because it needs fault injection or engine introspection:
 

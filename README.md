@@ -22,16 +22,17 @@ What remains for a production v1 is listed in [What's next](#whats-next).
 
 1. [Quick Start](#quick-start)
 2. [Durability Contract](#durability-contract)
-3. [What RedisMQ Is (and Isn't)](#what-redismq-is-and-isnt)
-4. [Architecture](#architecture)
-5. [Project Layout](#project-layout)
-6. [Running the Tests](#running-the-tests)
-7. [Conformance Suite](#conformance-suite)
-8. [API Reference](#api-reference)
-9. [Protocol Implementation Notes](#protocol-implementation-notes)
-10. [Accepted Limitations](#accepted-limitations)
-11. [What's Next](#whats-next)
-12. [CI](#ci)
+3. [Observability](#observability)
+4. [What RedisMQ Is (and Isn't)](#what-redismq-is-and-isnt)
+5. [Architecture](#architecture)
+6. [Project Layout](#project-layout)
+7. [Running the Tests](#running-the-tests)
+8. [Conformance Suite](#conformance-suite)
+9. [API Reference](#api-reference)
+10. [Protocol Implementation Notes](#protocol-implementation-notes)
+11. [Accepted Limitations](#accepted-limitations)
+12. [What's Next](#whats-next)
+13. [CI](#ci)
 
 ---
 
@@ -58,9 +59,9 @@ Expected results:
 
 | Suite | Total | Failed | Warnings |
 |-------|-------|--------|----------|
-| `RedisMQ.Broker.Tests` | 319 | 0 | 0 |
+| `RedisMQ.Broker.Tests` | 357 | 0 | 0 |
 | `RedisMQ.Conformance` | 19 | 0 | 0 |
-| `RedisMQ.Redis.Tests` | 60 | 0 | 0 |
+| `RedisMQ.Redis.Tests` | 66 | 0 | 0 |
 | `dotnet build RedisMQ.sln` | — | — | 0 |
 
 ### Minimal in-memory host
@@ -181,6 +182,44 @@ RedisMQ is deliberately explicit about what a confirm means.
 What is **not** promised: exactly-once delivery. RedisMQ is at-least-once, and a
 message replayed after a crash can arrive with `Redelivered=false` (see
 [Accepted Limitations](#accepted-limitations)).
+
+---
+
+## Observability
+
+The library publishes BCL diagnostics and leaves the HTTP surface and exporters to the
+host. `BrokerDiagnostics` owns one `Meter` and one `ActivitySource`, both named
+`RedisMQ.Broker`. Share one instance between the engine and the server so every
+measurement carries the same `broker.instance` tag:
+
+```csharp
+using RedisMQ.Broker.Diagnostics;
+using RedisMQ.Broker.Memory;
+using RedisMQ.Broker.Server;
+
+var diagnostics = new BrokerDiagnostics();
+var engine = new InMemoryEngine(["/"], diagnostics);
+var server = new AmqpBrokerServer(options, engine, diagnostics: diagnostics);
+await server.StartAsync();
+
+BrokerHealth health = server.GetHealth();   // live, ready, detail, queues, engine
+```
+
+`GetHealth()` is synchronous and cheap enough for a scrape interval. It reports
+connections/channels, per-queue ready/consumer/unacked counts, and (for Redis) mirror
+depth, failures, drops and the last sanitized error. A Redis disconnect makes the
+broker **not ready** because new publishes cannot honour the durability promise.
+
+The host owns `/metrics`, OTLP and log-shipping endpoints: subscribe a `MeterListener`
+or OpenTelemetry exporter to `RedisMQ.Broker`, attach an `IBrokerLogSink`, and map
+`GetHealth()` onto liveness/readiness probes. Prometheus requires dot-to-underscore
+name conversion and careful label-cardinality limits, so RedisMQ ships no exporter and
+no HTTP endpoint. Metric names use the `redismq.` prefix; never add a tag whose value
+is unbounded (message ids, routing keys or error text belong in logs, not metrics).
+
+See the [API reference](docs/API.md#diagnostics-and-observability) and the
+[architecture notes](docs/ARCHITECTURE.md#diagnostics-and-observability) for the full
+metric catalog, event ids and tracing rules.
 
 ---
 
@@ -334,13 +373,13 @@ dotnet test RedisMQ.sln
 ### Direct runner (this dev machine — `dotnet test` is broken by an SDK MTP bug)
 
 ```bash
-# Unit tests (319 expected)
+# Unit tests (357 expected)
 dotnet exec tests\RedisMQ.Broker.Tests\bin\Debug\net10.0\RedisMQ.Broker.Tests.dll
 
 # Conformance suite (19 expected)
 dotnet exec tests\RedisMQ.Conformance\bin\Debug\net10.0\RedisMQ.Conformance.dll
 
-# Redis mirror/replay tests (60 expected; needs Redis on localhost:6379)
+# Redis mirror/replay tests (66 expected; needs Redis on localhost:6379)
 dotnet exec tests\RedisMQ.Redis.Tests\bin\Debug\net10.0\RedisMQ.Redis.Tests.dll
 ```
 
@@ -577,7 +616,6 @@ Documented and pinned by tests rather than hidden:
 M4 part 1 completes the functional v1 surface. Remaining for a production v1:
 
 - **Connection/channel profiles** and tuning beyond RabbitMQ defaults.
-- **Observability**: metrics, structured logging, health endpoints.
 - **Performance work**: pipelining, batching mirrors, throughput benchmarks.
 - **Pika and other client compatibility** beyond RabbitMQ.Client 7.x.
 - **Packaging**: NuGet packages, container image, configuration binding.

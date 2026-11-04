@@ -1,7 +1,10 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.IO.Pipelines;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using RedisMQ.Broker.Diagnostics;
 using RedisMQ.Broker.Server;
 
 namespace RedisMQ.Broker.Transport;
@@ -21,20 +24,25 @@ public sealed class TlsSocketListener : IListenerTransport, IAsyncDisposable
     private readonly BrokerTlsOptions _options;
     private readonly BrokerCertificate _certificate;
     private readonly SslServerAuthenticationOptions _authentication;
+    private readonly BrokerDiagnostics _diagnostics;
 
     /// <summary>Loads the configured certificate and binds the TLS port.</summary>
-    public TlsSocketListener(BrokerTlsOptions options)
-        : this(options, BrokerCertificate.Load(options))
+    public TlsSocketListener(BrokerTlsOptions options, BrokerDiagnostics? diagnostics = null)
+        : this(options, BrokerCertificate.Load(options), diagnostics)
     {
     }
 
     /// <summary>A listener over an already-loaded certificate (used by tests and by
     /// callers that share one certificate between listeners).</summary>
-    internal TlsSocketListener(BrokerTlsOptions options, BrokerCertificate certificate)
+    internal TlsSocketListener(
+        BrokerTlsOptions options,
+        BrokerCertificate certificate,
+        BrokerDiagnostics? diagnostics = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         _options = options;
         _certificate = certificate ?? throw new ArgumentNullException(nameof(certificate));
+        _diagnostics = diagnostics ?? new BrokerDiagnostics();
         _authentication = certificate.CreateAuthenticationOptions();
         (_socket, _announcedPort) = SocketBinder.Bind(options.Port);
     }
@@ -80,9 +88,17 @@ public sealed class TlsSocketListener : IListenerTransport, IAsyncDisposable
             var ssl = new SslStream(new NetworkStream(accepted, ownsSocket: true), leaveInnerStreamOpen: false);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(_options.HandshakeTimeout);
+            long started = Stopwatch.GetTimestamp();
             try
             {
                 await ssl.AuthenticateAsServerAsync(_authentication, timeout.Token);
+                _diagnostics.Count(
+                    _diagnostics.TlsHandshakes,
+                    new TagList { { "result", "success" } });
+                _diagnostics.Measure(
+                    _diagnostics.TlsHandshakeDuration,
+                    Stopwatch.GetElapsedTime(started).TotalSeconds,
+                    new TagList { { "result", "success" } });
                 return new TransportSide(PipeReader.Create(ssl), PipeWriter.Create(ssl));
             }
             catch (Exception exception) when (
@@ -93,6 +109,25 @@ public sealed class TlsSocketListener : IListenerTransport, IAsyncDisposable
                 {
                     return null;
                 }
+
+                // A failure is one peer's attempt: count it, but log only the exception
+                // type at Debug so hostile traffic cannot flood the host's log.
+                _diagnostics.Count(
+                    _diagnostics.TlsHandshakes,
+                    new TagList { { "result", "failure" } });
+                _diagnostics.Measure(
+                    _diagnostics.TlsHandshakeDuration,
+                    Stopwatch.GetElapsedTime(started).TotalSeconds,
+                    new TagList { { "result", "failure" } });
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Debug,
+                    BrokerLogEvent.TlsHandshakeFailed,
+                    "TLS handshake failed",
+                    data:
+                    [
+                        new KeyValuePair<string, object?>(
+                            "exception", exception.GetType().Name),
+                    ]);
 
                 // A bad, timed-out or mTLS-rejected handshake belongs to that one peer;
                 // keep accepting so the listener survives hostile traffic.

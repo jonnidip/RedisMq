@@ -67,6 +67,64 @@ public sealed class AmqpBrokerServer
     public BrokerDiagnostics Diagnostics => _diagnostics;
 
     /// <summary>
+    /// A synchronous health snapshot for a host's liveness/readiness endpoint. Cheap
+    /// enough to call on a scrape interval: it reads counters and one engine snapshot,
+    /// and never touches the wire or Redis.
+    /// </summary>
+    public BrokerHealth GetHealth()
+    {
+        IEngineDiagnostics? engineDiagnostics = _engine as IEngineDiagnostics;
+        EngineHealth engine = engineDiagnostics?.GetEngineHealth()
+            ?? new EngineHealth("custom", false, null, 0, 0, 0, null, null, null);
+
+        IReadOnlyList<QueueSnapshot> snapshots = engineDiagnostics?.QueueSnapshots() ?? [];
+        Dictionary<(string Vhost, string Queue), long> unacked = [];
+        foreach (KeyValuePair<(string Vhost, string Queue), long> entry in _runtime.UnackedSnapshot())
+        {
+            unacked[entry.Key] = entry.Value;
+        }
+
+        HashSet<(string Vhost, string Queue)> liveQueues = [];
+        List<QueueSnapshot> queues = new(snapshots.Count);
+        foreach (QueueSnapshot snapshot in snapshots)
+        {
+            (string Vhost, string Queue) key = (snapshot.Vhost, snapshot.Name);
+            liveQueues.Add(key);
+            int count = unacked.TryGetValue(key, out long value)
+                ? (int)Math.Min(value, int.MaxValue)
+                : 0;
+            queues.Add(snapshot with { Unacked = count });
+        }
+
+        // A deleted queue must never leave a stale unacked series in health.
+        _runtime.PruneUnacked(liveQueues);
+
+        bool live = _started && Volatile.Read(ref _acceptFaulted) == 0;
+        bool ready = live;
+        string? detail = null;
+        if (!live)
+        {
+            detail = _started ? "listener failed" : "server is not started";
+        }
+        else if (engine.Kind == "redis" && engine.Durable && engine.RedisConnected == false)
+        {
+            // New publishes cannot honour the durability promise while Redis is down.
+            ready = false;
+            detail = engine.LastError ?? "redis disconnected";
+        }
+
+        return new BrokerHealth(
+            live,
+            ready,
+            detail,
+            DateTimeOffset.UtcNow,
+            _runtime.ActiveConnections,
+            _runtime.ActiveChannels,
+            queues,
+            engine);
+    }
+
+    /// <summary>
     /// Starts every accept loop. Returns as soon as accepting is armed (the loops
     /// themselves run in the background); no-op when the server was constructed without
     /// a listener. The stop call <see cref="StopAsync"/> ends the loops and drains
@@ -105,6 +163,10 @@ public sealed class AmqpBrokerServer
         _reaperTask = _options.ReaperInterval > TimeSpan.Zero
             ? RunReaperAsync(_options.ReaperInterval, ct)
             : Task.CompletedTask;
+        _diagnostics.WriteLog(
+            BrokerLogLevel.Information,
+            BrokerLogEvent.ServerStarted,
+            "broker server started");
         return Task.CompletedTask;
     }
 
@@ -158,6 +220,10 @@ public sealed class AmqpBrokerServer
         }
 
         _gaugeHandles.Clear();
+        _diagnostics.WriteLog(
+            BrokerLogLevel.Information,
+            BrokerLogEvent.ServerStopped,
+            "broker server stopped");
     }
 
     /// <summary>One accept loop per listener: hands each transport side to a connection

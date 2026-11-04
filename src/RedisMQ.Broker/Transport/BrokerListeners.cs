@@ -1,3 +1,4 @@
+using RedisMQ.Broker.Diagnostics;
 using RedisMQ.Broker.Server;
 
 namespace RedisMQ.Broker.Transport;
@@ -10,7 +11,9 @@ namespace RedisMQ.Broker.Transport;
 /// </summary>
 public static class BrokerListeners
 {
-    public static IReadOnlyList<IListenerTransport> Create(BrokerServerOptions options)
+    public static IReadOnlyList<IListenerTransport> Create(
+        BrokerServerOptions options,
+        BrokerDiagnostics? diagnostics = null)
     {
         ArgumentNullException.ThrowIfNull(options);
 
@@ -24,7 +27,7 @@ public static class BrokerListeners
 
             if (options.Tls is { Enabled: true } tls)
             {
-                listeners.Add(new TlsSocketListener(tls));
+                listeners.Add(new TlsSocketListener(tls, diagnostics));
             }
         }
         catch
