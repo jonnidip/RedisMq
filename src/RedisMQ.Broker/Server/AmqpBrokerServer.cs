@@ -206,7 +206,32 @@ public sealed class AmqpBrokerServer
         {
             while (await timer.WaitForNextTickAsync(ct))
             {
-                _engine.Reap(DateTimeOffset.UtcNow);
+                long started = Stopwatch.GetTimestamp();
+                try
+                {
+                    _engine.Reap(DateTimeOffset.UtcNow);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _diagnostics.Count(_diagnostics.ReaperFailures, new TagList());
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Error,
+                        BrokerLogEvent.ReaperFailed,
+                        "reaper tick failed",
+                        ex);
+                }
+                finally
+                {
+                    _diagnostics.Count(_diagnostics.ReaperSweeps, new TagList());
+                    _diagnostics.Measure(
+                        _diagnostics.ReaperDuration,
+                        Stopwatch.GetElapsedTime(started).TotalSeconds,
+                        new TagList());
+                }
             }
         }
         catch (OperationCanceledException)

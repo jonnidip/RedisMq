@@ -5,6 +5,18 @@ using System.Diagnostics.Metrics;
 using RedisMQ.Broker.Codec;
 using RedisMQ.Broker.Diagnostics;
 
+/// <summary>The outcome of one dead-letter attempt: which clearing rule (if any)
+/// prevented a copy. The x-death header reason stays <c>rejected</c>/<c>expired</c>;
+/// this only classifies the metric reason for a dropped copy.</summary>
+internal enum DeadLetterDisposition
+{
+    NoDeadLetterExchange,
+    Copied,
+    MissingExchange,
+    Unroutable,
+    LoopGuard,
+}
+
 /// <summary>
 /// The M0 in-memory topology engine: exchanges, queues and direct bindings per
 /// vhost, predeclared with the default exchange and <c>amq.direct</c>, plus the
@@ -452,6 +464,13 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
             }
         }
 
+        foreach (InMemoryMessage _ in dropped)
+        {
+            _diagnostics.Count(
+                _diagnostics.MessagesDropped,
+                new TagList { { "vhost", vhost }, { "queue", queue }, { "reason", "max_length" } });
+        }
+
         return EnqueueReceipt.Immediate(
             envelopeId,
             dropped.Count == 0 ? [] : dropped.Select(message => message.EnvelopeId).ToList());
@@ -586,7 +605,8 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
                 && message.DeliveryCount >= limit)
             {
                 DeadLetterAlreadyLocked(
-                    vhost, queue, message, reason: "rejected", DateTimeOffset.UtcNow, enqueued, removed);
+                    vhost, queue, message, reason: "rejected", metricReason: "delivery_limit",
+                    DateTimeOffset.UtcNow, enqueued, removed);
                 return new EngineDelta(enqueued, removed, []);
             }
 
@@ -622,7 +642,8 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
             if (_queues.TryGetValue((vhost, queue), out QueueInfo? info) && info.DeadLetterExchange is not null)
             {
                 DeadLetterAlreadyLocked(
-                    vhost, queue, message, reason: "rejected", DateTimeOffset.UtcNow, enqueued, removed);
+                    vhost, queue, message, reason: "rejected", metricReason: "rejected",
+                    DateTimeOffset.UtcNow, enqueued, removed);
             }
             else
             {
@@ -644,6 +665,7 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
         List<QueuedMessage> enqueued = [];
         List<QueuedMessageRef> removed = [];
         List<(string Vhost, string Name)> deletedQueues = [];
+        List<(string Vhost, string Queue)> expiredMessages = [];
         lock (_lock)
         {
             (string Vhost, string Queue)[] queues = [.. _queues.Keys];
@@ -682,10 +704,44 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
                 delivery.CollectExpiredMessages(now, expired);
                 foreach (InMemoryMessage message in expired)
                 {
+                    expiredMessages.Add((key.Vhost, key.Queue));
                     DeadLetterAlreadyLocked(
-                        key.Vhost, key.Queue, message, reason: "expired", now, enqueued, removed);
+                        key.Vhost, key.Queue, message, reason: "expired", metricReason: "expired",
+                        now, enqueued, removed);
                 }
             }
+        }
+
+        foreach ((string Vhost, string Queue) key in expiredMessages)
+        {
+            _diagnostics.Count(
+                _diagnostics.MessagesExpired,
+                new TagList { { "vhost", key.Vhost }, { "queue", key.Queue } });
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Debug,
+                BrokerLogEvent.MessageExpired,
+                "message expired",
+                data:
+                [
+                    new KeyValuePair<string, object?>("vhost", key.Vhost),
+                    new KeyValuePair<string, object?>("queue", key.Queue),
+                ]);
+        }
+
+        foreach ((string Vhost, string Name) key in deletedQueues)
+        {
+            _diagnostics.Count(
+                _diagnostics.QueuesExpired,
+                new TagList { { "vhost", key.Vhost } });
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Warning,
+                BrokerLogEvent.QueueExpired,
+                "queue expired",
+                data:
+                [
+                    new KeyValuePair<string, object?>("vhost", key.Vhost),
+                    new KeyValuePair<string, object?>("queue", key.Name),
+                ]);
         }
 
         return new EngineDelta(enqueued, removed, deletedQueues);
@@ -699,26 +755,28 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
     /// unroutable copy, or the loop guard leaves the original removed with no copy.
     /// Caller holds the engine gate.
     /// </summary>
-    private void DeadLetterAlreadyLocked(
+    private DeadLetterDisposition DeadLetterAlreadyLocked(
         string vhost,
         string queue,
         InMemoryMessage message,
         string reason,
+        string metricReason,
         DateTimeOffset now,
         List<QueuedMessage> enqueued,
         List<QueuedMessageRef> removed)
     {
         removed.Add(new QueuedMessageRef(vhost, queue, message.EnvelopeId));
 
-        if (HasDeathFor(message.Props.Headers, queue, reason))
-        {
-            return; // loop guard: this queue already dead-lettered this message this way
-        }
-
         if (!_queues.TryGetValue((vhost, queue), out QueueInfo? origin)
             || origin.DeadLetterExchange is not string deadLetterExchange)
         {
-            return; // no DLX: drop
+            return DeadLetterDisposition.NoDeadLetterExchange; // no DLX: drop, no failure
+        }
+
+        if (HasDeathFor(message.Props.Headers, queue, reason))
+        {
+            CountDeadLetterDropped(vhost, queue, "loop_guard");
+            return DeadLetterDisposition.LoopGuard;
         }
 
         ContentProperties properties = WithDeath(message.Props, queue, message.Exchange, reason, now);
@@ -737,7 +795,14 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
         }
         else
         {
-            return; // named DLX does not exist: the copy is silently dropped
+            CountDeadLetterDropped(vhost, queue, "missing_exchange");
+            return DeadLetterDisposition.MissingExchange; // named DLX does not exist
+        }
+
+        if (targets.Count == 0)
+        {
+            CountDeadLetterDropped(vhost, queue, "unroutable");
+            return DeadLetterDisposition.Unroutable;
         }
 
         foreach (string target in targets)
@@ -756,6 +821,9 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
             delivery.AppendAlreadyLocked(copy);
             delivery.WakeAlreadyLocked();
             enqueued.Add(new QueuedMessage(vhost, target, copy));
+            _diagnostics.Count(
+                _diagnostics.MessagesDeadlettered,
+                new TagList { { "vhost", vhost }, { "queue", queue }, { "reason", metricReason } });
 
             if (_queues.TryGetValue((vhost, target), out QueueInfo? targetInfo)
                 && targetInfo.MaxLength is int maxLength
@@ -767,7 +835,14 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
                 }
             }
         }
+
+        return DeadLetterDisposition.Copied;
     }
+
+    private void CountDeadLetterDropped(string vhost, string queue, string reason) =>
+        _diagnostics.Count(
+            _diagnostics.DeadLettersDropped,
+            new TagList { { "vhost", vhost }, { "queue", queue }, { "reason", reason } });
 
     /// <summary>True when the headers already carry an x-death entry for this
     /// (queue, reason) pair — the loop guard's check.</summary>
