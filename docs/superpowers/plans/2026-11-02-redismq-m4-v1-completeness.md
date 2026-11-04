@@ -111,36 +111,36 @@ Nine failure classes the design implies that no happy-path test catches:
 - Produces in `WriteCommand`: `TaskCompletionSource<bool>? Completion { get; init; }` (never serialized) and `bool ReservedDrainerSlot { get; init; }`.
 - Produces in `RedisStreamRouteEngine`: `internal SemaphoreSlim? DrainerSlotsForTest { get; }` (test seam, documented).
 
-- [ ] **Step 1: Write failing engine tests** in `EngineReceiptTests.cs`:
+- [x] **Step 1: Write failing engine tests** in `EngineReceiptTests.cs`:
   - `Enqueue_returns_monotonic_envelope_ids_and_a_completed_true_receipt`.
   - `Enqueue_reports_max_length_drops_in_DroppedEnvelopeIds` (declare `maxLength: 2`, enqueue three, assert the returned id is the third and `DroppedEnvelopeIds` is the first id).
   - `ReplayEnqueue_advances_the_id_counter` (replay id 100, then enqueue, assert the new id is 101).
   Compile-RED: `Enqueue` returns `void`.
 
-- [ ] **Step 2: Run → FAIL** for the expected compile reason.
+- [x] **Step 2: Run → FAIL** for the expected compile reason.
 
-- [ ] **Step 3: Implement the memory side.** Add `EnqueueReceipt.Immediate`. Change `InMemoryQueue.RemoveOldestMessages` to return `List<InMemoryMessage>` of the removed ready messages. Change `InMemoryEngine.Enqueue` to assign `++_lastEnvelopeId`, append, run max-length, and return the receipt with dropped ids. In `ReplayEnqueue`, set `_lastEnvelopeId = Math.Max(_lastEnvelopeId, message.EnvelopeId)`.
+- [x] **Step 3: Implement the memory side.** Add `EnqueueReceipt.Immediate`. Change `InMemoryQueue.RemoveOldestMessages` to return `List<InMemoryMessage>` of the removed ready messages. Change `InMemoryEngine.Enqueue` to assign `++_lastEnvelopeId`, append, run max-length, and return the receipt with dropped ids. In `ReplayEnqueue`, set `_lastEnvelopeId = Math.Max(_lastEnvelopeId, message.EnvelopeId)`.
 
-- [ ] **Step 4: Implement the Redis side.**
+- [x] **Step 4: Implement the Redis side.**
   - Add `Completion`/`ReservedDrainerSlot` to `WriteCommand` (not serialized).
   - `RedisStreamRouteEngine` creates `_drainerSlots = redis is null ? null : new SemaphoreSlim(drainerCapacity)`.
   - `Enqueue`: if `_channel is null`, return `_memory.Enqueue(...)` unchanged (memory-only confirms true). Otherwise `Wait(0)` a slot; if unavailable return `new EnqueueReceipt(0, ValueTask.FromResult(false), [])` **without touching memory**; then `_memory.Enqueue`, create a `TaskCompletionSource<bool>(RunContinuationsAsynchronously)`, build `var command = WriteCommand.Enqueue(realId, ...) with { Completion = tcs, ReservedDrainerSlot = true };`, and `TryWrite` it; on `TryWrite` failure release the slot, complete the TCS `false`, and return the receipt.
   - Drainer `finally` releases the slot; on success completes `true`, on exception completes `false` before swallowing.
   - Add `InternalsVisibleTo RedisMQ.Redis.Tests` to `RedisMQ.Redis.csproj`.
 
-- [ ] **Step 5: Write the Redis tests.** In `RedisStreamRouteEngineTests.cs`:
+- [x] **Step 5: Write the Redis tests.** In `RedisStreamRouteEngineTests.cs`:
   - `Null_redis_receipt_completes_true_and_assigns_ids`.
   - `Drainer_exhaustion_returns_false_without_enqueuing` (consume every slot through `DrainerSlotsForTest`, enqueue, assert id 0 / false / `PeekQueue` empty, release slots).
   - `Receipt_completes_only_after_xadd` (skip without Redis; await `Durable`, assert true, `StreamLengthAsync` is 1).
 
-- [ ] **Step 6: Run → PASS.**
+- [x] **Step 6: Run → PASS.**
   ```powershell
   dotnet build RedisMQ.sln
   dotnet exec tests\RedisMQ.Broker.Tests\bin\Debug\net10.0\RedisMQ.Broker.Tests.dll -class RedisMQ.Broker.Tests.EngineReceiptTests
   dotnet exec tests\RedisMQ.Redis.Tests\bin\Debug\net10.0\RedisMQ.Redis.Tests.dll -class RedisMQ.Redis.Tests.RedisStreamRouteEngineTests
   ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Memory src/RedisMQ.Redis tests/RedisMQ.Broker.Tests/EngineReceiptTests.cs tests/RedisMQ.Redis.Tests/RedisStreamRouteEngineTests.cs
   git commit -m "feat(engine): per-publish durability receipts and envelope identity"
@@ -175,25 +175,25 @@ Nine failure classes the design implies that no happy-path test catches:
   ```
 - Consumes: Task 1's receipt.
 
-- [ ] **Step 1: Write failing tests** in `EngineDeltaTests.cs`:
+- [x] **Step 1: Write failing tests** in `EngineDeltaTests.cs`:
   - `Acknowledge_returns_the_message_as_removed`.
   - `Reject_returns_the_message_as_removed`.
   - `Requeue_enqueues_the_message_redelivered_and_removes_the_original_id`.
   - `Max_length_drop_ids_are_available_to_the_mirror` (three enqueues into `maxLength: 2`, assert the last receipt's dropped ids).
   Compile-RED: methods absent.
 
-- [ ] **Step 2: Run → FAIL.**
+- [x] **Step 2: Run → FAIL.**
 
-- [ ] **Step 3: Implement `InMemoryEngine`.**
+- [x] **Step 3: Implement `InMemoryEngine`.**
   - `Acknowledge`/`Reject`: `new EngineDelta([], [new QueuedMessageRef(vhost, queue, message.EnvelopeId)], [])`. No memory mutation — the pump already popped the message; these methods only describe the Redis settle.
   - `Requeue`: append `message with { Redelivered = true }`, wake the pump, return `Enqueued: [new QueuedMessage(vhost, queue, ...)]`, `Removed: [original id]`.
   - `Enqueue` already returns drops through the receipt; no extra delta.
 
-- [ ] **Step 4: Implement `RedisStreamRouteEngine` pass-throughs** (`Acknowledge`/`Reject`/`Requeue` delegate to `_memory`, return its delta). Mirroring lands in Task 5; this task only keeps the seam honest and compilable.
+- [x] **Step 4: Implement `RedisStreamRouteEngine` pass-throughs** (`Acknowledge`/`Reject`/`Requeue` delegate to `_memory`, return its delta). Mirroring lands in Task 5; this task only keeps the seam honest and compilable.
 
-- [ ] **Step 5: Run → PASS** (`EngineDeltaTests`).
+- [x] **Step 5: Run → PASS** (`EngineDeltaTests`).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Memory src/RedisMQ.Redis tests/RedisMQ.Broker.Tests/EngineDeltaTests.cs
   git commit -m "feat(engine): engine deltas for settle and requeue mirroring"
@@ -217,9 +217,9 @@ Nine failure classes the design implies that no happy-path test catches:
   ```
 - Consumes: `Acknowledge`/`Reject`/`Requeue` (Task 2).
 
-- [ ] **Step 1: Add `RecordingEngine`** by copying the private `TransportPairConnectionListener`/`WireClient`/handshake helper block pattern used by `PublishTests.cs` into the new test file (do not refactor the existing four copies).
+- [x] **Step 1: Add `RecordingEngine`** by copying the private `TransportPairConnectionListener`/`WireClient`/handshake helper block pattern used by `PublishTests.cs` into the new test file (do not refactor the existing four copies).
 
-- [ ] **Step 2: Write failing wire tests** in `SettleMirroringTests.cs`:
+- [x] **Step 2: Write failing wire tests** in `SettleMirroringTests.cs`:
   - `Ack_calls_Acknowledge`.
   - `Reject_without_requeue_calls_Reject`.
   - `Nack_with_requeue_calls_Requeue`.
@@ -229,7 +229,7 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Channel_close_requeues_unacked_entries`.
   Compile-RED: ack path currently never calls the engine.
 
-- [ ] **Step 3: Implement the settle routing.**
+- [x] **Step 3: Implement the settle routing.**
   - Replace `SettleLedger(..., bool requeue)` with `SettleLedger(..., SettleAction action)`.
   - `basic.ack` → `Ack`; `basic.reject`/`basic.nack` with `requeue=false` → `Reject`; with `requeue=true` → `Requeue`.
   - Ack path: `foreach entry in settled) _engine.Acknowledge(...)`.
@@ -238,9 +238,9 @@ Nine failure classes the design implies that no happy-path test catches:
   - `OnBasicGet`: when `noAck`, call `_engine.Acknowledge(...)` after the claim succeeds and before scheduling the reply.
   - `TearDownActiveConsumers`/`OnBasicRecover` already call `Requeue`; no change beyond the new return type.
 
-- [ ] **Step 4: Run → PASS.**
+- [x] **Step 4: Run → PASS.**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Server/ChannelContext.cs tests/RedisMQ.Broker.Tests/RecordingEngine.cs tests/RedisMQ.Broker.Tests/SettleMirroringTests.cs
   git commit -m "feat(server): mirror ack, reject, requeue and auto-ack settles through the engine"
@@ -274,26 +274,26 @@ Nine failure classes the design implies that no happy-path test catches:
 - Stream fields: `env`, `ex`, `rk`, `props` (base64 `ContentHeaderCodec.Write`), `body`, `expires-at` (Unix ms, omitted when null), `delivery-count`, `redelivered` (`0`/`1`).
 - Removes the `PropertiesJson` JSON path. `ContentProperties` is a `FieldTable` carrier and cannot round-trip JSON.
 
-- [ ] **Step 1: Write failing codec tests** in `RedisStreamRouteEngineTests.cs` (`StreamCodecTests` class):
+- [x] **Step 1: Write failing codec tests** in `RedisStreamRouteEngineTests.cs` (`StreamCodecTests` class):
   - `Encode_decode_round_trips_properties_in_amqp_wire_form` — headers with a nested table, an array, a timestamp, a byte array and a decimal; assert every value/type survives.
   - `Encode_decode_round_trips_expiry_delivery_count_and_redelivered`.
   - `Replay_restores_expiry_delivery_count_and_redelivered` (skip without Redis).
   Compile-RED: `EnvelopeRecord` still has `PropertiesJson`.
 
-- [ ] **Step 2: Run → FAIL.**
+- [x] **Step 2: Run → FAIL.**
 
-- [ ] **Step 3: Implement `StreamCodec`.**
+- [x] **Step 3: Implement `StreamCodec`.**
   - `EncodeEnqueue`: `ContentHeaderCodec.Write(writer, 60, body.Length, properties)`, base64 to `props`; add the three new fields; omit `expires-at` when null.
   - `DecodeEnqueue`: read `props` via `ContentHeaderCodec.Read(ref reader).Properties`; missing/empty → `new ContentProperties()`; a malformed `props` payload falls back to empty properties (replay must not crash on a corrupt entry); read the three fields with defaults.
   - Add `RedisKeys.QueueField.ExpiresAt`, `DeliveryCount`, `Redelivered`.
 
-- [ ] **Step 4: Update `WriteCommand`** enqueue/requeue factories and serialization to carry `ExpiresAt`, `DeliveryCount`, `Redelivered` through `EnvelopeRecord`; delete the JSON serialize/deserialize path. Keep the M3 round-trip test compiling by updating its `EnvelopeRecord` construction.
+- [x] **Step 4: Update `WriteCommand`** enqueue/requeue factories and serialization to carry `ExpiresAt`, `DeliveryCount`, `Redelivered` through `EnvelopeRecord`; delete the JSON serialize/deserialize path. Keep the M3 round-trip test compiling by updating its `EnvelopeRecord` construction.
 
-- [ ] **Step 5: Update replay** to build `InMemoryMessage(..., Expiration: record.ExpiresAt, DeliveryCount: record.DeliveryCount, Redelivered: record.Redelivered)`.
+- [x] **Step 5: Update replay** to build `InMemoryMessage(..., Expiration: record.ExpiresAt, DeliveryCount: record.DeliveryCount, Redelivered: record.Redelivered)`.
 
-- [ ] **Step 6: Run → PASS.**
+- [x] **Step 6: Run → PASS.**
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
   ```powershell
   git add src/RedisMQ.Redis/StreamCodec.cs src/RedisMQ.Redis/RedisKeys.cs src/RedisMQ.Redis/WriteCommand.cs src/RedisMQ.Broker/Memory/InMemoryMessage.cs tests/RedisMQ.Redis.Tests/RedisStreamRouteEngineTests.cs
   git commit -m "feat(redis): persist AMQP-wire properties, expiry and delivery metadata"
@@ -322,12 +322,12 @@ Nine failure classes the design implies that no happy-path test catches:
 - Produces in `RedisStreamRouteEngine`: private `_streamIds` map `(vhost, queue, envelopeId) → RedisValue`, and `private void MirrorDelta(EngineDelta delta)`.
 - Consumes: Task 2 deltas, Task 4 records.
 
-- [ ] **Step 1: Write failing unit tests** (no Redis needed):
+- [x] **Step 1: Write failing unit tests** (no Redis needed):
   - `Ack_returns_a_remove_delta_without_redis` — `new RedisStreamRouteEngine(null, ["/"], replayOnStart: false)`; `Acknowledge` returns one removed id; no throw.
   - `WriteCommand_Remove_round_trips` and `Delta_batch_round_trips` (or assert `ToStreamFields` throws for `Delta`, which is never replayed).
   - `Requeue_no_longer_exists_as_a_stream_command` (compile-level: update the M3 round-trip test to use `Enqueue` with `redelivered: true`).
 
-- [ ] **Step 2: Write failing integration tests** (skip without Redis; unique vhost per test):
+- [x] **Step 2: Write failing integration tests** (skip without Redis; unique vhost per test):
   - `Ack_removes_the_stream_entry_and_replay_does_not_resurrect_it` — enqueue, await receipt, `Acknowledge`, wait for `XLEN` 0, dispose, construct a new engine with replay, assert queue empty.
   - `Reject_without_requeue_removes_the_stream_entry`.
   - `Requeue_replaces_the_entry` — one entry remains, `delivery-count` incremented, `redelivered` true.
@@ -336,7 +336,7 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Unbind_tombstone_survives_replay`.
   - `Crash_window_duplicate_is_collapsed_and_stale_entry_xdel_ed` — manually `XADD` two entries with the same envelope id (one lower count), construct a replay engine, assert one message and `XLEN` 1.
 
-- [ ] **Step 3: Implement the drainer map and command handling.**
+- [x] **Step 3: Implement the drainer map and command handling.**
   - `Enqueue` command: `StreamAddAsync`, store the returned id in `_streamIds`.
   - `Remove`: resolve each id from the map, `StreamDeleteAsync`, remove map entries.
   - `RemoveStreamIds`: `StreamDeleteAsync` the given ids and drop their map entries.
@@ -346,15 +346,15 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Enqueue` dropped ids: after the enqueue command, `TryWrite` a `Remove(vhost, queue, droppedIds)` command (best effort).
   - `Acknowledge`/`Reject`/`Requeue` call `_memory` then `MirrorDelta`.
 
-- [ ] **Step 4: Implement replay.**
+- [x] **Step 4: Implement replay.**
   - Topology replay: apply `DeclareExchange`, `DeclareQueue` (all fields), `Bind`, `Unbind`, `DeleteQueue` in stream order; a deleted queue drops its bindings.
   - Queue replay: parse entries, group by envelope id, keep the higher `delivery-count` (tie: later stream id), `XDEL` the stale ids, `ReplayEnqueue` survivors with their metadata, and record their stream ids in `_streamIds`.
 
-- [ ] **Step 5: Update `InMemoryEngine.DeleteQueue`** to also remove bindings and the queue's `LastUsed` entry (when Task 7 adds `LastUsed`; in this task remove bindings).
+- [x] **Step 5: Update `InMemoryEngine.DeleteQueue`** to also remove bindings and the queue's `LastUsed` entry (when Task 7 adds `LastUsed`; in this task remove bindings).
 
-- [ ] **Step 6: Run → PASS** (unit always; integration with Redis when available).
+- [x] **Step 6: Run → PASS** (unit always; integration with Redis when available).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
   ```powershell
   git add src/RedisMQ.Redis src/RedisMQ.Broker/Memory/InMemoryEngine.cs tests/RedisMQ.Redis.Tests/RedisStreamRouteEngineTests.cs
   git commit -m "feat(redis): mirror settles and topology tombstones, dedupe replay"
@@ -397,7 +397,7 @@ Nine failure classes the design implies that no happy-path test catches:
   ```
 - Produces `BrokerServerOptions.ConfirmQueueCapacity` (default 4096) and `ConfirmTimeout` (default 5 s).
 
-- [ ] **Step 1: Write failing tests** in `ConfirmPipelineTests.cs` (copy the raw-client helper block; configure `ConfirmQueueCapacity` where needed):
+- [x] **Step 1: Write failing tests** in `ConfirmPipelineTests.cs` (copy the raw-client helper block; configure `ConfirmQueueCapacity` where needed):
   - `Ack_waits_for_the_receipt` — `RecordingEngine.EnqueueOverride` returns an uncompleted TCS; publish; assert no `confirm.ack` within 200 ms; complete true; assert ack.
   - `Failed_receipt_nacks` — complete false; assert `confirm.nack` with `requeue=false`.
   - `Receipts_complete_out_of_order_but_acks_stay_in_sequence` — two publishes, complete the second first, assert ack 1 then ack 2.
@@ -406,18 +406,18 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Retired_channel_discards_a_late_confirm` — publish, close the channel, complete the receipt; assert no confirm on that channel and the connection still serves a new channel.
   - `Full_confirm_queue_blocks_the_pump` — capacity 1; publish 1 (uncompleted), publish 2, then `queue.declare`; assert no declare-ok until receipt 1 completes; then assert ack 1, ack 2 and declare-ok.
 
-- [ ] **Step 2: Run → FAIL.**
+- [x] **Step 2: Run → FAIL.**
 
-- [ ] **Step 3: Implement `PendingConfirm` and `IChannelDeliveryHost` additions.** `WriteReturnToWireAsync` writes the return method + header + body as one gated write (refactor the existing `ChannelOutcomeBasicReturn` case in `DispatchChannelOutcomeAsync` to call it).
+- [x] **Step 3: Implement `PendingConfirm` and `IChannelDeliveryHost` additions.** `WriteReturnToWireAsync` writes the return method + header + body as one gated write (refactor the existing `ChannelOutcomeBasicReturn` case in `DispatchChannelOutcomeAsync` to call it).
 
-- [ ] **Step 4: Rework `FinishPublish`.**
+- [x] **Step 4: Rework `FinishPublish`.**
   - Routed: collect one `EnqueueReceipt` per target.
   - Unroutable non-mandatory: empty receipt list.
   - Mandatory unroutable: empty receipt list plus `ReturnFirst` with the same `basic.return` payload.
   - In confirm mode: `_host.EnqueueConfirm(new PendingConfirm(this, _channel, sequence, receipts, returnFirst))` and return `ChannelOutcomeSilent`.
   - In non-confirm mode: today's inline `basic.return`/silence.
 
-- [ ] **Step 5: Implement the confirm loop in `WireConnection`.**
+- [x] **Step 5: Implement the confirm loop in `WireConnection`.**
   - On entering `Serving` (after `connection.open-ok`), create a bounded `Channel<PendingConfirm>` with `ConfirmQueueCapacity`, start `RunConfirmLoopAsync` with a `CancellationTokenSource`.
   - `EnqueueConfirm` does a deliberate blocking `WriteAsync` on the bounded channel (pump backpressure); cancellation/closed channel drops the entry silently.
   - Loop: for each entry, `await Task.WhenAll(entry.Receipts.Select(r => r.Durable.AsTask())).WaitAsync(ConfirmTimeout, ct)`; all true or empty → ack; false/exception/timeout → nack.
@@ -425,11 +425,11 @@ Nine failure classes the design implies that no happy-path test catches:
   - Schedule `ReturnFirst` first, then the ack/nack, then `await channel.FlushWriterChainAsync(ct)`.
   - Dispose: cancel and await the loop before completing the transport.
 
-- [ ] **Step 6: Implement `ChannelContext` helpers.** `ScheduleConfirmResult` builds `confirm.ack`/`confirm.nack` via `NewMethod` and schedules `_host.WriteMethodToWireAsync`; `ScheduleConfirmReturn` schedules `_host.WriteReturnToWireAsync`; `FlushWriterChainAsync` calls `RunWriterChainAsync`; `IsOpen => _state == ChannelState.Running`.
+- [x] **Step 6: Implement `ChannelContext` helpers.** `ScheduleConfirmResult` builds `confirm.ack`/`confirm.nack` via `NewMethod` and schedules `_host.WriteMethodToWireAsync`; `ScheduleConfirmReturn` schedules `_host.WriteReturnToWireAsync`; `FlushWriterChainAsync` calls `RunWriterChainAsync`; `IsOpen => _state == ChannelState.Running`.
 
-- [ ] **Step 7: Run → PASS.** Also run the existing `FlowTests` confirms (`Confirm_ack_round_trip`) to prove the in-memory path still acks fast.
+- [x] **Step 7: Run → PASS.** Also run the existing `FlowTests` confirms (`Confirm_ack_round_trip`) to prove the in-memory path still acks fast.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Server tests/RedisMQ.Broker.Tests/ConfirmPipelineTests.cs tests/RedisMQ.Broker.Tests/RecordingEngine.cs
   git commit -m "feat(server): ordered async publisher confirms with receipt backpressure"
@@ -465,33 +465,33 @@ Nine failure classes the design implies that no happy-path test catches:
 - `InMemoryMessage` gains `int DeliveryCount = 0`.
 - `ChannelContext` parses `x-dead-letter-exchange`, `x-dead-letter-routing-key`, `x-delivery-limit`, `x-expires` alongside `x-max-length`.
 
-- [ ] **Step 1: Write failing declare tests** in `QueueArgumentsTests.cs`:
+- [x] **Step 1: Write failing declare tests** in `QueueArgumentsTests.cs`:
   - `Declare_accepts_all_v1_queue_arguments` (assert the stored `QueueInfo` fields, including `Expiration == TimeSpan.FromSeconds(30)`).
   - `Unknown_queue_argument_still_returns_not_implemented`.
   - `Negative_or_non_integral_argument_returns_precondition_failed` (each of the four integral args).
   - `Redeclare_with_a_different_dlx_arg_is_inequivalent`.
   - `Empty_dlx_name_is_the_default_exchange_not_no_dlx`.
 
-- [ ] **Step 2: Write failing TTL/count tests:**
+- [x] **Step 2: Write failing TTL/count tests:**
   - `Expiration_is_relative_to_enqueue_time` — `expiration: "1000"`, assert `Expiration` is within 100 ms of now + 1 s.
   - `Zero_expiration_expires_immediately`.
   - `Negative_or_unparseable_expiration_leaves_no_deadline`.
   - `Requeue_keeps_the_absolute_deadline`.
   - `Delivery_count_increments_on_claim_and_requeue` — consume, nack-requeue, `PeekQueue` shows `DeliveryCount == 1`.
 
-- [ ] **Step 3: Implement `QueueInfo` and declare parsing.** In `OnQueueDeclare`, parse the argument table into a small `QueueDeclareArguments` struct; unknown keys → `NotSupportedArguments`; invalid/negative → `PRECONDITION_FAILED - invalid arg '<name>' ...`; pass the fields into `new QueueInfo(...)`. Extend `DeclaredQueueOutcome` equivalence checks for each field. Server-generated names still work.
+- [x] **Step 3: Implement `QueueInfo` and declare parsing.** In `OnQueueDeclare`, parse the argument table into a small `QueueDeclareArguments` struct; unknown keys → `NotSupportedArguments`; invalid/negative → `PRECONDITION_FAILED - invalid arg '<name>' ...`; pass the fields into `new QueueInfo(...)`. Extend `DeclaredQueueOutcome` equivalence checks for each field. Server-generated names still work.
 
-- [ ] **Step 4: Implement relative TTL and delivery count.**
+- [x] **Step 4: Implement relative TTL and delivery count.**
   - `InMemoryEngine.Enqueue`: `Expiration = now + TimeSpan.FromMilliseconds(ms)`; guard overflow/negative (leave null).
   - `InMemoryQueue.TryClaimOneAlreadyLocked` and `InMemoryEngine.TryClaimForGet` hand out `message with { DeliveryCount = message.DeliveryCount + 1 }`.
   - `Requeue` preserves the deadline and the incremented count.
   - Add an in-memory `_lastUsed` map; touch it in `DeclareQueue`, `Bind`, `Enqueue`, `TryClaimForGet`, `RegisterConsumer`, and `UnregisterConsumer` (when the last consumer leaves). No persistence. Replace the unused `GetQueueExpiry` with `internal TimeSpan? GetQueueIdleExpiration(string vhost, string queue)` (or delete it; nothing else calls it).
 
-- [ ] **Step 5: Persist the arguments.** Extend `WriteCommand.DeclareQueue(..., int? expiresMs = null, string? deadLetterExchange = null, string? deadLetterRoutingKey = null, int? deliveryLimit = null)`; serialize `x-expires`, `x-dead-letter-exchange`, `x-dead-letter-routing-key`, `x-delivery-limit`; replay rebuilds `QueueInfo` with `Expiration: TimeSpan.FromMilliseconds(expiresMs)`.
+- [x] **Step 5: Persist the arguments.** Extend `WriteCommand.DeclareQueue(..., int? expiresMs = null, string? deadLetterExchange = null, string? deadLetterRoutingKey = null, int? deliveryLimit = null)`; serialize `x-expires`, `x-dead-letter-exchange`, `x-dead-letter-routing-key`, `x-delivery-limit`; replay rebuilds `QueueInfo` with `Expiration: TimeSpan.FromMilliseconds(expiresMs)`.
 
-- [ ] **Step 6: Run → PASS.** Update the existing `Redis_stream_engine_expires_messages` test to use `Reap` in Task 8; for now keep it compiling against the internal expiry helper.
+- [x] **Step 6: Run → PASS.** Update the existing `Redis_stream_engine_expires_messages` test to use `Reap` in Task 8; for now keep it compiling against the internal expiry helper.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
   ```powershell
   git add src/RedisMQ.Broker src/RedisMQ.Redis tests/RedisMQ.Broker.Tests/QueueArgumentsTests.cs tests/RedisMQ.Redis.Tests/RedisStreamRouteEngineTests.cs
   git commit -m "feat(engine): queue TTL/DLX arguments, relative expiry and delivery counts"
@@ -516,7 +516,7 @@ Nine failure classes the design implies that no happy-path test catches:
 - Produces private `DeadLetterAlreadyLocked(...)` and `WithDeath(...)` in `InMemoryEngine`.
 - `Reject` now dead-letters when the queue has a DLX; `Requeue` dead-letters on delivery-limit overflow.
 
-- [ ] **Step 1: Write failing tests** in `DeadLetterTests.cs`:
+- [x] **Step 1: Write failing tests** in `DeadLetterTests.cs`:
   - `Reject_with_dlx_enqueues_a_copy_with_x_death` — declare source with DLX + target queue, bind, enqueue, consume/requeue, reject; assert the target has one message with `x-death` (`queue`, `reason = rejected`, `count = 1`, `time` is a timestamp, `exchange` is the original).
   - `Nack_without_requeue_dead_letters`.
   - `Requeue_over_limit_dead_letters` — `x-delivery-limit: 1`; deliver, requeue → copy in DLX.
@@ -528,11 +528,11 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Dead_letter_copy_resets_delivery_count_and_clears_expiration`.
   - `Loop_guard_drops_a_second_death_for_the_same_queue_and_reason`.
 
-- [ ] **Step 2: Run → FAIL.**
+- [x] **Step 2: Run → FAIL.**
 
-- [ ] **Step 3: Implement `WithDeath`.** Clone the `Headers` table, find `x-death` (`FieldValue[]` of tables), increment the matching `(queue, reason)` table's `count` (a `long`/`l`) and refresh `time` (`T`), or prepend a new table `{ queue: S, reason: S, count: l, time: T, exchange: S }`; set `x-first-death-queue/reason/exchange` only when absent; return `properties with { Headers = headers, Expiration = null }`.
+- [x] **Step 3: Implement `WithDeath`.** Clone the `Headers` table, find `x-death` (`FieldValue[]` of tables), increment the matching `(queue, reason)` table's `count` (a `long`/`l`) and refresh `time` (`T`), or prepend a new table `{ queue: S, reason: S, count: l, time: T, exchange: S }`; set `x-first-death-queue/reason/exchange` only when absent; return `properties with { Headers = headers, Expiration = null }`.
 
-- [ ] **Step 4: Implement `DeadLetterAlreadyLocked`.**
+- [x] **Step 4: Implement `DeadLetterAlreadyLocked`.**
   - Loop guard: if `x-death` already contains `(originQueue, reason)`, remove only.
   - Resolve `DeadLetterExchange`: null → remove only; `""` → default exchange; named → `GetExchange` (missing → remove only).
   - Routing key = `DeadLetterRoutingKey ?? message.RoutingKey`.
@@ -540,7 +540,7 @@ Nine failure classes the design implies that no happy-path test catches:
   - For each target: new envelope id (`++_lastEnvelopeId`), append `new InMemoryMessage(props, DefensiveCopy(body), dlxName, key, newId, DeliveryCount: 0, Expiration: null)`, apply max-length and add any evicted ids to `Removed`.
   - Add each copy to `Enqueued`; always add the original to `Removed`.
 
-- [ ] **Step 5: Wire the triggers.**
+- [x] **Step 5: Wire the triggers.**
   - `Reject`: if the queue has a DLX, dead-letter with `rejected`; else removed only.
   - `Requeue`: if `DeliveryLimit is int limit && message.DeliveryCount >= limit`, dead-letter with `rejected`; else requeue.
   - `Reap`: sweep each queue's ready messages with `Expiration <= now`; dead-letter with `expired` or remove; return one delta. Snapshot the queue keys before the sweep so a DLX copy into another queue does not mutate the iteration set.
@@ -548,16 +548,16 @@ Nine failure classes the design implies that no happy-path test catches:
   - `ChannelContext`'s reject path already calls `_engine.Reject` (Task 3); no change needed beyond confirming it passes the message.
   - Update the existing M1 test `Redis_stream_engine_expires_messages` from `RemoveExpiredReadyMessages()` to `engine.Reap(DateTimeOffset.UtcNow)` and delete the old internal helper.
 
-- [ ] **Step 6: Add a wire test** in `SettleMirroringTests.cs`: consume, `basic.reject(requeue:false)` with a DLX queue, consume from the DLX target, assert `x-death` headers on the delivered content.
+- [x] **Step 6: Add a wire test** in `SettleMirroringTests.cs`: consume, `basic.reject(requeue:false)` with a DLX queue, consume from the DLX target, assert `x-death` headers on the delivered content.
 
-- [ ] **Step 7: Add Redis integration tests** in `RedisStreamRouteEngineTests.cs` (skip without Redis; unique vhost):
+- [x] **Step 7: Add Redis integration tests** in `RedisStreamRouteEngineTests.cs` (skip without Redis; unique vhost):
   - `Dead_letter_copy_is_mirrored_with_x_death` — declare source with a DLX and target, enqueue, `Reject`, wait for the target's `XLEN` to be 1, dispose, replay, assert the target holds one message whose `x-death` survived.
   - `Dead_letter_copy_resets_expiry_in_redis` — assert the replayed copy's `expires-at` field is absent.
   Use a bounded polling helper (`WaitUntilAsync(Func<bool>, 2 s)`) because the drainer is asynchronous.
 
-- [ ] **Step 8: Run → PASS.**
+- [x] **Step 8: Run → PASS.**
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Memory src/RedisMQ.Redis tests/RedisMQ.Broker.Tests/DeadLetterTests.cs tests/RedisMQ.Broker.Tests/SettleMirroringTests.cs tests/RedisMQ.Redis.Tests/RedisStreamRouteEngineTests.cs
   git commit -m "feat(engine): dead-letter routing with x-death and delivery-limit overflow"
@@ -581,7 +581,7 @@ Nine failure classes the design implies that no happy-path test catches:
 - `BrokerServerOptions.ReaperInterval` (`TimeSpan`, default 5 s, `0` disables).
 - `AmqpBrokerServer` owns one `PeriodicTimer` reaper loop for all listeners.
 
-- [ ] **Step 1: Write failing tests** in `ReaperTests.cs`:
+- [x] **Step 1: Write failing tests** in `ReaperTests.cs`:
   - `Idle_queue_with_x_expires_is_deleted` — declare with `x-expires: 100`, `Reap(lastUsed + 200 ms)`, assert `GetQueue` null, bindings gone.
   - `Queue_with_a_consumer_is_not_expired`.
   - `Queue_expiry_deletes_messages_without_dead_lettering` — source with DLX; expire the queue; assert the DLX target is empty.
@@ -589,20 +589,20 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Server_reaper_loop_expires_a_message` — `ReaperInterval = 50 ms`, publish with `expiration: "50"`, wait, assert the queue is empty (no consumer).
   - `Redis_reap_mirrors_deletes` (integration; skip without Redis) — expire a queue, assert the stream key is gone and replay stays deleted.
 
-- [ ] **Step 2: Run → FAIL.**
+- [x] **Step 2: Run → FAIL.**
 
-- [ ] **Step 3: Implement queue expiry in `Reap`.** Under `_lock`: for each queue with `Expiration is TimeSpan idle` and `now >= _lastUsed[(vhost,queue)] + idle` and no consumers, remove the queue, delivery state, bindings and `_lastUsed`, and add `(vhost, queue)` to `DeletedQueues`. Messages are dropped (no DLX path).
+- [x] **Step 3: Implement queue expiry in `Reap`.** Under `_lock`: for each queue with `Expiration is TimeSpan idle` and `now >= _lastUsed[(vhost,queue)] + idle` and no consumers, remove the queue, delivery state, bindings and `_lastUsed`, and add `(vhost, queue)` to `DeletedQueues`. Messages are dropped (no DLX path).
 
-- [ ] **Step 4: Implement the server loop.** In `StartAsync`, start `RunReaperAsync` when `ReaperInterval > TimeSpan.Zero`:
+- [x] **Step 4: Implement the server loop.** In `StartAsync`, start `RunReaperAsync` when `ReaperInterval > TimeSpan.Zero`:
   ```csharp
   using var timer = new PeriodicTimer(_options.ReaperInterval);
   while (await timer.WaitForNextTickAsync(ct)) { _engine.Reap(DateTimeOffset.UtcNow); }
   ```
   Start it alongside the accept loops; `StopAsync` cancels and awaits it (swallowing cancellation). Do not start a second loop per listener.
 
-- [ ] **Step 5: Run → PASS** (including the new conformance expiry scenario).
+- [x] **Step 5: Run → PASS** (including the new conformance expiry scenario).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
   ```powershell
   git add src/RedisMQ.Broker src/RedisMQ.Redis tests/RedisMQ.Broker.Tests/ReaperTests.cs tests/RedisMQ.Redis.Tests/RedisStreamRouteEngineTests.cs tests/RedisMQ.Conformance/FlowTests.cs
   git commit -m "feat(server): queue expiry and the shared reaper loop"
@@ -659,7 +659,7 @@ Nine failure classes the design implies that no happy-path test catches:
   (Typo guard for the executor: the method is `BrokerPassword.Verify(string password, BrokerUser user)`.)
 - Produces `BrokerServerOptions.Validate()` called from `AmqpBrokerServer.StartAsync` and `TestBrokerHost.Start`.
 
-- [ ] **Step 1: Write failing tests** in `PermissionTests.cs`:
+- [x] **Step 1: Write failing tests** in `PermissionTests.cs`:
   - `Pbkdf2_hash_round_trips` (hash, verify true, wrong password false).
   - `Malformed_or_wrong_algorithm_hash_is_refused`.
   - `FullAccess_grants_configure_write_read_on_named_vhosts` and denies other vhosts.
@@ -669,21 +669,21 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Exactly_one_credential_form_is_required` (`Validate` throws for both/neither).
   - `Regex_timeout_denies_instead_of_hanging` (a pathological pattern with a 1 s timeout; assert the `RegexMatchTimeoutException` path returns false).
 
-- [ ] **Step 2: Run → FAIL.**
+- [x] **Step 2: Run → FAIL.**
 
-- [ ] **Step 3: Implement `BrokerPermission`/`BrokerUser`.** Add the record parameters; `FullAccess` builds `new BrokerPermission(v, ".*", ".*", ".*")` for each vhost. Keep positional `new BrokerUser("guest", "guest")` compiling (password is the second parameter).
+- [x] **Step 3: Implement `BrokerPermission`/`BrokerUser`.** Add the record parameters; `FullAccess` builds `new BrokerPermission(v, ".*", ".*", ".*")` for each vhost. Keep positional `new BrokerUser("guest", "guest")` compiling (password is the second parameter).
 
-- [ ] **Step 4: Implement `BrokerPassword`.** `Rfc2898DeriveBytes.Pbkdf2(password, salt, 210_000, HashAlgorithmName.SHA256, 32)`; 16-byte random salt; encode `pbkdf2-sha256$210000$<base64 salt>$<base64 hash>`; parse exactly four `$` parts; `CryptographicOperations.FixedTimeEquals` for the hash and for plaintext passwords.
+- [x] **Step 4: Implement `BrokerPassword`.** `Rfc2898DeriveBytes.Pbkdf2(password, salt, 210_000, HashAlgorithmName.SHA256, 32)`; 16-byte random salt; encode `pbkdf2-sha256$210000$<base64 salt>$<base64 hash>`; parse exactly four `$` parts; `CryptographicOperations.FixedTimeEquals` for the hash and for plaintext passwords.
 
-- [ ] **Step 5: Implement `BrokerPrincipal`.** Compile each permission triple once with `RegexOptions.CultureInvariant` and `TimeSpan.FromSeconds(1)`; `CanX(vhost, name)` finds the vhost entry (first match wins) and returns `regex.IsMatch(name)`, catching `RegexMatchTimeoutException` → false. `IsKnownVhost` is entry presence, even for a deny-all entry.
+- [x] **Step 5: Implement `BrokerPrincipal`.** Compile each permission triple once with `RegexOptions.CultureInvariant` and `TimeSpan.FromSeconds(1)`; `CanX(vhost, name)` finds the vhost entry (first match wins) and returns `regex.IsMatch(name)`, catching `RegexMatchTimeoutException` → false. `IsKnownVhost` is entry presence, even for a deny-all entry.
 
-- [ ] **Step 6: Implement `BrokerServerOptions.Validate()`** and call it at server/host start. Validate: every user has exactly one of `Password`/`PasswordHash`; malformed hashes throw; every permission regex compiles; duplicate user names throw.
+- [x] **Step 6: Implement `BrokerServerOptions.Validate()`** and call it at server/host start. Validate: every user has exactly one of `Password`/`PasswordHash`; malformed hashes throw; every permission regex compiles; duplicate user names throw.
 
-- [ ] **Step 7: Update the six construction sites** to `BrokerUser.FullAccess("guest", "guest", "/")`: `PublishTests.NewOptions`, `ConsumeTests` options helper, `ChannelTopologyTests` options helper, `ConnectionFsmTests.NewOptions`, and both `TestBrokerHost.Start` overloads.
+- [x] **Step 7: Update the six construction sites** to `BrokerUser.FullAccess("guest", "guest", "/")`: `PublishTests.NewOptions`, `ConsumeTests` options helper, `ChannelTopologyTests` options helper, `ConnectionFsmTests.NewOptions`, and both `TestBrokerHost.Start` overloads.
 
-- [ ] **Step 8: Run → PASS** plus the existing suites (default deny has not been enforced yet, so all wire tests should still pass).
+- [x] **Step 8: Run → PASS** plus the existing suites (default deny has not been enforced yet, so all wire tests should still pass).
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Server tests/RedisMQ.Broker.Tests tests/RedisMQ.Conformance/TestBrokerHost.cs
   git commit -m "feat(server): per-vhost permissions, PBKDF2 accounts and FullAccess helper"
@@ -703,7 +703,7 @@ Nine failure classes the design implies that no happy-path test catches:
 - `WireConnection` builds the principal at `StartOk` and passes it to `new ChannelContext(channel, _vhost, Routes, this, _connectionId, _principal)`.
 - `ChannelContext` constructor gains `BrokerPrincipal? principal = null`; null means "internal test, full access" (only `WireConnection` creates channels in production).
 
-- [ ] **Step 1: Write failing wire tests** in `PermissionWireTests.cs`:
+- [x] **Step 1: Write failing wire tests** in `PermissionWireTests.cs`:
   - `Full_access_user_can_declare_bind_publish_consume_and_get`.
   - `Restricted_user_is_denied_exchange_declare_without_configure`.
   - `Restricted_user_is_denied_queue_declare_without_configure`.
@@ -715,13 +715,13 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Connection_open_on_a_vhost_without_a_permission_entry_is_refused` — `403 ACCESS_REFUSED - access to vhost '<vhost>' refused for user '<user>'`, class/method 10/40.
   - `Deny_all_permission_entry_allows_open_but_denies_operations`.
 
-- [ ] **Step 2: Run → FAIL.**
+- [x] **Step 2: Run → FAIL.**
 
-- [ ] **Step 3: Implement principal capture.** In `OnStartOkAsync`, find the user by name, verify with `BrokerPassword.Verify`, and set `_principal = new BrokerPrincipal(user.Name, user.Permissions ?? [])`; keep the existing `ACCESS_REFUSED` wording for bad credentials.
+- [x] **Step 3: Implement principal capture.** In `OnStartOkAsync`, find the user by name, verify with `BrokerPassword.Verify`, and set `_principal = new BrokerPrincipal(user.Name, user.Permissions ?? [])`; keep the existing `ACCESS_REFUSED` wording for bad credentials.
 
-- [ ] **Step 4: Implement vhost-open.** In `OnOpenAsync`, after the `Vhosts` configured check, require `_principal is not null && _principal.IsKnownVhost(vhost)`; otherwise `CloseConnectionAsync(AccessRefused, $"ACCESS_REFUSED - access to vhost '{vhost}' refused for user '{_principal?.Name}'", 10, 40, ct)`.
+- [x] **Step 4: Implement vhost-open.** In `OnOpenAsync`, after the `Vhosts` configured check, require `_principal is not null && _principal.IsKnownVhost(vhost)`; otherwise `CloseConnectionAsync(AccessRefused, $"ACCESS_REFUSED - access to vhost '{vhost}' refused for user '{_principal?.Name}'", 10, 40, ct)`.
 
-- [ ] **Step 5: Implement channel checks** (all before existence/equivalence):
+- [x] **Step 5: Implement channel checks** (all before existence/equivalence):
   - `OnExchangeDeclare`: `CanConfigure(name)`.
   - `OnQueueDeclare`: `CanConfigure(actual)` after server-name generation (passive included).
   - `BindingAction`: `CanConfigure(queueName) && CanWrite(exchange)`.
@@ -729,9 +729,9 @@ Nine failure classes the design implies that no happy-path test catches:
   - `OnBasicConsume` / `OnBasicGet`: `CanRead(queue)`.
   - Refusal helper returns `Soft(method, AccessRefused, "ACCESS_REFUSED - access to <kind> '<name>' in vhost '<vhost>' refused for user '<user>'")`.
 
-- [ ] **Step 6: Run → PASS** and the full Broker suite (all FullAccess sites now exercise the new checks).
+- [x] **Step 6: Run → PASS** and the full Broker suite (all FullAccess sites now exercise the new checks).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Server/WireConnection.cs src/RedisMQ.Broker/Server/ChannelContext.cs tests/RedisMQ.Broker.Tests/PermissionWireTests.cs
   git commit -m "feat(server): enforce per-vhost configure/write/read and vhost-open permissions"
@@ -779,9 +779,9 @@ Nine failure classes the design implies that no happy-path test catches:
 - `IListenerTransport` gains `int? AnnouncedPort => null;`; `SocketListener` adds `int? IListenerTransport.AnnouncedPort => _announcedPort;`.
 - `BrokerServerOptions.Tls` (`BrokerTlsOptions?`).
 
-- [ ] **Step 1: Write `TestCertificates`.** Generate a self-signed `localhost` PFX and, for mTLS, a CA certificate + a CA-signed client certificate (RSA 2048, SHA-256, SAN DNS `localhost`). Write PFX/PEM to temp paths; implement `IDisposable` cleanup.
+- [x] **Step 1: Write `TestCertificates`.** Generate a self-signed `localhost` PFX and, for mTLS, a CA certificate + a CA-signed client certificate (RSA 2048, SHA-256, SAN DNS `localhost`). Write PFX/PEM to temp paths; implement `IDisposable` cleanup.
 
-- [ ] **Step 2: Write failing tests** in `TlsTransportTests.cs`:
+- [x] **Step 2: Write failing tests** in `TlsTransportTests.cs`:
   - `Pfx_certificate_loads_and_reports_a_private_key`.
   - `Pem_certificate_with_key_loads`.
   - `Missing_certificate_file_throws_BrokerConfigurationException`.
@@ -791,17 +791,17 @@ Nine failure classes the design implies that no happy-path test catches:
   - `Mutual_tls_accepts_a_ca_signed_client_certificate`.
   - `Handshake_timeout_closes_that_socket_and_keeps_accepting` (set `HandshakeTimeout = 200 ms`, connect and send nothing, then a valid client).
 
-- [ ] **Step 3: Implement `BrokerCertificate`.**
+- [x] **Step 3: Implement `BrokerCertificate`.**
   - PFX: `X509CertificateLoader.LoadPkcs12FromFile(path, password, X509KeyStorageFlags.EphemeralKeySet)`.
   - PEM: `X509Certificate2.CreateFromPemFile(certPath, keyPath)`, then re-export as PFX and reload with `EphemeralKeySet` on Windows (keeps `SslStream` happy).
   - mTLS: load CA bundle with `X509Certificate2Collection.ImportFromPemFile`; validation callback builds `X509Chain` with `TrustMode = CustomRootTrust`, `RevocationMode = NoCheck`, adds the CA certs, and returns `chain.Build(cert)`.
   - Protocol helper: `Tls12` → `Tls12 | Tls13`; `Tls13` → `Tls13`.
 
-- [ ] **Step 4: Implement `TlsSocketListener`.** Reuse the socket binder (extract `internal static (Socket Socket, int Port) Bind(int port)` from `SocketListener` into a small `SocketBinder` type or a private static method shared in the same file). Accept loop: on `SocketException`/`ObjectDisposedException` return null; on accepted socket wrap `SslStream(new NetworkStream(socket, ownsSocket: true))`, `AuthenticateAsServerAsync(options, ct).AsTask().WaitAsync(HandshakeTimeout, ct)`; on failure dispose and `continue`; on success return `new TransportSide(PipeReader.Create(ssl), PipeWriter.Create(ssl))`. `DisposeAsync` disposes the socket and certificate.
+- [x] **Step 4: Implement `TlsSocketListener`.** Reuse the socket binder (extract `internal static (Socket Socket, int Port) Bind(int port)` from `SocketListener` into a small `SocketBinder` type or a private static method shared in the same file). Accept loop: on `SocketException`/`ObjectDisposedException` return null; on accepted socket wrap `SslStream(new NetworkStream(socket, ownsSocket: true))`, `AuthenticateAsServerAsync(options, ct).AsTask().WaitAsync(HandshakeTimeout, ct)`; on failure dispose and `continue`; on success return `new TransportSide(PipeReader.Create(ssl), PipeWriter.Create(ssl))`. `DisposeAsync` disposes the socket and certificate.
 
-- [ ] **Step 5: Run → PASS.**
+- [x] **Step 5: Run → PASS.**
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Server src/RedisMQ.Broker/Transport tests/RedisMQ.Broker.Tests/TlsTransportTests.cs tests/RedisMQ.Broker.Tests/TestCertificates.cs
   git commit -m "feat(transport): SslStream listener with PFX/PEM and mutual TLS"
@@ -824,22 +824,22 @@ Nine failure classes the design implies that no happy-path test catches:
 - `AmqpBrokerServer` gains `AmqpBrokerServer(BrokerServerOptions options, IRouteEngine engine, IReadOnlyList<IListenerTransport> listeners)`; the existing single-listener ctor delegates. One accept loop per listener; stop cancels/awaits all.
 - `TestBrokerHost` exposes `int Port` and `int? TlsPort`, creates listeners through the factory, and disposes every listener it created.
 
-- [ ] **Step 1: Write failing tests** in `BrokerListenersTests.cs`:
+- [x] **Step 1: Write failing tests** in `BrokerListenersTests.cs`:
   - `Factory_returns_plain_only_when_tls_is_disabled`.
   - `Factory_returns_both_when_tls_is_enabled` (TLS `Port = 0`).
   - `Factory_returns_no_plaintext_when_port_is_minus_one`.
   - `Multi_listener_server_accepts_on_both_ports` (start plain + TLS, connect a raw TLS client, complete the AMQP handshake far enough to read `connection.start`).
   - `Single_listener_constructor_still_starts_one_loop`.
 
-- [ ] **Step 2: Run → FAIL.**
+- [x] **Step 2: Run → FAIL.**
 
-- [ ] **Step 3: Implement the factory and multi-listener server.** `StartAsync` starts every accept loop; `StopAsync` cancels and awaits all; the reaper loop (Task 9) is started once. The server does not dispose listeners.
+- [x] **Step 3: Implement the factory and multi-listener server.** `StartAsync` starts every accept loop; `StopAsync` cancels and awaits all; the reaper loop (Task 9) is started once. The server does not dispose listeners.
 
-- [ ] **Step 4: Update `TestBrokerHost`.** `Start` sets `Port = 0`; when `options.Tls?.Enabled == true` and `Tls.Port == 0`, keep the OS-assigned port. `Port` comes from the plain listener (or `-1`), `TlsPort` from the TLS listener. `StopAsync` stops the server, then disposes every listener. Both `Start` overloads share the code.
+- [x] **Step 4: Update `TestBrokerHost`.** `Start` sets `Port = 0`; when `options.Tls?.Enabled == true` and `Tls.Port == 0`, keep the OS-assigned port. `Port` comes from the plain listener (or `-1`), `TlsPort` from the TLS listener. `StopAsync` stops the server, then disposes every listener. Both `Start` overloads share the code.
 
-- [ ] **Step 5: Run → PASS** plus the existing conformance suite (plain path unchanged).
+- [x] **Step 5: Run → PASS** plus the existing conformance suite (plain path unchanged).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
   ```powershell
   git add src/RedisMQ.Broker/Transport/BrokerListeners.cs src/RedisMQ.Broker/Server/AmqpBrokerServer.cs tests/RedisMQ.Conformance/TestBrokerHost.cs tests/RedisMQ.Broker.Tests/BrokerListenersTests.cs
   git commit -m "feat(server): plaintext+TLS listener factory and multi-listener accept loops"
@@ -863,14 +863,14 @@ Nine failure classes the design implies that no happy-path test catches:
 **Interfaces:**
 - Consumes: everything above.
 
-- [ ] **Step 1: Add TLS conformance tests** in `TlsFlowTests.cs`:
+- [x] **Step 1: Add TLS conformance tests** in `TlsFlowTests.cs`:
   - `Connect_over_tls_and_publish_consume` — start a TLS host with a self-signed PFX; `ConnectionFactory.Ssl = new SslOption { Enabled = true, ServerName = "localhost", AcceptablePolicyErrors = SslPolicyErrors.RemoteCertificateNameMismatch | SslPolicyErrors.RemoteCertificateChainErrors }`; endpoint `new AmqpTcpEndpoint("localhost", host.TlsPort!.Value)`; declare, publish, consume.
   - `Mutual_tls_accepts_a_client_certificate` — configure `ClientCertificateRequired`, CA path; client `SslOption.CertPath`/`CertPassphrase`; publish/consume.
   - `Mutual_tls_refuses_a_client_without_a_certificate` — assert the connect attempt throws/fails.
 
-- [ ] **Step 2: Run → PASS** (if the RabbitMQ.Client mTLS surface differs, pin the accept/refuse cases at the transport level in `TlsTransportTests` and keep conformance to server-auth TLS; note the deviation in the plan's execution notes).
+- [x] **Step 2: Run → PASS** (if the RabbitMQ.Client mTLS surface differs, pin the accept/refuse cases at the transport level in `TlsTransportTests` and keep conformance to server-auth TLS; note the deviation in the plan's execution notes).
 
-- [ ] **Step 3: Update docs.**
+- [x] **Step 3: Update docs.**
   - `README.md`: quick start uses `BrokerUser.FullAccess`; TLS snippet; "fresh Redis store" note; durability contract (Redis confirm = every fan-out `XADD` accepted; memory-only = no durability promise).
   - `docs/API.md`: `BrokerServerOptions.Tls/ConfirmTimeout/ConfirmQueueCapacity/ReaperInterval`; `BrokerTlsOptions`; `BrokerUser`/`BrokerPermission`/`BrokerPassword`; `QueueInfo` arguments.
   - `docs/ARCHITECTURE.md`: receipts, `EngineDelta`, enqueue-first/remove-second, replay dedupe, DLX/TTL, `LastUsed`, permissions, TLS.
@@ -879,7 +879,7 @@ Nine failure classes the design implies that no happy-path test catches:
   - `docs/PROTOCOL.md`: queue arguments, relative `expiration`, `x-death` shape, confirm ordering, 403 wording.
   - `docs/index.md`: M4 part-1 status and what remains (profiles, observability, perf, Pika, packaging).
 
-- [ ] **Step 4: Full regression gate.**
+- [x] **Step 4: Full regression gate.**
   ```powershell
   dotnet build RedisMQ.sln
   dotnet exec tests\RedisMQ.Broker.Tests\bin\Debug\net10.0\RedisMQ.Broker.Tests.dll
@@ -888,9 +888,9 @@ Nine failure classes the design implies that no happy-path test catches:
   ```
   Requirements: build 0 errors; every pre-M4 test still green; new tests green; Redis-dependent tests green against a local container (or skipped with a recorded reason if Redis is unavailable).
 
-- [ ] **Step 5: Run the suites a second time** to catch flakes (especially TLS handshake timing and confirm backpressure).
+- [x] **Step 5: Run the suites a second time** to catch flakes (especially TLS handshake timing and confirm backpressure).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
   ```powershell
   git add tests/RedisMQ.Conformance README.md docs
   git commit -m "test(m4): TLS conformance and v1 completeness regression gate"
