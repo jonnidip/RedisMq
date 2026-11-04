@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Linq;
 using System.Threading.Channels;
 using RedisMQ.Broker.Codec;
+using RedisMQ.Broker.Diagnostics;
 using RedisMQ.Broker.Memory;
 using RedisMQ.Broker.Server;
 using StackExchange.Redis;
@@ -15,11 +16,12 @@ namespace RedisMQ.Redis;
 /// Streams asynchronously by a single background drainer so the protocol path
 /// never blocks on Redis.
 /// </summary>
-public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
+public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, IAsyncDisposable
 {
     private readonly IDatabase? _redis;
     private readonly string[] _vhosts;
     private readonly InMemoryEngine _memory;
+    private readonly BrokerDiagnostics _diagnostics;
     private readonly Channel<WriteCommand>? _channel;
     private readonly Task? _drainerTask;
     private readonly SemaphoreSlim? _drainerSlots;
@@ -45,7 +47,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     /// the server's maxmemory-policy is checked at startup; eviction policies that
     /// could discard durable data cause the constructor to throw.
     /// </summary>
-    public RedisStreamRouteEngine(IDatabase? redis, IReadOnlyList<string> vhosts, bool replayOnStart = true, int drainerCapacity = 1024, bool enforceEvictionGate = true)
+    public RedisStreamRouteEngine(IDatabase? redis, IReadOnlyList<string> vhosts, bool replayOnStart = true, int drainerCapacity = 1024, bool enforceEvictionGate = true, BrokerDiagnostics? diagnostics = null)
     {
         ArgumentNullException.ThrowIfNull(vhosts);
         if (vhosts.Count == 0)
@@ -54,7 +56,8 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
         }
         _redis = redis;
         _vhosts = [.. vhosts];
-        _memory = new InMemoryEngine(_vhosts);
+        _diagnostics = diagnostics ?? new BrokerDiagnostics();
+        _memory = new InMemoryEngine(_vhosts, _diagnostics);
 
         if (redis is not null)
         {
@@ -80,6 +83,26 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
     /// <summary>Test seam: the drainer's slot semaphore, exposed so a test can
     /// exhaust it deterministically. Null when Redis is absent.</summary>
     internal SemaphoreSlim? DrainerSlotsForTest => _drainerSlots;
+
+    /// <summary>The diagnostics instance this engine emits to (never disposed here).</summary>
+    public BrokerDiagnostics Diagnostics => _diagnostics;
+
+    /// <summary>Durability and connection state of the Redis backend. Mirror counters
+    /// are zero until the drainer instrumentation fills them (observability Task 7).</summary>
+    public EngineHealth GetEngineHealth() => new(
+        "redis",
+        _redis is not null,
+        _redis?.Multiplexer.IsConnected,
+        _channel?.Reader.Count ?? 0,
+        0,
+        0,
+        null,
+        null,
+        null);
+
+    /// <summary>Queue depth and consumer counts come from the inner memory store; both
+    /// deployments report identical per-queue numbers.</summary>
+    public IReadOnlyList<QueueSnapshot> QueueSnapshots() => _memory.QueueSnapshots();
 
     public ExchangeInfo? GetExchange(string vhost, string name) => _memory.GetExchange(vhost, name);
 
@@ -769,5 +792,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IAsyncDisposable
                 // Drainer may fault on shutdown; ignore.
             }
         }
+
+        _memory.Dispose();
     }
 }

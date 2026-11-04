@@ -1,6 +1,9 @@
 namespace RedisMQ.Broker.Memory;
 
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using RedisMQ.Broker.Codec;
+using RedisMQ.Broker.Diagnostics;
 
 /// <summary>
 /// The M0 in-memory topology engine: exchanges, queues and direct bindings per
@@ -12,7 +15,7 @@ using RedisMQ.Broker.Codec;
 /// Queue deletion exists only through the reaper (x-expires) and the Redis
 /// engine's exclusive/auto-delete reconciliation.
 /// </summary>
-public sealed class InMemoryEngine : IRouteEngine
+public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposable
 {
     private readonly object _lock = new();
     private readonly Dictionary<(string Vhost, string Name), ExchangeInfo> _exchanges = [];
@@ -29,19 +32,108 @@ public sealed class InMemoryEngine : IRouteEngine
     // in-memory state: it resets on restart, so a queue restarts its idle clock.
     private readonly Dictionary<(string Vhost, string Queue), DateTimeOffset> _lastUsed = [];
 
+    private readonly BrokerDiagnostics _diagnostics;
+    private readonly IDisposable _readyGauge;
+    private readonly IDisposable _consumerGauge;
+    private bool _disposed;
+
     /// <summary>Creates the engine and predeclares, per vhost, the default exchange
     /// (empty name, direct type, durable) and <c>amq.direct</c> exactly as the real
     /// broker's internal declarations do. The declares run on empty dictionaries, so
-    /// their null returns are the creation contract of the compare-and-set.</summary>
-    public InMemoryEngine(IReadOnlyList<string> vhosts)
+    /// their null returns are the creation contract of the compare-and-set. A null
+    /// diagnostics instance becomes a private one owned by this engine's lifetime.</summary>
+    public InMemoryEngine(IReadOnlyList<string> vhosts, BrokerDiagnostics? diagnostics = null)
     {
         ArgumentNullException.ThrowIfNull(vhosts);
+        _diagnostics = diagnostics ?? new BrokerDiagnostics();
+        _readyGauge = _diagnostics.RegisterObservableGauge(
+            "redismq.messages.ready",
+            "{message}",
+            "Ready messages per queue.",
+            ObserveReady);
+        _consumerGauge = _diagnostics.RegisterObservableGauge(
+            "redismq.consumers",
+            "{consumer}",
+            "Registered consumers per queue.",
+            ObserveConsumers);
+
         foreach (string vhost in vhosts)
         {
             DeclareExchange(new ExchangeInfo(vhost, "", "direct", Durable: true));
             DeclareExchange(new ExchangeInfo(vhost, "amq.direct", "direct", Durable: true));
         }
     }
+
+    /// <summary>The diagnostics instance this engine emits to (never disposed here).</summary>
+    public BrokerDiagnostics Diagnostics => _diagnostics;
+
+    /// <summary>A memory engine is never durable and has no Redis connection to lose.</summary>
+    public EngineHealth GetEngineHealth() =>
+        new("memory", false, null, 0, 0, 0, null, null, null);
+
+    /// <summary>Every declared queue's ready and consumer counts under the engine gate;
+    /// unacked deliveries are connection state the server overlays.</summary>
+    public IReadOnlyList<QueueSnapshot> QueueSnapshots()
+    {
+        lock (_lock)
+        {
+            List<QueueSnapshot> snapshots = [];
+            foreach ((string vhost, string name) in _queues.Keys)
+            {
+                (int ready, int consumers) = CountsOf(vhost, name);
+                snapshots.Add(new QueueSnapshot(vhost, name, ready, consumers));
+            }
+
+            return snapshots;
+        }
+    }
+
+    /// <summary>Unregisters this engine's gauges; the shared diagnostics instance is
+    /// untouched. Idempotent.</summary>
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _readyGauge.Dispose();
+        _consumerGauge.Dispose();
+    }
+
+    private IEnumerable<Measurement<long>> ObserveReady()
+    {
+        lock (_lock)
+        {
+            foreach ((string vhost, string name) in _queues.Keys)
+            {
+                (int ready, _) = CountsOf(vhost, name);
+                yield return new Measurement<long>(
+                    ready,
+                    new TagList { { "vhost", vhost }, { "queue", name } });
+            }
+        }
+    }
+
+    private IEnumerable<Measurement<long>> ObserveConsumers()
+    {
+        lock (_lock)
+        {
+            foreach ((string vhost, string name) in _queues.Keys)
+            {
+                (_, int consumers) = CountsOf(vhost, name);
+                yield return new Measurement<long>(
+                    consumers,
+                    new TagList { { "vhost", vhost }, { "queue", name } });
+            }
+        }
+    }
+
+    private (int Ready, int Consumers) CountsOf(string vhost, string name) =>
+        _delivery.TryGetValue((vhost, name), out InMemoryQueue? delivery)
+            ? (delivery.ReadyCount, delivery.ConsumerCount)
+            : (0, 0);
 
     public ExchangeInfo? GetExchange(string vhost, string name)
     {

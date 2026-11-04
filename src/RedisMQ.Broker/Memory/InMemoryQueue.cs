@@ -32,6 +32,9 @@ internal sealed class InMemoryQueue
     /// (claimed/unacked messages are NOT here — the pump removed them at admit).</summary>
     internal int ReadyCount => _ready.Count;
 
+    /// <summary>Registered consumers, counted for the per-queue consumers gauge.</summary>
+    internal int ConsumerCount => _consumers.Count;
+
     internal bool HasConsumers => _consumers.Count > 0;
 
     /// <summary>Whether any consumer currently registered claimed the queue exclusively.</summary>
