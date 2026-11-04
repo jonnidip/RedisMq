@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.Linq;
 using System.Threading.Channels;
@@ -26,6 +28,17 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
     private readonly Task? _drainerTask;
     private readonly SemaphoreSlim? _drainerSlots;
     private readonly CancellationTokenSource _stopCts = new();
+
+    // Mirror health: written by the drainer and the protocol path, read under
+    // _healthLock by GetEngineHealth.
+    private readonly object _healthLock = new();
+    private long _mirrorFailures;
+    private long _mirrorDropped;
+    private DateTimeOffset? _lastMirrorFailureUtc;
+    private DateTimeOffset? _lastMirrorDropUtc;
+    private string? _lastError;
+    private bool _failureEpisode;
+    private IDisposable? _depthGauge;
 
     // Exclusive queue ownership and auto-delete consumer tracking for connection
     // teardown reconciliation.
@@ -65,6 +78,11 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
                 new BoundedChannelOptions(drainerCapacity) { FullMode = BoundedChannelFullMode.Wait });
             _drainerSlots = new SemaphoreSlim(drainerCapacity, drainerCapacity);
             _drainerTask = Task.Run(() => DrainAsync(_stopCts.Token));
+            _depthGauge = _diagnostics.RegisterObservableGauge(
+                "redismq.redis.drainer.depth",
+                "{command}",
+                "Commands queued in the Redis drainer.",
+                () => [new Measurement<long>(_channel!.Reader.Count)]);
         }
 
         if (enforceEvictionGate && redis is not null)
@@ -74,7 +92,19 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
 
         if (replayOnStart && redis is not null)
         {
-            ReplayAsync().GetAwaiter().GetResult();
+            try
+            {
+                ReplayAsync().GetAwaiter().GetResult();
+            }
+            catch
+            {
+                _diagnostics.Count(_diagnostics.RedisReplayFailures, new TagList());
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Error,
+                    BrokerLogEvent.RedisMirrorFailed,
+                    "redis replay failed");
+                throw;
+            }
         }
     }
 
@@ -84,21 +114,48 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
     /// exhaust it deterministically. Null when Redis is absent.</summary>
     internal SemaphoreSlim? DrainerSlotsForTest => _drainerSlots;
 
+    private Func<WriteCommand, Task>? _writeOverrideForTest;
+
+    /// <summary>Test seam: replaces the Redis write so a failure episode can be
+    /// induced deterministically. Null restores the real write path.</summary>
+    internal Func<WriteCommand, Task>? WriteOverrideForTest
+    {
+        get => Volatile.Read(ref _writeOverrideForTest);
+        set => Volatile.Write(ref _writeOverrideForTest, value);
+    }
+
+    /// <summary>Test seam: completes the drainer's writer so subsequent enqueues are
+    /// dropped as if the channel were closed. True when a channel exists.</summary>
+    internal bool CompleteDrainerForTest() => _channel?.Writer.TryComplete() ?? false;
+
     /// <summary>The diagnostics instance this engine emits to (never disposed here).</summary>
     public BrokerDiagnostics Diagnostics => _diagnostics;
 
-    /// <summary>Durability and connection state of the Redis backend. Mirror counters
-    /// are zero until the drainer instrumentation fills them (observability Task 7).</summary>
-    public EngineHealth GetEngineHealth() => new(
-        "redis",
-        _redis is not null,
-        _redis?.Multiplexer.IsConnected,
-        _channel?.Reader.Count ?? 0,
-        0,
-        0,
-        null,
-        null,
-        null);
+    /// <summary>Durability and connection state of the Redis backend, plus the
+    /// drainer's mirror-failure/drop counters and last sanitized error.</summary>
+    public EngineHealth GetEngineHealth()
+    {
+        DateTimeOffset? lastFailure;
+        DateTimeOffset? lastDrop;
+        string? lastError;
+        lock (_healthLock)
+        {
+            lastFailure = _lastMirrorFailureUtc;
+            lastDrop = _lastMirrorDropUtc;
+            lastError = _lastError;
+        }
+
+        return new EngineHealth(
+            "redis",
+            _redis is not null,
+            _redis?.Multiplexer.IsConnected,
+            _channel?.Reader.Count ?? 0,
+            Interlocked.Read(ref _mirrorFailures),
+            Interlocked.Read(ref _mirrorDropped),
+            lastFailure,
+            lastDrop,
+            lastError);
+    }
 
     /// <summary>Queue depth and consumer counts come from the inner memory store; both
     /// deployments report identical per-queue numbers.</summary>
@@ -177,6 +234,11 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
         {
             // Backpressure contract: no slot means the mirror cannot promise
             // durability, so the publish is refused before it touches memory.
+            _diagnostics.Count(_diagnostics.RedisDrainerSaturated, new TagList());
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Warning,
+                BrokerLogEvent.DrainerSaturated,
+                "publish refused: redis drainer saturated");
             return new EnqueueReceipt(0, ValueTask.FromResult(false), []);
         }
 
@@ -201,6 +263,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
         {
             _drainerSlots.Release();
             completion.TrySetResult(false);
+            CountMirrorDropped(command);
             return new EnqueueReceipt(memoryReceipt.EnvelopeId, ValueTask.FromResult(false), memoryReceipt.DroppedEnvelopeIds);
         }
 
@@ -208,8 +271,12 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
         {
             // x-max-length evictions are mirrored best-effort: a missed removal can
             // resurrect a dropped message on replay, but never lose a live one.
-            _ = _channel.Writer.TryWrite(WriteCommand.Remove(
-                vhost, queue, [.. memoryReceipt.DroppedEnvelopeIds]));
+            WriteCommand remove = WriteCommand.Remove(
+                vhost, queue, [.. memoryReceipt.DroppedEnvelopeIds]);
+            if (!_channel.Writer.TryWrite(remove))
+            {
+                CountMirrorDropped(remove);
+            }
         }
 
         return new EnqueueReceipt(
@@ -328,7 +395,11 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
             return;
         }
 
-        _ = _channel.Writer.TryWrite(batch.Count == 1 ? batch[0] : WriteCommand.Delta([.. batch]));
+        WriteCommand outgoing = batch.Count == 1 ? batch[0] : WriteCommand.Delta([.. batch]);
+        if (!_channel.Writer.TryWrite(outgoing))
+        {
+            CountMirrorDropped(outgoing);
+        }
     }
 
     /// <summary>The publish path's absolute deadline from the AMQP relative
@@ -397,7 +468,30 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
         // Bounded channel with Wait full mode: applies backpressure on the
         // protocol thread when Redis can't keep up, but never blocks on Redis
         // directly.
-        _ = _channel.Writer.TryWrite(command);
+        if (!_channel.Writer.TryWrite(command))
+        {
+            CountMirrorDropped(command);
+        }
+    }
+
+    /// <summary>Records one command the drainer channel would not accept. A dropped
+    /// command degrades the mirror but not readiness: memory is still the system of
+    /// record.</summary>
+    private void CountMirrorDropped(WriteCommand command)
+    {
+        Interlocked.Increment(ref _mirrorDropped);
+        lock (_healthLock)
+        {
+            _lastMirrorDropUtc = DateTimeOffset.UtcNow;
+        }
+
+        _diagnostics.Count(
+            _diagnostics.RedisMirrorDropped,
+            new TagList
+            {
+                { "kind", command.Kind.ToString() },
+                { "reason", "channel_full" },
+            });
     }
 
     private async Task DrainAsync(CancellationToken ct)
@@ -405,17 +499,45 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
         await foreach (var command in _channel!.Reader.ReadAllAsync(ct))
         {
             bool succeeded = true;
+            long started = Stopwatch.GetTimestamp();
             try
             {
                 await WriteCommandToRedisAsync(command);
+                if (_failureEpisode)
+                {
+                    _failureEpisode = false;
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Information,
+                        BrokerLogEvent.RedisMirrorRecovered,
+                        "redis mirror recovered");
+                }
             }
-            catch
+            catch (Exception ex)
             {
                 // Drainer is best-effort: memory is the system of record. A
                 // transient Redis failure drops the mirrored write; the in-memory
                 // state is already updated, and a waiting publisher is told the
                 // truth (confirm.nack) rather than a lie.
                 succeeded = false;
+                Interlocked.Increment(ref _mirrorFailures);
+                string error = SanitizeMirrorError(ex);
+                lock (_healthLock)
+                {
+                    _lastMirrorFailureUtc = DateTimeOffset.UtcNow;
+                    _lastError = error;
+                }
+
+                if (!_failureEpisode)
+                {
+                    _failureEpisode = true;
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Error,
+                        BrokerLogEvent.RedisMirrorFailed,
+                        "redis mirror write failed",
+                        ex,
+                        new KeyValuePair<string, object?>("kind", command.Kind.ToString()),
+                        new KeyValuePair<string, object?>("error", error));
+                }
             }
             finally
             {
@@ -424,13 +546,45 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
                     _drainerSlots!.Release();
                 }
 
+                _diagnostics.Count(
+                    _diagnostics.RedisMirrorCommands,
+                    new TagList
+                    {
+                        { "kind", command.Kind.ToString() },
+                        { "outcome", succeeded ? "success" : "failure" },
+                    });
+                _diagnostics.Measure(
+                    _diagnostics.RedisMirrorDuration,
+                    Stopwatch.GetElapsedTime(started).TotalSeconds,
+                    new TagList { { "kind", command.Kind.ToString() } });
+
                 command.Completion?.TrySetResult(succeeded);
             }
         }
     }
 
+    /// <summary>The first line of a failure message, bounded to 200 characters.
+    /// Health reports this, never a stack trace or a connection string.</summary>
+    private static string SanitizeMirrorError(Exception ex)
+    {
+        string message = ex.Message.Length > 0 ? ex.Message : ex.GetType().Name;
+        int newline = message.IndexOfAny(['\r', '\n']);
+        if (newline >= 0)
+        {
+            message = message[..newline];
+        }
+
+        return message.Length <= 200 ? message : message[..200];
+    }
+
     private async Task WriteCommandToRedisAsync(WriteCommand command)
     {
+        if (WriteOverrideForTest is { } write)
+        {
+            await write(command);
+            return;
+        }
+
         ArgumentNullException.ThrowIfNull(_redis);
         var fields = command.Kind == WriteCommandKind.Delta ? [] : command.ToStreamFields();
 
@@ -743,6 +897,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
                 record.ExpiresAt,
                 record.DeliveryCount);
             _memory.ReplayEnqueue(vhost, queueName, message);
+            _diagnostics.Count(_diagnostics.RedisReplayMessages, new TagList());
 
             lock (_streamIdsLock)
             {
@@ -793,6 +948,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
             }
         }
 
+        _depthGauge?.Dispose();
         _memory.Dispose();
     }
 }
