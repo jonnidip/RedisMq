@@ -768,8 +768,9 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
     /// <summary>Hands one publish outcome to the confirm loop. The deliberate blocking
     /// wait is the backpressure contract: when every slot is held the frame pump stops
-    /// reading, so Redis receives no new publishes and no confirm is invented. A
-    /// cancelled connection drops the entry silently.</summary>
+    /// reading, so Redis receives no new publishes and no confirm is invented. Any entry
+    /// the pipeline cannot admit has its <c>amqp.publish</c> span stopped as dropped, so
+    /// no span outlives its connection.</summary>
     void IChannelDeliveryHost.EnqueueConfirm(PendingConfirm confirm)
     {
         ArgumentNullException.ThrowIfNull(confirm);
@@ -778,6 +779,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         Channel<PendingConfirm>? queue = _confirmQueue;
         if (slots is null || queue is null)
         {
+            BrokerDiagnostics.StopActivity(confirm.Activity, "dropped");
             return;
         }
 
@@ -787,13 +789,26 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         }
         catch (OperationCanceledException)
         {
+            BrokerDiagnostics.StopActivity(confirm.Activity, "dropped");
             return; // connection ending: no outcome can be observed
         }
 
         if (!queue.Writer.TryWrite(confirm))
         {
             slots.Release(); // loop gone (shutdown): do not leak the permit
+            BrokerDiagnostics.StopActivity(confirm.Activity, "dropped");
         }
+    }
+
+    /// <summary>The confirm loop's per-entry result: the wire outcome it wrote, or
+    /// <see cref="Dropped"/> when the channel had already retired (no metric, span
+    /// stopped as dropped).</summary>
+    private enum ConfirmOutcome
+    {
+        Ack,
+        Nack,
+        Timeout,
+        Dropped,
     }
 
     private async Task RunConfirmLoopAsync(ChannelReader<PendingConfirm> reader, CancellationToken ct)
@@ -804,13 +819,21 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             {
                 while (reader.TryRead(out PendingConfirm? confirm))
                 {
+                    string outcome = "dropped";
                     try
                     {
-                        await ProcessConfirmAsync(confirm, ct);
+                        ConfirmOutcome result = await ProcessConfirmAsync(confirm, ct);
+                        outcome = result switch
+                        {
+                            ConfirmOutcome.Ack => "ack",
+                            ConfirmOutcome.Nack => "nack",
+                            ConfirmOutcome.Timeout => "timeout",
+                            _ => "dropped",
+                        };
                     }
                     catch (OperationCanceledException) when (ct.IsCancellationRequested)
                     {
-                        return;
+                        throw;
                     }
                     catch
                     {
@@ -818,6 +841,10 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
                     }
                     finally
                     {
+                        BrokerDiagnostics.StopActivity(
+                            confirm.Activity,
+                            outcome,
+                            error: outcome is "nack" or "timeout");
                         _confirmSlots?.Release();
                     }
                 }
@@ -827,15 +854,28 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         {
             // Connection teardown: pending outcomes are intentionally discarded.
         }
+        finally
+        {
+            // Drain whatever was admitted but never processed: every owned span must be
+            // stopped exactly once, even when the connection ends with work queued.
+            while (reader.TryRead(out PendingConfirm? leftover))
+            {
+                BrokerDiagnostics.StopActivity(leftover.Activity, "dropped");
+                _confirmSlots?.Release();
+            }
+        }
     }
 
     /// <summary>Waits for every receipt in the entry, then writes the outcome in publish
     /// order: the mandatory return first, then confirm.ack (all durable/empty) or
     /// confirm.nack (any refusal, fault or timeout). Timeout is not cancellation: a
-    /// timed-out XADD may still land, which is documented at-least-once behavior.</summary>
-    private async Task ProcessConfirmAsync(PendingConfirm confirm, CancellationToken ct)
+    /// timed-out XADD may still land, which is documented at-least-once behavior.
+    /// Metrics/span tags are emitted only for a live channel; a retired one is dropped
+    /// without inventing an outcome.</summary>
+    private async Task<ConfirmOutcome> ProcessConfirmAsync(PendingConfirm confirm, CancellationToken ct)
     {
         bool ack;
+        bool timedOut = false;
         try
         {
             if (confirm.Receipts.Count == 0)
@@ -857,6 +897,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         catch (TimeoutException)
         {
             ack = false;
+            timedOut = true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -873,7 +914,45 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             || !ReferenceEquals(current, confirm.Channel)
             || !current.IsOpen)
         {
-            return;
+            return ConfirmOutcome.Dropped;
+        }
+
+        ConfirmOutcome outcome = timedOut
+            ? ConfirmOutcome.Timeout
+            : ack ? ConfirmOutcome.Ack : ConfirmOutcome.Nack;
+        string outcomeName = outcome switch
+        {
+            ConfirmOutcome.Ack => "ack",
+            ConfirmOutcome.Timeout => "timeout",
+            _ => "nack",
+        };
+
+        _diagnostics.Count(
+            _diagnostics.Confirms,
+            new TagList { { "outcome", outcomeName } });
+        if (confirm.StartedTimestamp != 0)
+        {
+            _diagnostics.Measure(
+                _diagnostics.ConfirmDuration,
+                Stopwatch.GetElapsedTime(confirm.StartedTimestamp).TotalSeconds,
+                new TagList());
+        }
+
+        if (outcome is ConfirmOutcome.Nack or ConfirmOutcome.Timeout)
+        {
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Warning,
+                outcome is ConfirmOutcome.Timeout
+                    ? BrokerLogEvent.ConfirmTimeout
+                    : BrokerLogEvent.ConfirmNack,
+                outcome is ConfirmOutcome.Timeout
+                    ? "publish confirm timed out"
+                    : "publish confirm refused",
+                data:
+                [
+                    new KeyValuePair<string, object?>("sequence", confirm.Sequence),
+                    new KeyValuePair<string, object?>("channel", confirm.ChannelNumber),
+                ]);
         }
 
         if (confirm.ReturnFirst is { } returned)
@@ -883,6 +962,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
 
         confirm.Channel.ScheduleConfirmResult(confirm.Sequence, ack);
         await confirm.Channel.FlushWriterChainAsync(ct);
+        return outcome;
     }
 
     /// <summary>Sends the server's channel.close for a soft error; the channel stays

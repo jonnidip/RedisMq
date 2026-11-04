@@ -1,5 +1,6 @@
 namespace RedisMQ.Broker.Server;
 
+using System.Diagnostics;
 using RedisMQ.Broker.Memory;
 
 /// <summary>
@@ -17,9 +18,15 @@ using RedisMQ.Broker.Memory;
 /// unroutable publish. No receipt means "nothing to persist".</param>
 /// <param name="ReturnFirst">The mandatory-unroutable basic.return, written before
 /// the confirm for the same sequence.</param>
+/// <param name="StartedTimestamp">The <see cref="Stopwatch"/> timestamp taken when
+/// the content dispatch began; the confirm loop turns it into the confirm duration.</param>
+/// <param name="Activity">The <c>amqp.publish</c> span this publish owns; the confirm
+/// loop stops it exactly once (the channel stops only the non-confirm case).</param>
 public sealed record PendingConfirm(
     ChannelContext Channel,
     ushort ChannelNumber,
     long Sequence,
     IReadOnlyList<EnqueueReceipt> Receipts,
-    ChannelOutcomeBasicReturn? ReturnFirst);
+    ChannelOutcomeBasicReturn? ReturnFirst,
+    long StartedTimestamp = 0,
+    Activity? Activity = null);

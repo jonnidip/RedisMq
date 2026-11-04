@@ -498,7 +498,10 @@ public sealed class ChannelContext
     /// <summary>The content is whole: rabbit_channel's publish dispatch in order —
     /// immediate first, then lookup_or_die, then routing and the engine hand-off (or
     /// the mandatory/unroutable return). The pending sequence is already back in the
-    /// expect-method state when any reply frame of this decision leaves the wire.</summary>
+    /// expect-method state when any reply frame of this decision leaves the wire.
+    /// Diagnostics count one publish outcome (and one size) per completed dispatch and
+    /// own the <c>amqp.publish</c> span: inline for a non-confirm channel, handed to the
+    /// confirm loop otherwise.</summary>
     private ChannelOutcome FinishPublish()
     {
         AmqpMethod method = _pendingPublish!;
@@ -508,88 +511,171 @@ public sealed class ChannelContext
         var pendingConfirmSequence = _pendingConfirmSequence;
         ResetPendingContent();
 
-        // rabbit_channel: handle_method(#'basic.publish'{immediate = true}, ...)
-        // exits protocol_error(not_implemented, "immediate=true") — hard, and it
-        // receives the already-assembled content, before any exchange lookup.
-        if (method.Get("immediate") is true)
-        {
-            return new ChannelOutcomeHardError(
-                AmqpConstants.NotImplemented,
-                "NOT_IMPLEMENTED - immediate=true",
-                method.ClassId, method.MethodId);
-        }
-
         string exchangeName = method.Get("exchange") as string ?? string.Empty;
         string routingKey = method.Get("routing-key") as string ?? string.Empty;
 
-        // check_write_permitted runs before lookup_or_die. On the default exchange
-        // the routing key names the queue the write is checked against.
-        if (!CanWrite(exchangeName.Length == 0 ? routingKey : exchangeName))
+        Activity? activity = _diagnostics.StartPublishActivity(
+            _vhost, exchangeName, routingKey, body.Length);
+        _diagnostics.Measure(
+            _diagnostics.PublishSize,
+            body.Length,
+            new TagList { { "vhost", _vhost } });
+
+        string outcome = "error";
+        ExchangeInfo? resolvedExchange = null;
+        bool recorded = false;
+        bool handedOff = false;
+
+        // One count (and one span tag) per dispatch, whatever path it takes.
+        void RecordOutcome()
         {
-            return PermissionRefused("write", "exchange", exchangeName.Length == 0 ? routingKey : exchangeName, method);
-        }
-
-        // lookup_or_die happens after the full content assembly (it receives the
-        // content), not-found being the ordinary soft 404.
-        ExchangeInfo? exchange = _engine.GetExchange(_vhost, exchangeName);
-        if (exchange is null)
-        {
-            return NotFound(kind: "exchange", exchangeName, method);
-        }
-
-        // rabbit_exchange's default-exchange clause: the queue resource NAMED by the
-        // routing key, no binding table — an absent queue is unroutable, NOT a
-        // not-found (verified in the source; see the Task 6 report).
-        IReadOnlyList<string> targets = exchangeName.Length == 0
-            ? (_engine.GetQueue(_vhost, routingKey) is null ? [] : [routingKey])
-            : _engine.RouteTo(exchange, header.Properties, routingKey);
-
-        ChannelOutcomeBasicReturn? returnFirst = null;
-        List<EnqueueReceipt> receipts = [];
-
-        if (targets.Count == 0)
-        {
-            // process_routing_mandatory: mandatory + nothing routed → basic.return
-            // (no_route) carrying the publishing origin and the full content back;
-            // non-mandatory → messages_unroutable_dropped, just an ack. In confirm
-            // mode the return rides the confirm loop so it stays ordered with the
-            // ack for the same sequence; otherwise it goes out inline.
-            if (method.Get("mandatory") is true)
+            if (recorded)
             {
-                returnFirst = new ChannelOutcomeBasicReturn(
-                    NewMethod("basic.return", basicReturn =>
-                    {
-                        basicReturn.Set("reply-code", (short)AmqpConstants.NoRoute); // NO_ROUTE
-                        basicReturn.Set("reply-text", "NO_ROUTE");
-                        basicReturn.Set("exchange", exchangeName);
-                        basicReturn.Set("routing-key", routingKey);
-                    }),
-                    header.Properties,
-                    body);
+                return;
+            }
+
+            recorded = true;
+            TagList tags = new() { { "vhost", _vhost }, { "outcome", outcome } };
+            if (exchangeName.Length > 0)
+            {
+                tags.Add("exchange", exchangeName);
+            }
+
+            if (resolvedExchange is not null)
+            {
+                tags.Add("exchange_type", resolvedExchange.Type);
+            }
+
+            _diagnostics.Count(_diagnostics.Publishes, tags);
+            activity?.SetTag("redismq.publish.outcome", outcome);
+        }
+
+        try
+        {
+            // rabbit_channel: handle_method(#'basic.publish'{immediate = true}, ...)
+            // exits protocol_error(not_implemented, "immediate=true") — hard, and it
+            // receives the already-assembled content, before any exchange lookup.
+            if (method.Get("immediate") is true)
+            {
+                outcome = "refused";
+                return new ChannelOutcomeHardError(
+                    AmqpConstants.NotImplemented,
+                    "NOT_IMPLEMENTED - immediate=true",
+                    method.ClassId, method.MethodId);
+            }
+
+            // check_write_permitted runs before lookup_or_die. On the default exchange
+            // the routing key names the queue the write is checked against.
+            if (!CanWrite(exchangeName.Length == 0 ? routingKey : exchangeName))
+            {
+                outcome = "refused";
+                return PermissionRefused("write", "exchange", exchangeName.Length == 0 ? routingKey : exchangeName, method);
+            }
+
+            // lookup_or_die happens after the full content assembly (it receives the
+            // content), not-found being the ordinary soft 404.
+            ExchangeInfo? exchange = _engine.GetExchange(_vhost, exchangeName);
+            if (exchange is null)
+            {
+                outcome = "refused";
+                return NotFound(kind: "exchange", exchangeName, method);
+            }
+
+            resolvedExchange = exchange;
+
+            // rabbit_exchange's default-exchange clause: the queue resource NAMED by the
+            // routing key, no binding table — an absent queue is unroutable, NOT a
+            // not-found (verified in the source; see the Task 6 report).
+            IReadOnlyList<string> targets = exchangeName.Length == 0
+                ? (_engine.GetQueue(_vhost, routingKey) is null ? [] : [routingKey])
+                : _engine.RouteTo(exchange, header.Properties, routingKey);
+
+            ChannelOutcomeBasicReturn? returnFirst = null;
+            List<EnqueueReceipt> receipts = [];
+
+            if (targets.Count == 0)
+            {
+                // process_routing_mandatory: mandatory + nothing routed → basic.return
+                // (no_route) carrying the publishing origin and the full content back;
+                // non-mandatory → messages_unroutable_dropped, just an ack. In confirm
+                // mode the return rides the confirm loop so it stays ordered with the
+                // ack for the same sequence; otherwise it goes out inline.
+                if (method.Get("mandatory") is true)
+                {
+                    outcome = "mandatory_return";
+                    returnFirst = new ChannelOutcomeBasicReturn(
+                        NewMethod("basic.return", basicReturn =>
+                        {
+                            basicReturn.Set("reply-code", (short)AmqpConstants.NoRoute); // NO_ROUTE
+                            basicReturn.Set("reply-text", "NO_ROUTE");
+                            basicReturn.Set("exchange", exchangeName);
+                            basicReturn.Set("routing-key", routingKey);
+                        }),
+                        header.Properties,
+                        body);
+                }
+                else
+                {
+                    outcome = "unroutable";
+                }
+            }
+            else
+            {
+                outcome = "routed";
+                foreach (string queue in targets)
+                {
+                    // One engine entry per routed queue, in binding-insertion order; the
+                    // body ownership may move because the engine stores its own defensive copy.
+                    receipts.Add(_engine.Enqueue(_vhost, queue, header.Properties, body, exchangeName, routingKey));
+                }
+
+                // An engine refusal (drainer exhaustion, storage rejection) is reported
+                // as EnvelopeId 0; the publish outcome is refused even if other queues
+                // accepted a copy.
+                if (receipts.Exists(static receipt => receipt.EnvelopeId == 0))
+                {
+                    outcome = "refused";
+                }
+            }
+
+            if (!_confirmMode)
+            {
+                // Non-confirm channel: today's inline basic.return (or silence) and no confirms.
+                return (ChannelOutcome?)returnFirst ?? new ChannelOutcomeSilent();
+            }
+
+            // One ordered outcome for every publish on a confirm-mode channel: the
+            // connection's confirm loop awaits the receipts, then writes the return
+            // (if any) followed by confirm.ack/nack for this sequence. Record before the
+            // hand-off so the span carries the dispatch outcome even if the loop stops it
+            // immediately.
+            RecordOutcome();
+            long sequence = pendingConfirmSequence ?? ++_confirmSequence;
+            _host.EnqueueConfirm(new PendingConfirm(
+                this,
+                _channel,
+                sequence,
+                receipts,
+                returnFirst,
+                StartedTimestamp: Stopwatch.GetTimestamp(),
+                Activity: activity));
+            handedOff = true;
+            return new ChannelOutcomeSilent(); // basic.publish never replies on success
+        }
+        catch
+        {
+            outcome = "error";
+            throw;
+        }
+        finally
+        {
+            RecordOutcome();
+            if (!handedOff)
+            {
+                BrokerDiagnostics.StopActivity(
+                    activity, outcome, error: outcome is "refused" or "error");
             }
         }
-        else
-        {
-            foreach (string queue in targets)
-            {
-                // One engine entry per routed queue, in binding-insertion order; the
-                // body ownership may move because the engine stores its own defensive copy.
-                receipts.Add(_engine.Enqueue(_vhost, queue, header.Properties, body, exchangeName, routingKey));
-            }
-        }
-
-        if (!_confirmMode)
-        {
-            // Non-confirm channel: today's inline basic.return (or silence) and no confirms.
-            return (ChannelOutcome?)returnFirst ?? new ChannelOutcomeSilent();
-        }
-
-        // One ordered outcome for every publish on a confirm-mode channel: the
-        // connection's confirm loop awaits the receipts, then writes the return
-        // (if any) followed by confirm.ack/nack for this sequence.
-        long sequence = pendingConfirmSequence ?? ++_confirmSequence;
-        _host.EnqueueConfirm(new PendingConfirm(this, _channel, sequence, receipts, returnFirst));
-        return new ChannelOutcomeSilent(); // basic.publish never replies on success
     }
 
     private void ResetPendingContent()
