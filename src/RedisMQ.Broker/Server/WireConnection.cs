@@ -935,7 +935,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             _diagnostics.Measure(
                 _diagnostics.ConfirmDuration,
                 Stopwatch.GetElapsedTime(confirm.StartedTimestamp).TotalSeconds,
-                new TagList());
+                new TagList { { "outcome", outcomeName } });
         }
 
         if (outcome is ConfirmOutcome.Nack or ConfirmOutcome.Timeout)

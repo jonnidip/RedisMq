@@ -1399,16 +1399,54 @@ public sealed class ChannelContext
             // consumer path).
             _engine.Acknowledge(_vhost, queue, claimed);
         }
-
-        ScheduleWriterJob(() => _host.WriteMethodToWireAsync(_channel, NewMethod("basic.get-ok", ok =>
+        else
         {
-            ok.Set("delivery-tag", tag);
-            ok.Set("redelivered", claimed.Redelivered);
-            ok.Set("message-count", remaining);
-            ok.Set("exchange", claimed.Exchange);
-            ok.Set("routing-key", claimed.RoutingKey);
-        }), default));
-        ScheduleWriterJob(() => _host.WriteContentToWireAsync(_channel, claimed.Props, claimed.Body, default));
+            _runtime.DeliveryClaimed(_vhost, queue);
+        }
+
+        _diagnostics.Count(
+            _diagnostics.Deliveries,
+            new TagList
+            {
+                { "vhost", _vhost },
+                { "queue", queue },
+                { "auto_ack", noAck ? "true" : "false" },
+            });
+        Activity? activity = _diagnostics.StartDeliverActivity(
+            _vhost, queue, tag, claimed.Redelivered, claimed.Body.Length);
+
+        ScheduleWriterJob(async () =>
+        {
+            bool failed = false;
+            try
+            {
+                await _host.WriteMethodToWireAsync(_channel, NewMethod("basic.get-ok", ok =>
+                {
+                    ok.Set("delivery-tag", tag);
+                    ok.Set("redelivered", claimed.Redelivered);
+                    ok.Set("message-count", remaining);
+                    ok.Set("exchange", claimed.Exchange);
+                    ok.Set("routing-key", claimed.RoutingKey);
+                }), default);
+                await _host.WriteContentToWireAsync(_channel, claimed.Props, claimed.Body, default);
+            }
+            catch (Exception ex)
+            {
+                failed = true;
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Warning,
+                    BrokerLogEvent.DeliveryFailed,
+                    "get write failed",
+                    ex,
+                    new KeyValuePair<string, object?>("queue", queue));
+                throw;
+            }
+            finally
+            {
+                BrokerDiagnostics.StopActivity(
+                    activity, failed ? "error" : "delivered", error: failed);
+            }
+        });
         return ChannelOutcomeChain.Instance;
     }
 
@@ -1423,15 +1461,28 @@ public sealed class ChannelContext
     /// the tail order stable. Credit freed → the channel's consumer queues are
     /// nudged (a pump idled out on the gate re-spawns).</summary>
     private ChannelOutcome OnBasicAck(AmqpMethod method) =>
-        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, method.Get("multiple") is true, SettleAction.Ack);
+        SettleLedger(
+            method,
+            method.Get("delivery-tag") as long? ?? 0L,
+            method.Get("multiple") is true,
+            SettleAction.Ack,
+            "ack");
 
     private ChannelOutcome OnBasicReject(AmqpMethod method) =>
-        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, multiple: false,
-            method.Get("requeue") is true ? SettleAction.Requeue : SettleAction.Reject);
+        SettleLedger(
+            method,
+            method.Get("delivery-tag") as long? ?? 0L,
+            multiple: false,
+            method.Get("requeue") is true ? SettleAction.Requeue : SettleAction.Reject,
+            "reject");
 
     private ChannelOutcome OnBasicNack(AmqpMethod method) =>
-        SettleLedger(method, method.Get("delivery-tag") as long? ?? 0L, method.Get("multiple") is true,
-            method.Get("requeue") is true ? SettleAction.Requeue : SettleAction.Reject);
+        SettleLedger(
+            method,
+            method.Get("delivery-tag") as long? ?? 0L,
+            method.Get("multiple") is true,
+            method.Get("requeue") is true ? SettleAction.Requeue : SettleAction.Reject,
+            "nack");
 
     /// <summary>What a settle does to each ledger entry: ack drops it, reject drops
     /// it without requeue, requeue returns it to the queue tail.</summary>
@@ -1442,7 +1493,12 @@ public sealed class ChannelContext
         Requeue,
     }
 
-    private ChannelOutcome SettleLedger(AmqpMethod method, long tag, bool multiple, SettleAction action)
+    private ChannelOutcome SettleLedger(
+        AmqpMethod method,
+        long tag,
+        bool multiple,
+        SettleAction action,
+        string wireMethod)
     {
         List<Unacked> settled = [];
         lock (_deliveryLock)
@@ -1515,6 +1571,24 @@ public sealed class ChannelContext
         }
 
         NudgeChannelQueues();
+
+        // One settlement per ledger entry, tagged by the effective action and the wire
+        // verb that asked for it; the unacked gauge falls by exactly one per entry.
+        string kind = action.ToString().ToLowerInvariant();
+        foreach (Unacked entry in settled)
+        {
+            _diagnostics.Count(
+                _diagnostics.Settlements,
+                new TagList
+                {
+                    { "vhost", _vhost },
+                    { "queue", entry.Queue },
+                    { "kind", kind },
+                    { "method", wireMethod },
+                });
+            _runtime.DeliverySettled(_vhost, entry.Queue);
+        }
+
         return new ChannelOutcomeSilent();
     }
 
@@ -1541,6 +1615,13 @@ public sealed class ChannelContext
             plan.Sort(static (left, right) => left.Tag.CompareTo(right.Tag));
             _unacked.Clear();
             _outstandingBytes = 0;
+        }
+
+        // recover settles this channel's whole ledger without one of the three settle
+        // verbs, so the gauge falls here but no `redismq.settlements` series is emitted.
+        foreach (Unacked entry in plan)
+        {
+            _runtime.DeliverySettled(_vhost, entry.Queue);
         }
 
         // recover-ok's write goes first, the requeue plan second: the chain keeps the
@@ -1587,6 +1668,15 @@ public sealed class ChannelContext
         {
             consumers = _consumerQueues.Select(pair => (pair.Value, pair.Key)).ToList();
             plan = _unacked.Values.ToList();
+            // Clear the ledger here so a late settle on the retired channel cannot
+            // decrement the gauge a second time.
+            _unacked.Clear();
+            _outstandingBytes = 0;
+        }
+
+        foreach (Unacked entry in plan)
+        {
+            _runtime.DeliverySettled(_vhost, entry.Queue);
         }
 
         foreach ((string queue, string tag) in consumers)
@@ -1774,16 +1864,55 @@ public sealed class ChannelContext
                     deliverRecord.Set("routing-key", message.RoutingKey);
                 });
 
-                owner.ScheduleWriterJob(() => owner._host.WriteDeliveryToWireAsync(
-                    owner._channel, deliver, message.Props, message.Body, default));
+                owner._diagnostics.Count(
+                    owner._diagnostics.Deliveries,
+                    new TagList
+                    {
+                        { "vhost", owner._vhost },
+                        { "queue", queueName },
+                        { "auto_ack", autoAck ? "true" : "false" },
+                    });
+                Activity? activity = owner._diagnostics.StartDeliverActivity(
+                    owner._vhost, queueName, deliveryTag, message.Redelivered, message.Body.Length);
+
+                owner.ScheduleWriterJob(async () =>
+                {
+                    bool failed = false;
+                    try
+                    {
+                        await owner._host.WriteDeliveryToWireAsync(
+                            owner._channel, deliver, message.Props, message.Body, default);
+                    }
+                    catch (Exception ex)
+                    {
+                        failed = true;
+                        owner._diagnostics.WriteLog(
+                            BrokerLogLevel.Warning,
+                            BrokerLogEvent.DeliveryFailed,
+                            "delivery write failed",
+                            ex,
+                            new KeyValuePair<string, object?>("queue", queueName));
+                        throw;
+                    }
+                    finally
+                    {
+                        BrokerDiagnostics.StopActivity(
+                            activity, failed ? "error" : "delivered", error: failed);
+                    }
+                });
             }
 
-            // Auto-ack mirrors the settle: the durable copy is removed as soon as the
-            // message is handed out. Outside _deliveryLock to keep the lock ladder
-            // one-way (the pump holds the engine gate while taking _deliveryLock).
             if (autoAck)
             {
+                // Auto-ack mirrors the settle: the durable copy is removed as soon as the
+                // message is handed out. Outside _deliveryLock to keep the lock ladder
+                // one-way (the pump holds the engine gate while taking _deliveryLock).
                 owner._engine.Acknowledge(owner._vhost, queueName, message);
+            }
+            else
+            {
+                // Manual delivery: the one unacked entry this admission created.
+                owner._runtime.DeliveryClaimed(owner._vhost, queueName);
             }
 
             return true;
