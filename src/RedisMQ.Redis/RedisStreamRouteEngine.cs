@@ -85,26 +85,53 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
                 () => [new Measurement<long>(_channel!.Reader.Count)]);
         }
 
-        if (enforceEvictionGate && redis is not null)
+        try
         {
-            CheckEvictionPolicy();
-        }
+            if (enforceEvictionGate && redis is not null)
+            {
+                CheckEvictionPolicy();
+            }
 
-        if (replayOnStart && redis is not null)
+            if (replayOnStart && redis is not null)
+            {
+                try
+                {
+                    ReplayAsync().GetAwaiter().GetResult();
+                }
+                catch
+                {
+                    _diagnostics.Count(_diagnostics.RedisReplayFailures, new TagList());
+                    if (_diagnostics.IsLogEnabled(BrokerLogLevel.Error))
+                    {
+                        _diagnostics.WriteLog(
+                            BrokerLogLevel.Error,
+                            BrokerLogEvent.RedisMirrorFailed,
+                            "redis replay failed");
+                    }
+
+                    throw;
+                }
+            }
+        }
+        catch
         {
-            try
+            // Construction failed after the drainer and its gauge were created: the
+            // caller has no instance to dispose, so unwind them here rather than let
+            // the task and the gauge outlive a half-built engine.
+            _stopCts.Cancel();
+            _depthGauge?.Dispose();
+            if (_drainerTask is not null)
             {
-                ReplayAsync().GetAwaiter().GetResult();
+                _ = _drainerTask.ContinueWith(
+                    static task => _ = task.Exception,
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted
+                        | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
             }
-            catch
-            {
-                _diagnostics.Count(_diagnostics.RedisReplayFailures, new TagList());
-                _diagnostics.WriteLog(
-                    BrokerLogLevel.Error,
-                    BrokerLogEvent.RedisMirrorFailed,
-                    "redis replay failed");
-                throw;
-            }
+
+            _memory.Dispose();
+            throw;
         }
     }
 
@@ -235,10 +262,14 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
             // Backpressure contract: no slot means the mirror cannot promise
             // durability, so the publish is refused before it touches memory.
             _diagnostics.Count(_diagnostics.RedisDrainerSaturated, new TagList());
-            _diagnostics.WriteLog(
-                BrokerLogLevel.Warning,
-                BrokerLogEvent.DrainerSaturated,
-                "publish refused: redis drainer saturated");
+            if (_diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
+            {
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Warning,
+                    BrokerLogEvent.DrainerSaturated,
+                    "publish refused: redis drainer saturated");
+            }
+
             return new EnqueueReceipt(0, ValueTask.FromResult(false), []);
         }
 
@@ -476,8 +507,9 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
 
     /// <summary>Records one command the drainer channel would not accept. A dropped
     /// command degrades the mirror but not readiness: memory is still the system of
-    /// record.</summary>
-    private void CountMirrorDropped(WriteCommand command)
+    /// record. <paramref name="reason"/> distinguishes a full channel during normal
+    /// operation from commands abandoned at shutdown.</summary>
+    private void CountMirrorDropped(WriteCommand command, string reason = "channel_full")
     {
         Interlocked.Increment(ref _mirrorDropped);
         lock (_healthLock)
@@ -490,7 +522,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
             new TagList
             {
                 { "kind", command.Kind.ToString() },
-                { "reason", "channel_full" },
+                { "reason", reason },
             });
     }
 
@@ -498,6 +530,15 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
     {
         await foreach (var command in _channel!.Reader.ReadAllAsync(ct))
         {
+            // Shutdown stops starting new mirror writes. The reader still yields
+            // commands that were buffered before cancellation, so account each one
+            // here instead of letting the write run after DisposeAsync began.
+            if (ct.IsCancellationRequested)
+            {
+                AbandonWrite(command);
+                continue;
+            }
+
             bool succeeded = true;
             long started = Stopwatch.GetTimestamp();
             try
@@ -506,10 +547,13 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
                 if (_failureEpisode)
                 {
                     _failureEpisode = false;
-                    _diagnostics.WriteLog(
-                        BrokerLogLevel.Information,
-                        BrokerLogEvent.RedisMirrorRecovered,
-                        "redis mirror recovered");
+                    if (_diagnostics.IsLogEnabled(BrokerLogLevel.Information))
+                    {
+                        _diagnostics.WriteLog(
+                            BrokerLogLevel.Information,
+                            BrokerLogEvent.RedisMirrorRecovered,
+                            "redis mirror recovered");
+                    }
                 }
             }
             catch (Exception ex)
@@ -530,13 +574,16 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
                 if (!_failureEpisode)
                 {
                     _failureEpisode = true;
-                    _diagnostics.WriteLog(
-                        BrokerLogLevel.Error,
-                        BrokerLogEvent.RedisMirrorFailed,
-                        "redis mirror write failed",
-                        ex,
-                        new KeyValuePair<string, object?>("kind", command.Kind.ToString()),
-                        new KeyValuePair<string, object?>("error", error));
+                    if (_diagnostics.IsLogEnabled(BrokerLogLevel.Error))
+                    {
+                        _diagnostics.WriteLog(
+                            BrokerLogLevel.Error,
+                            BrokerLogEvent.RedisMirrorFailed,
+                            "redis mirror write failed",
+                            ex,
+                            new KeyValuePair<string, object?>("kind", command.Kind.ToString()),
+                            new KeyValuePair<string, object?>("error", error));
+                    }
                 }
             }
             finally
@@ -948,7 +995,41 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
             }
         }
 
+        AbandonQueuedWrites();
         _depthGauge?.Dispose();
         _memory.Dispose();
+    }
+
+    /// <summary>Counts and refuses the commands still queued when the drainer stopped.
+    /// Each reserved slot is released and each waiting publisher is told the truth
+    /// (<c>Durable == false</c>) instead of hanging on a completion the disposed
+    /// drainer will never service.</summary>
+    private void AbandonQueuedWrites()
+    {
+        if (_channel is null)
+        {
+            return;
+        }
+
+        while (_channel.Reader.TryRead(out WriteCommand? command) && command is not null)
+        {
+            AbandonWrite(command);
+        }
+    }
+
+    /// <summary>Accounts for one command the drainer will never write: release its
+    /// admission slot, complete the publisher's durability task false, and count the
+    /// drop under <c>reason=shutdown</c>. Called for buffered commands noticed after
+    /// cancellation and for whatever is still queued once the drainer returned, so
+    /// each command is counted exactly once.</summary>
+    private void AbandonWrite(WriteCommand command)
+    {
+        if (command.ReservedDrainerSlot)
+        {
+            _drainerSlots?.Release();
+        }
+
+        command.Completion?.TrySetResult(false);
+        CountMirrorDropped(command, "shutdown");
     }
 }

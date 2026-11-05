@@ -254,6 +254,12 @@ public sealed class BrokerDiagnostics : IDisposable
         }
     }
 
+    /// <summary>True when the host's sink would accept this level. Call sites guard
+    /// with this so a disabled sink costs one virtual call and never builds the
+    /// message or the <c>data</c> array (the guard inside <see cref="WriteLog"/> runs
+    /// too late: the arguments are already evaluated).</summary>
+    internal bool IsLogEnabled(BrokerLogLevel level) => Log.IsEnabled(level);
+
     /// <summary>Writes one structured entry when the sink enables its level; a sink
     /// exception is swallowed so host logging can never kill a connection.</summary>
     internal void WriteLog(
@@ -446,10 +452,13 @@ public sealed class BrokerDiagnostics : IDisposable
 
                     tags.Add(new KeyValuePair<string, object?>(InstanceTag, _owner.InstanceId));
                     tags.Sort(static (left, right) => string.CompareOrdinal(left.Key, right.Key));
+                    // Escape both halves: an unescaped join would let a queue name that
+                    // contains '=' or '|' collide with a different tag set and merge two
+                    // gauge series.
                     string key = string.Join(
                         '|',
                         tags.Select(tag =>
-                            $"{tag.Key}={Convert.ToString(tag.Value, CultureInfo.InvariantCulture)}"));
+                            $"{Uri.EscapeDataString(tag.Key)}={Uri.EscapeDataString(Convert.ToString(tag.Value, CultureInfo.InvariantCulture) ?? string.Empty)}"));
 
                     if (sums.TryGetValue(key, out var existing))
                     {

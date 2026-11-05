@@ -127,6 +127,58 @@ public sealed class DeliveryDiagnosticsTests
         Assert.Equal(0, Gauge(meter, "redismq.messages.unacked", "del4"));
     }
 
+    [Fact]
+    public async Task Auto_ack_get_reports_auto_ack_and_leaves_no_unacked_entry()
+    {
+        using var diag = new BrokerDiagnostics("del5");
+        using var meter = new MeterCollector();
+        await using var harness = DiagnosticsWireHarness.Start(diagnostics: diag);
+        await harness.HandshakeAsync();
+        await harness.OpenChannelAsync();
+        await harness.DeclareQueueAsync(1, "q");
+        await harness.PublishAsync(1, "", "q");
+        _ = await harness.BasicGetAsync(1, "q", noAck: true);
+
+        await WaitUntilAsync(
+            () => meter.For("redismq.deliveries").Any(r => r.Tags["broker.instance"] is "del5"),
+            "the auto-ack delivery was not counted");
+        MeasurementRecord delivery = Assert.Single(
+            meter.For("redismq.deliveries"),
+            r => r.Tags["broker.instance"] is "del5");
+        Assert.Equal("true", delivery.Tags["auto_ack"]);
+        Assert.DoesNotContain(
+            meter.For("redismq.settlements"),
+            r => r.Tags["broker.instance"] is "del5");
+        Assert.Equal(0, Gauge(meter, "redismq.messages.unacked", "del5"));
+    }
+
+    [Fact]
+    public async Task Channel_close_settles_unacked_deliveries_from_the_pump()
+    {
+        using var diag = new BrokerDiagnostics("del6");
+        using var meter = new MeterCollector();
+        await using var harness = DiagnosticsWireHarness.Start(diagnostics: diag);
+        await harness.HandshakeAsync();
+        await harness.OpenChannelAsync();
+        await harness.DeclareQueueAsync(1, "q");
+        await harness.PublishAsync(1, "", "q");
+        await harness.PublishAsync(1, "", "q");
+        await harness.BasicConsumeAsync(1, "q");
+        _ = await harness.ReadDeliveryAsync(1);
+        _ = await harness.ReadDeliveryAsync(1);
+
+        await WaitUntilAsync(
+            () => Gauge(meter, "redismq.messages.unacked", "del6") == 2,
+            "the pump did not claim two deliveries");
+
+        await harness.CloseChannelAsync(1);
+
+        await WaitUntilAsync(
+            () => Gauge(meter, "redismq.messages.unacked", "del6") == 0,
+            "channel close did not settle the pump's unacked deliveries");
+        Assert.Equal(0, Gauge(meter, "redismq.messages.unacked", "del6"));
+    }
+
     private static List<(string Kind, string Method)> Rows(MeterCollector meter) =>
     [
         .. meter.For("redismq.settlements")

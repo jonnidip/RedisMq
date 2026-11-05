@@ -99,12 +99,13 @@ public sealed class AmqpBrokerServer
         // A deleted queue must never leave a stale unacked series in health.
         _runtime.PruneUnacked(liveQueues);
 
-        bool live = _started && Volatile.Read(ref _acceptFaulted) == 0;
+        bool started = Volatile.Read(ref _started);
+        bool live = started && Volatile.Read(ref _acceptFaulted) == 0;
         bool ready = live;
         string? detail = null;
         if (!live)
         {
-            detail = _started ? "listener failed" : "server is not started";
+            detail = started ? "listener failed" : "server is not started";
         }
         else if (engine.Kind == "redis" && engine.Durable && engine.RedisConnected == false)
         {
@@ -163,10 +164,14 @@ public sealed class AmqpBrokerServer
         _reaperTask = _options.ReaperInterval > TimeSpan.Zero
             ? RunReaperAsync(_options.ReaperInterval, ct)
             : Task.CompletedTask;
-        _diagnostics.WriteLog(
-            BrokerLogLevel.Information,
-            BrokerLogEvent.ServerStarted,
-            "broker server started");
+        if (_diagnostics.IsLogEnabled(BrokerLogLevel.Information))
+        {
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Information,
+                BrokerLogEvent.ServerStarted,
+                "broker server started");
+        }
+
         return Task.CompletedTask;
     }
 
@@ -220,10 +225,13 @@ public sealed class AmqpBrokerServer
         }
 
         _gaugeHandles.Clear();
-        _diagnostics.WriteLog(
-            BrokerLogLevel.Information,
-            BrokerLogEvent.ServerStopped,
-            "broker server stopped");
+        if (_diagnostics.IsLogEnabled(BrokerLogLevel.Information))
+        {
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Information,
+                BrokerLogEvent.ServerStopped,
+                "broker server stopped");
+        }
     }
 
     /// <summary>One accept loop per listener: hands each transport side to a connection
@@ -245,11 +253,15 @@ public sealed class AmqpBrokerServer
             catch (Exception ex)
             {
                 Interlocked.Exchange(ref _acceptFaulted, 1);
-                _diagnostics.WriteLog(
-                    BrokerLogLevel.Error,
-                    BrokerLogEvent.ListenerFailed,
-                    "listener accept failed",
-                    ex);
+                if (_diagnostics.IsLogEnabled(BrokerLogLevel.Error))
+                {
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Error,
+                        BrokerLogEvent.ListenerFailed,
+                        "listener accept failed",
+                        ex);
+                }
+
                 return;
             }
 
@@ -284,11 +296,14 @@ public sealed class AmqpBrokerServer
                 catch (Exception ex)
                 {
                     _diagnostics.Count(_diagnostics.ReaperFailures, new TagList());
-                    _diagnostics.WriteLog(
-                        BrokerLogLevel.Error,
-                        BrokerLogEvent.ReaperFailed,
-                        "reaper tick failed",
-                        ex);
+                    if (_diagnostics.IsLogEnabled(BrokerLogLevel.Error))
+                    {
+                        _diagnostics.WriteLog(
+                            BrokerLogLevel.Error,
+                            BrokerLogEvent.ReaperFailed,
+                            "reaper tick failed",
+                            ex);
+                    }
                 }
                 finally
                 {
@@ -312,11 +327,6 @@ public sealed class AmqpBrokerServer
     /// and the transport completes (RabbitMQ-parity wire kill; the client sees EOF).</summary>
     private void TrackConnection(TransportSide side, string listenerKind, CancellationToken ct)
     {
-        _runtime.ConnectionStarted();
-        _diagnostics.Count(
-            _diagnostics.ConnectionsOpened,
-            new TagList { { "listener", listenerKind } });
-
         Task task = RunConnectionAsync(side, listenerKind, ct);
         bool added;
         lock (_gate)

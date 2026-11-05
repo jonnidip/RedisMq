@@ -205,7 +205,7 @@ public sealed class ChannelContext
     // drainer (_writerGate) runs jobs strictly in schedule order.
     private readonly SemaphoreSlim _writerGate = new(1, 1);
     private readonly object _writerLock = new();
-    private readonly Queue<Func<ValueTask>> _writerJobs = [];
+    private readonly Queue<WriterJob> _writerJobs = [];
 
     private readonly string _connectionId;
     private readonly BrokerPrincipal? _principal; // null = internal test channel, full access
@@ -264,15 +264,18 @@ public sealed class ChannelContext
         _diagnostics.Count(
             _diagnostics.ChannelsClosed,
             new TagList { { "vhost", _vhost }, { "reason", reason } });
-        _diagnostics.WriteLog(
-            BrokerLogLevel.Debug,
-            BrokerLogEvent.ChannelClosed,
-            "channel closed",
-            data:
-            [
-                new KeyValuePair<string, object?>("vhost", _vhost),
-                new KeyValuePair<string, object?>("reason", reason),
-            ]);
+        if (_diagnostics.IsLogEnabled(BrokerLogLevel.Debug))
+        {
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Debug,
+                BrokerLogEvent.ChannelClosed,
+                "channel closed",
+                data:
+                [
+                    new KeyValuePair<string, object?>("vhost", _vhost),
+                    new KeyValuePair<string, object?>("reason", reason),
+                ]);
+        }
     }
 
     /// <summary>Dispatches one fully-decoded method by the channel's current state.</summary>
@@ -297,15 +300,18 @@ public sealed class ChannelContext
                 _diagnostics.Count(
                     _diagnostics.ChannelsOpened,
                     new TagList { { "vhost", _vhost } });
-                _diagnostics.WriteLog(
-                    BrokerLogLevel.Debug,
-                    BrokerLogEvent.ChannelOpened,
-                    "channel opened",
-                    data:
-                    [
-                        new KeyValuePair<string, object?>("vhost", _vhost),
-                        new KeyValuePair<string, object?>("channel", _channel),
-                    ]);
+                if (_diagnostics.IsLogEnabled(BrokerLogLevel.Debug))
+                {
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Debug,
+                        BrokerLogEvent.ChannelOpened,
+                        "channel opened",
+                        data:
+                        [
+                            new KeyValuePair<string, object?>("vhost", _vhost),
+                            new KeyValuePair<string, object?>("channel", _channel),
+                        ]);
+                }
             }
 
             return new ChannelOutcomeReply(NewMethod("channel.open-ok", openOk =>
@@ -1380,28 +1386,41 @@ public sealed class ChannelContext
                 break;
         }
 
-        long tag;
+        long tag = 0;
+        bool tornDown;
         lock (_deliveryLock)
         {
-            tag = ++_nextDeliveryTag;
-            if (!noAck)
+            tornDown = _consumersTornDown;
+            if (!tornDown)
             {
-                _unacked[tag] = new Unacked(tag, queue, message!);
-                _outstandingBytes += message!.Body.LongLength;
+                tag = ++_nextDeliveryTag;
+                if (!noAck)
+                {
+                    _unacked[tag] = new Unacked(tag, queue, message!);
+                    _outstandingBytes += message!.Body.LongLength;
+                    // Claim the gauge in the same critical section that created the
+                    // ledger entry: teardown snapshots and settles under this lock, so
+                    // the increment can never outlive the entry it counts.
+                    _runtime.DeliveryClaimed(_vhost, queue);
+                }
             }
         }
 
         InMemoryMessage claimed = message!;
+        if (tornDown)
+        {
+            // The channel is already tearing down: return the claimed message instead
+            // of handing it to a channel whose ledger sweep has already run.
+            _engine.Requeue(_vhost, queue, claimed);
+            return ChainReply("basic.get-empty", empty => empty.Set("cluster-id", string.Empty));
+        }
+
         if (noAck)
         {
             // basic.get(autoAck:true) hands the message straight over, so the durable
             // copy settles now (outside _deliveryLock — same ladder concern as the
             // consumer path).
             _engine.Acknowledge(_vhost, queue, claimed);
-        }
-        else
-        {
-            _runtime.DeliveryClaimed(_vhost, queue);
         }
 
         _diagnostics.Count(
@@ -1433,12 +1452,16 @@ public sealed class ChannelContext
             catch (Exception ex)
             {
                 failed = true;
-                _diagnostics.WriteLog(
-                    BrokerLogLevel.Warning,
-                    BrokerLogEvent.DeliveryFailed,
-                    "get write failed",
-                    ex,
-                    new KeyValuePair<string, object?>("queue", queue));
+                if (_diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
+                {
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Warning,
+                        BrokerLogEvent.DeliveryFailed,
+                        "get write failed",
+                        ex,
+                        new KeyValuePair<string, object?>("queue", queue));
+                }
+
                 throw;
             }
             finally
@@ -1446,7 +1469,7 @@ public sealed class ChannelContext
                 BrokerDiagnostics.StopActivity(
                     activity, failed ? "error" : "delivered", error: failed);
             }
-        });
+        }, abandon: () => BrokerDiagnostics.StopActivity(activity, "abandoned"));
         return ChannelOutcomeChain.Instance;
     }
 
@@ -1661,11 +1684,18 @@ public sealed class ChannelContext
             return;
         }
 
-        _consumersTornDown = true;
         List<(string Queue, string Tag)> consumers;
         List<Unacked> plan;
         lock (_deliveryLock)
         {
+            // Double-check under the lock: a concurrent teardown may have won the race
+            // between the fast-path read above and this acquisition.
+            if (_consumersTornDown)
+            {
+                return;
+            }
+
+            _consumersTornDown = true;
             consumers = _consumerQueues.Select(pair => (pair.Value, pair.Key)).ToList();
             plan = _unacked.Values.ToList();
             // Clear the ledger here so a late settle on the retired channel cannot
@@ -1691,6 +1721,10 @@ public sealed class ChannelContext
         {
             _engine.Requeue(_vhost, entry.Queue, entry.Message);
         }
+
+        // Anything still queued will never be written: the channel is gone. Stop the
+        // activities those jobs carried so a retire cannot leak delivery spans.
+        AbandonPendingWriterJobs();
     }
 
     // ---------- the serialized writer chain (Task 7) ----------
@@ -1730,12 +1764,14 @@ public sealed class ChannelContext
 
     /// <summary>Schedules one job on the channel's writer chain: pure synchronous
     /// enqueue, safe under the engine gate and _deliveryLock alike (the drains run
-    /// elsewhere, so nothing here ever awaits).</summary>
-    private void ScheduleWriterJob(Func<ValueTask> job)
+    /// elsewhere, so nothing here ever awaits). <paramref name="abandon"/> runs when
+    /// the job never starts (a cancelled drain or a sibling job's failure) and is how
+    /// a queued deliver span is stopped instead of leaking.</summary>
+    private void ScheduleWriterJob(Func<ValueTask> job, Action? abandon = null)
     {
         lock (_writerLock)
         {
-            _writerJobs.Enqueue(job);
+            _writerJobs.Enqueue(new WriterJob(job, abandon));
         }
     }
 
@@ -1744,13 +1780,14 @@ public sealed class ChannelContext
     /// or requeue plans — they surface cancellation and absorb transport death
     /// themselves, and the strict caller discipline (pump: gate released before the
     /// drain; frame pump: no engine lock held) keeps the writer-gate → engine-gate
-    /// edge one-way.</summary>
+    /// edge one-way. A batch cut short by cancellation or a throwing job abandons the
+    /// jobs it never started, so their activities are stopped.</summary>
     internal async Task RunWriterChainAsync(CancellationToken ct)
     {
         while (true)
         {
             await _writerGate.WaitAsync(ct);
-            List<Func<ValueTask>> batch;
+            List<WriterJob> batch;
             lock (_writerLock)
             {
                 batch = [.. _writerJobs];
@@ -1763,19 +1800,51 @@ public sealed class ChannelContext
                 return;
             }
 
+            int next = 0;
             try
             {
-                foreach (Func<ValueTask> job in batch)
+                while (next < batch.Count)
                 {
-                    await job();
+                    WriterJob job = batch[next++];
+                    await job.Run();
                 }
             }
             finally
             {
+                for (; next < batch.Count; next++)
+                {
+                    batch[next].Abandon?.Invoke();
+                }
+
                 _writerGate.Release();
             }
         }
     }
+
+    /// <summary>Stops the jobs that will never run because the channel is going away.
+    /// The writes themselves were already lost with the channel (unchanged behavior);
+    /// this only stops the activities they carried.</summary>
+    private void AbandonPendingWriterJobs()
+    {
+        List<WriterJob> pending;
+        lock (_writerLock)
+        {
+            if (_writerJobs.Count == 0)
+            {
+                return;
+            }
+
+            pending = [.. _writerJobs];
+            _writerJobs.Clear();
+        }
+
+        foreach (WriterJob job in pending)
+        {
+            job.Abandon?.Invoke();
+        }
+    }
+
+    private readonly record struct WriterJob(Func<ValueTask> Run, Action? Abandon);
 
     /// <summary>The consumer-family reply: scheduled on the chain (a pump claim can
     /// never jump a promise the channel already made) with the drain marker that
@@ -1825,6 +1894,14 @@ public sealed class ChannelContext
             bool autoAck = false;
             lock (owner._deliveryLock)
             {
+                // Teardown sets this under the same lock before it snapshots and
+                // settles the ledger; admitting afterwards would orphan the gauge
+                // increment for a delivery nobody will ever settle.
+                if (owner._consumersTornDown)
+                {
+                    return false;
+                }
+
                 // Channel flow control: if flow is off, no new deliveries are admitted
                 if (!owner._flowActive)
                 {
@@ -1853,6 +1930,9 @@ public sealed class ChannelContext
                     deliveryTag = ++owner._nextDeliveryTag;
                     owner._unacked[deliveryTag] = new Unacked(deliveryTag, queueName, message);
                     owner._outstandingBytes += bytes;
+                    // Same critical section as the ledger entry, so teardown's
+                    // snapshot+settle can never miss the increment.
+                    owner._runtime.DeliveryClaimed(owner._vhost, queueName);
                 }
 
                 AmqpMethod deliver = ChannelContext.NewMethod("basic.deliver", deliverRecord =>
@@ -1886,12 +1966,16 @@ public sealed class ChannelContext
                     catch (Exception ex)
                     {
                         failed = true;
-                        owner._diagnostics.WriteLog(
-                            BrokerLogLevel.Warning,
-                            BrokerLogEvent.DeliveryFailed,
-                            "delivery write failed",
-                            ex,
-                            new KeyValuePair<string, object?>("queue", queueName));
+                        if (owner._diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
+                        {
+                            owner._diagnostics.WriteLog(
+                                BrokerLogLevel.Warning,
+                                BrokerLogEvent.DeliveryFailed,
+                                "delivery write failed",
+                                ex,
+                                new KeyValuePair<string, object?>("queue", queueName));
+                        }
+
                         throw;
                     }
                     finally
@@ -1899,7 +1983,7 @@ public sealed class ChannelContext
                         BrokerDiagnostics.StopActivity(
                             activity, failed ? "error" : "delivered", error: failed);
                     }
-                });
+                }, abandon: () => BrokerDiagnostics.StopActivity(activity, "abandoned"));
             }
 
             if (autoAck)
@@ -1908,11 +1992,6 @@ public sealed class ChannelContext
                 // message is handed out. Outside _deliveryLock to keep the lock ladder
                 // one-way (the pump holds the engine gate while taking _deliveryLock).
                 owner._engine.Acknowledge(owner._vhost, queueName, message);
-            }
-            else
-            {
-                // Manual delivery: the one unacked entry this admission created.
-                owner._runtime.DeliveryClaimed(owner._vhost, queueName);
             }
 
             return true;
@@ -1957,16 +2036,19 @@ public sealed class ChannelContext
         _diagnostics.Count(
             _diagnostics.PermissionDenials,
             new TagList { { "operation", operation } });
-        _diagnostics.WriteLog(
-            BrokerLogLevel.Warning,
-            BrokerLogEvent.PermissionDenied,
-            "permission denied",
-            data:
-            [
-                new KeyValuePair<string, object?>("operation", operation),
-                new KeyValuePair<string, object?>("kind", kind),
-                new KeyValuePair<string, object?>("name", name),
-            ]);
+        if (_diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
+        {
+            _diagnostics.WriteLog(
+                BrokerLogLevel.Warning,
+                BrokerLogEvent.PermissionDenied,
+                "permission denied",
+                data:
+                [
+                    new KeyValuePair<string, object?>("operation", operation),
+                    new KeyValuePair<string, object?>("kind", kind),
+                    new KeyValuePair<string, object?>("name", name),
+                ]);
+        }
 
         return Soft(
             method,

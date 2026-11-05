@@ -119,15 +119,18 @@ public sealed class TlsSocketListener : IListenerTransport, IAsyncDisposable
                     _diagnostics.TlsHandshakeDuration,
                     Stopwatch.GetElapsedTime(started).TotalSeconds,
                     new TagList { { "result", "failure" } });
-                _diagnostics.WriteLog(
-                    BrokerLogLevel.Debug,
-                    BrokerLogEvent.TlsHandshakeFailed,
-                    "TLS handshake failed",
-                    data:
-                    [
-                        new KeyValuePair<string, object?>(
-                            "exception", exception.GetType().Name),
-                    ]);
+                if (_diagnostics.IsLogEnabled(BrokerLogLevel.Debug))
+                {
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Debug,
+                        BrokerLogEvent.TlsHandshakeFailed,
+                        "TLS handshake failed",
+                        data:
+                        [
+                            new KeyValuePair<string, object?>(
+                                "exception", exception.GetType().Name),
+                        ]);
+                }
 
                 // A bad, timed-out or mTLS-rejected handshake belongs to that one peer;
                 // keep accepting so the listener survives hostile traffic.

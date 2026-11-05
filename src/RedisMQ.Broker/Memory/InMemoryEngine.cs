@@ -717,15 +717,18 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
             _diagnostics.Count(
                 _diagnostics.MessagesExpired,
                 new TagList { { "vhost", key.Vhost }, { "queue", key.Queue } });
-            _diagnostics.WriteLog(
-                BrokerLogLevel.Debug,
-                BrokerLogEvent.MessageExpired,
-                "message expired",
-                data:
-                [
-                    new KeyValuePair<string, object?>("vhost", key.Vhost),
-                    new KeyValuePair<string, object?>("queue", key.Queue),
-                ]);
+            if (_diagnostics.IsLogEnabled(BrokerLogLevel.Debug))
+            {
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Debug,
+                    BrokerLogEvent.MessageExpired,
+                    "message expired",
+                    data:
+                    [
+                        new KeyValuePair<string, object?>("vhost", key.Vhost),
+                        new KeyValuePair<string, object?>("queue", key.Queue),
+                    ]);
+            }
         }
 
         foreach ((string Vhost, string Name) key in deletedQueues)
@@ -733,15 +736,18 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
             _diagnostics.Count(
                 _diagnostics.QueuesExpired,
                 new TagList { { "vhost", key.Vhost } });
-            _diagnostics.WriteLog(
-                BrokerLogLevel.Warning,
-                BrokerLogEvent.QueueExpired,
-                "queue expired",
-                data:
-                [
-                    new KeyValuePair<string, object?>("vhost", key.Vhost),
-                    new KeyValuePair<string, object?>("queue", key.Name),
-                ]);
+            if (_diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
+            {
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Warning,
+                    BrokerLogEvent.QueueExpired,
+                    "queue expired",
+                    data:
+                    [
+                        new KeyValuePair<string, object?>("vhost", key.Vhost),
+                        new KeyValuePair<string, object?>("queue", key.Name),
+                    ]);
+            }
         }
 
         return new EngineDelta(enqueued, removed, deletedQueues);
@@ -832,6 +838,17 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
                 foreach (InMemoryMessage evicted in delivery.RemoveOldestMessages(maxLength))
                 {
                     removed.Add(new QueuedMessageRef(vhost, target, evicted.EnvelopeId));
+                    // A dead-letter copy that evicts an incumbent is a drop like any
+                    // other x-max-length eviction; count it so the queue's drop series
+                    // does not silently under-report.
+                    _diagnostics.Count(
+                        _diagnostics.MessagesDropped,
+                        new TagList
+                        {
+                            { "vhost", vhost },
+                            { "queue", target },
+                            { "reason", "max_length" },
+                        });
                 }
             }
         }

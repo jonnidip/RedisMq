@@ -175,8 +175,8 @@ internal sealed class DiagnosticsWireHarness : IAsyncDisposable
     public Task SendQueueDeclareAsync(ushort channel, string queue) =>
         Client.SendAsync(MethodFrameOn(channel, QueueDeclareFrame(channel, queue)));
 
-    public Task SendBasicGetAsync(ushort channel, string queue) =>
-        Client.SendAsync(MethodFrameOn(channel, BasicGetFrame(channel, queue)));
+    public Task SendBasicGetAsync(ushort channel, string queue, bool noAck = false) =>
+        Client.SendAsync(MethodFrameOn(channel, BasicGetFrame(channel, queue, noAck)));
 
     public Task SendBasicAckAsync(ushort channel, ulong deliveryTag) =>
         Client.SendAsync(MethodFrameOn(channel, BasicAckFrame(deliveryTag)));
@@ -192,9 +192,9 @@ internal sealed class DiagnosticsWireHarness : IAsyncDisposable
     public async Task<(AmqpMethod GetOk, ContentHeader Header, byte[] Body)?> BasicGetAsync(
         ushort channel,
         string queue,
-        bool noAck = true)
+        bool noAck = false)
     {
-        await SendBasicGetAsync(channel, queue);
+        await SendBasicGetAsync(channel, queue, noAck);
         AmqpMethod answer = await Client.ReadMethodOnChannelAsync(channel, 60, 0);
         if (answer.MethodId == 72) // basic.get-empty
         {

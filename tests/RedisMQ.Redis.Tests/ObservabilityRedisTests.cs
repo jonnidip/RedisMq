@@ -161,6 +161,48 @@ public sealed class ObservabilityRedisTests
             .Count(r => r.Tags["broker.instance"] is "redis5"));
     }
 
+    [Fact]
+    public async Task Dispose_counts_queued_writes_as_shutdown_drops()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return;
+        }
+
+        using var diag = new BrokerDiagnostics("redis6");
+        using var meter = new RedisMeterCollector();
+        string vhost = $"/obs-shutdown-{Guid.NewGuid():N}";
+        var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 16,
+            enforceEvictionGate: false, diagnostics: diag);
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        engine.WriteOverrideForTest = _ => gate.Task;
+
+        _ = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "", "q");
+        EnqueueReceipt second = engine.Enqueue(vhost, "q", new ContentProperties(), [2], "", "q");
+        EnqueueReceipt third = engine.Enqueue(vhost, "q", new ContentProperties(), [3], "", "q");
+
+        // Wait until the drainer holds the first command, so the two behind it are
+        // deterministically still queued when disposal cancels the loop.
+        await WaitUntilAsync(
+            () => engine.GetEngineHealth().DrainerDepth == 2,
+            "the drainer did not take the first command");
+
+        ValueTask disposal = engine.DisposeAsync();
+        gate.SetResult(true);
+        await disposal;
+
+        Assert.False(await second.Durable);
+        Assert.False(await third.Durable);
+        Assert.Equal(2, engine.GetEngineHealth().MirrorDropped);
+        Assert.Equal(
+            2,
+            meter.For("redismq.redis.mirror.dropped").Count(r =>
+                r.Tags["broker.instance"] is "redis6"
+                && (string?)r.Tags["reason"] == "shutdown"));
+    }
+
     private static IDatabase? TryConnectRedis()
     {
         try

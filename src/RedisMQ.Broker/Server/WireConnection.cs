@@ -103,6 +103,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
     private readonly string _connectionId;
     private readonly BrokerDiagnostics _diagnostics;
     private readonly BrokerRuntimeState _runtime;
+    private readonly string _listenerKind;
     private string _closeReason = "server";
 
     public WireConnection(
@@ -144,6 +145,7 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
         _transport = transport;
         _diagnostics = diagnostics;
         _runtime = runtime;
+        _listenerKind = listenerKind;
         _connectionId = connectionId ?? Guid.NewGuid().ToString("N");
         _frameMax = options.FrameMax; // pre-TuneOk bound: the broker's own configured max
         // The topology engine backs Task 5's channel dispatch: every channel context
@@ -168,6 +170,13 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             cancellationToken, _stopCts.Token, _heartbeatCts.Token);
         var ct = linked.Token;
         _runToken = ct;
+        // Opened/active are counted here rather than at accept time so the public
+        // constructor path (a host-built connection with a private runtime) is
+        // symmetric with the server path: every run opens and closes exactly one.
+        _runtime.ConnectionStarted();
+        _diagnostics.Count(
+            _diagnostics.ConnectionsOpened,
+            new TagList { { "listener", _listenerKind } });
         try
         {
             if (await RunHandshakeAsync(ct))
@@ -241,7 +250,8 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             _diagnostics.Count(
                 _diagnostics.ConnectionsClosed,
                 new TagList { { "reason", _closeReason } });
-            if (_closeReason is not ("auth_refused" or "vhost_refused" or "heartbeat" or "error"))
+            if (_closeReason is not ("auth_refused" or "vhost_refused" or "heartbeat" or "error")
+                && _diagnostics.IsLogEnabled(BrokerLogLevel.Information))
             {
                 _diagnostics.WriteLog(
                     BrokerLogLevel.Information,
@@ -938,7 +948,8 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
                 new TagList { { "outcome", outcomeName } });
         }
 
-        if (outcome is ConfirmOutcome.Nack or ConfirmOutcome.Timeout)
+        if ((outcome is ConfirmOutcome.Nack or ConfirmOutcome.Timeout)
+            && _diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
         {
             _diagnostics.WriteLog(
                 BrokerLogLevel.Warning,
@@ -1028,11 +1039,14 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             _diagnostics.Count(
                 _diagnostics.AuthFailures,
                 new TagList { { "reason", failure } });
-            _diagnostics.WriteLog(
-                BrokerLogLevel.Warning,
-                BrokerLogEvent.AuthenticationFailed,
-                "authentication failed",
-                data: [new KeyValuePair<string, object?>("reason", failure)]);
+            if (_diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
+            {
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Warning,
+                    BrokerLogEvent.AuthenticationFailed,
+                    "authentication failed",
+                    data: [new KeyValuePair<string, object?>("reason", failure)]);
+            }
 
             // RabbitMQ's exact wire wording for a refused PLAIN login. The message never
             // carries the username, password or mechanism input.
@@ -1130,11 +1144,14 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             _diagnostics.Count(
                 _diagnostics.VhostRefusals,
                 new TagList { { "reason", "unknown" } });
-            _diagnostics.WriteLog(
-                BrokerLogLevel.Warning,
-                BrokerLogEvent.VhostAccessDenied,
-                "virtual host refused",
-                data: [new KeyValuePair<string, object?>("vhost", vhost)]);
+            if (_diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
+            {
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Warning,
+                    BrokerLogEvent.VhostAccessDenied,
+                    "virtual host refused",
+                    data: [new KeyValuePair<string, object?>("vhost", vhost)]);
+            }
 
             return await CloseConnectionAsync(
                 AmqpConstants.InvalidPath,
@@ -1150,11 +1167,14 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
             _diagnostics.Count(
                 _diagnostics.VhostRefusals,
                 new TagList { { "reason", "denied" } });
-            _diagnostics.WriteLog(
-                BrokerLogLevel.Warning,
-                BrokerLogEvent.VhostAccessDenied,
-                "virtual host refused",
-                data: [new KeyValuePair<string, object?>("vhost", vhost)]);
+            if (_diagnostics.IsLogEnabled(BrokerLogLevel.Warning))
+            {
+                _diagnostics.WriteLog(
+                    BrokerLogLevel.Warning,
+                    BrokerLogEvent.VhostAccessDenied,
+                    "virtual host refused",
+                    data: [new KeyValuePair<string, object?>("vhost", vhost)]);
+            }
 
             return await CloseConnectionAsync(
                 AmqpConstants.AccessRefused,
