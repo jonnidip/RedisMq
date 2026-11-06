@@ -23,3 +23,45 @@ jobs:
 
       - name: Test
         run: dotnet test RedisMQ.sln --no-restore --no-build
+
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build (Release)
+        run: dotnet build RedisMQ.sln -c Release
+
+      - name: Pack
+        run: dotnet pack RedisMQ.sln -c Release --no-build -o artifacts
+
+      - name: Core has no package references
+        run: |
+          dotnet list src/RedisMQ.Broker/RedisMQ.Broker.csproj package --include-transitive --format json > core-packages.json
+          if jq -e '[.projects[].frameworks[] | (.topLevelPackages // []) + (.transitivePackages // [])] | flatten | length > 0' core-packages.json; then
+            echo "RedisMQ.Broker gained a package reference"
+            exit 1
+          fi
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t redismq:ci .
