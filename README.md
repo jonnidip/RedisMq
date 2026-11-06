@@ -53,16 +53,44 @@ dotnet test RedisMQ.sln
 > dotnet exec tests\RedisMQ.Broker.Tests\bin\Debug\net10.0\RedisMQ.Broker.Tests.dll
 > dotnet exec tests\RedisMQ.Conformance\bin\Debug\net10.0\RedisMQ.Conformance.dll
 > dotnet exec tests\RedisMQ.Redis.Tests\bin\Debug\net10.0\RedisMQ.Redis.Tests.dll
+> dotnet exec tests\RedisMQ.Hosting.Tests\bin\Debug\net10.0\RedisMQ.Hosting.Tests.dll
 > ```
 
 Expected results:
 
 | Suite | Total | Failed | Warnings |
 |-------|-------|--------|----------|
-| `RedisMQ.Broker.Tests` | 357 | 0 | 0 |
+| `RedisMQ.Broker.Tests` | 359 | 0 | 0 |
 | `RedisMQ.Conformance` | 19 | 0 | 0 |
-| `RedisMQ.Redis.Tests` | 66 | 0 | 0 |
+| `RedisMQ.Redis.Tests` | 67 | 0 | 0 |
+| `RedisMQ.Hosting.Tests` | 11 | 0 | 0 |
 | `dotnet build RedisMQ.sln` | — | — | 0 |
+
+### Run in Docker
+
+```bash
+# Build the image and run the memory-only broker
+docker build -t redismq:dev .
+docker run --rm -p 5672:5672 -p 8080:8080 redismq:dev
+
+# Or run the broker plus Redis with durable confirms
+docker compose up --build
+```
+
+See [docs/PACKAGING.md](docs/PACKAGING.md) for configuration, TLS and the container
+details.
+
+### Packages
+
+RedisMQ ships as three packages:
+
+- `RedisMQ.Broker` — the core broker with zero external dependencies
+- `RedisMQ.Redis` — the Redis Streams write-ahead log
+- `RedisMQ.Hosting` — `IConfiguration` binding, DI and hosted lifecycle
+
+```bash
+dotnet add package RedisMQ.Hosting --prerelease
+```
 
 ### Minimal in-memory host
 
@@ -344,17 +372,28 @@ RedisMQ.sln
 │   │       ├── BrokerCertificate.cs        # PFX/PEM loading + mTLS chain validation
 │   │       ├── BrokerListeners.cs          # plaintext + TLS factory
 │   │       └── TransportPair.cs
+│   ├── RedisMQ.Hosting/                    # configuration binding + DI lifecycle
+│   │   ├── RedisMqOptions.cs               # root RedisMQ section
+│   │   ├── RedisEngineOptions.cs           # Redis engine settings
+│   │   ├── RedisMqServiceCollectionExtensions.cs  # AddRedisMQBroker
+│   │   ├── BrokerServerHostedService.cs    # startup validation + stop/dispose
+│   │   └── LoggerBrokerLogSink.cs          # broker logs -> ILogger
 │   └── RedisMQ.Redis/                      # StackExchange.Redis only here
 │       ├── RedisStreamRouteEngine.cs       # write-ahead mirror + replay
 │       ├── RedisKeys.cs                    # cluster-safe key layout
 │       ├── StreamCodec.cs                  # AMQP-wire properties in stream fields
 │       └── WriteCommand.cs
+├── samples/
+│   └── RedisMQ.Host/                       # container-ready host + /livez + /healthz
 ├── tests/
 │   ├── RedisMQ.Broker.Tests/               # codec/FSM/engine/server/permissions/TLS
 │   ├── RedisMQ.Conformance/                # RabbitMQ.Client 7.x over real sockets
+│   ├── RedisMQ.Hosting.Tests/              # binding, DI lifecycle, log sink
 │   └── RedisMQ.Redis.Tests/                # Redis mirror, replay, eviction gate
-├── docs/                                   # architecture, protocol, API, conformance
+├── docs/                                   # architecture, protocol, API, packaging
 ├── .github/workflows/ci.yml
+├── Dockerfile
+├── docker-compose.yml
 ├── global.json
 └── README.md
 ```
@@ -373,14 +412,17 @@ dotnet test RedisMQ.sln
 ### Direct runner (this dev machine — `dotnet test` is broken by an SDK MTP bug)
 
 ```bash
-# Unit tests (357 expected)
+# Unit tests (359 expected)
 dotnet exec tests\RedisMQ.Broker.Tests\bin\Debug\net10.0\RedisMQ.Broker.Tests.dll
 
 # Conformance suite (19 expected)
 dotnet exec tests\RedisMQ.Conformance\bin\Debug\net10.0\RedisMQ.Conformance.dll
 
-# Redis mirror/replay tests (66 expected; needs Redis on localhost:6379)
+# Redis mirror/replay tests (67 expected; needs Redis on localhost:6379)
 dotnet exec tests\RedisMQ.Redis.Tests\bin\Debug\net10.0\RedisMQ.Redis.Tests.dll
+
+# Hosting/configuration tests (11 expected)
+dotnet exec tests\RedisMQ.Hosting.Tests\bin\Debug\net10.0\RedisMQ.Hosting.Tests.dll
 ```
 
 ### Filtered runs
@@ -618,7 +660,6 @@ M4 part 1 completes the functional v1 surface. Remaining for a production v1:
 - **Connection/channel profiles** and tuning beyond RabbitMQ defaults.
 - **Performance work**: pipelining, batching mirrors, throughput benchmarks.
 - **Pika and other client compatibility** beyond RabbitMQ.Client 7.x.
-- **Packaging**: NuGet packages, container image, configuration binding.
 - **Operational hardening**: certificate hot-reload, Redis failure recovery policy,
   management surface for users/vhosts/permissions.
 

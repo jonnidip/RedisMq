@@ -26,6 +26,9 @@ dotnet exec tests\RedisMQ.Conformance\bin\Debug\net10.0\RedisMQ.Conformance.dll
 
 # Redis mirror/replay suite
 dotnet exec tests\RedisMQ.Redis.Tests\bin\Debug\net10.0\RedisMQ.Redis.Tests.dll
+
+# Hosting/configuration suite
+dotnet exec tests\RedisMQ.Hosting.Tests\bin\Debug\net10.0\RedisMQ.Hosting.Tests.dll
 ```
 
 CI (`.github/workflows/ci.yml`) uses the standard `dotnet test` on ubuntu-latest — that
@@ -55,9 +58,10 @@ those are not analyzer warnings and do not count.)
 
 | Suite | Project | Expected |
 |-------|---------|----------|
-| Codec/FSM/engine/server unit tests | `RedisMQ.Broker.Tests` | 357 passed |
+| Codec/FSM/engine/server unit tests | `RedisMQ.Broker.Tests` | 359 passed |
 | Real-client conformance | `RedisMQ.Conformance` | 19 passed |
-| Redis mirror/replay | `RedisMQ.Redis.Tests` | 66 passed (or skipped without Redis) |
+| Redis mirror/replay | `RedisMQ.Redis.Tests` | 67 passed (or skipped without Redis) |
+| Hosting/configuration | `RedisMQ.Hosting.Tests` | 11 passed |
 
 Run the broker and conformance suites twice after touching TLS or confirm timing to
 catch handshake and backpressure flakes.
@@ -210,11 +214,15 @@ there follow the same review bar as protocol changes.
 - **Instrumentation must not add a wire surface.** No new frames, methods or fields:
   observability observes the existing protocol, it does not extend it.
 
+## Packaging
+
+NuGet packages, `IConfiguration` binding, the sample host and the container image are
+documented in [PACKAGING.md](PACKAGING.md).
+
 ## Remaining work toward production v1
 
 - Connection/channel profiles and tuning beyond RabbitMQ defaults.
 - Throughput work: pipelining, mirror batching, benchmarks.
 - Client compatibility beyond RabbitMQ.Client 7.x (Pika and others).
-- Packaging: NuGet packages, container image, configuration binding.
 - Operational hardening: certificate hot-reload, Redis failure recovery policy,
   runtime user/vhost/permission management.
