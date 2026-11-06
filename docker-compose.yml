@@ -1,0 +1,30 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  broker:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      RedisMQ__Redis__ConnectionString: "redis:6379"
+    ports:
+      - "5672:5672"
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5672'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  redis-data:

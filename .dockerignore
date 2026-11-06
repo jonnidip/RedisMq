@@ -1,0 +1,11 @@
+**/bin
+**/obj
+.git
+.gitignore
+.idea
+.superpowers
+TestResults
+artifacts
+docs
+tests
+*.user
