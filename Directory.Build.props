@@ -1,0 +1,21 @@
+<Project>
+  <PropertyGroup>
+    <Version>0.1.0-preview.1</Version>
+    <Authors>RedisMQ contributors</Authors>
+    <Company>RedisMQ contributors</Company>
+    <Description>AMQP 0-9-1 broker with a Redis Streams write-ahead log.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>amqp;rabbitmq;redis;broker;streams;messaging</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/jonnidip/RedisMq</PackageProjectUrl>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/jonnidip/RedisMq</RepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
