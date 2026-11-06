@@ -2,6 +2,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using RedisMQ.Broker.Diagnostics;
 using RedisMQ.Broker.Memory;
 using RedisMQ.Broker.Server;
@@ -69,7 +70,11 @@ public static class RedisMqServiceCollectionExtensions
     private static BrokerDiagnostics CreateDiagnostics(IServiceProvider provider)
     {
         RedisMqOptions options = provider.GetRequiredService<RedisMqOptions>();
-        return new BrokerDiagnostics(options.InstanceId, serviceVersion: options.ServiceVersion);
+        ILoggerFactory? loggerFactory = provider.GetService<ILoggerFactory>();
+        IBrokerLogSink sink = loggerFactory is null
+            ? NullBrokerLogSink.Instance
+            : new LoggerBrokerLogSink(loggerFactory);
+        return new BrokerDiagnostics(options.InstanceId, sink, options.ServiceVersion);
     }
 
     private static IRouteEngine CreateEngine(IServiceProvider provider)
