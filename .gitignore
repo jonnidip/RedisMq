@@ -12,3 +12,4 @@ tests/clients/.logs/
 tests/clients/pika/__pycache__/
 tests/clients/node/node_modules/
 tests/clients/java/target/
+tests/clients/go/conformance.exe
