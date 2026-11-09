@@ -39,6 +39,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $clientsRoot = Join-Path $repoRoot 'tests\clients'
 $logDir = Join-Path $clientsRoot '.logs'
@@ -105,7 +107,6 @@ function Get-ClientSpec([string]$Name) {
                 Command     = 'java'
                 Arguments   = @('-jar', 'target/redismq-client-conformance.jar')
                 Prepare     = @('-q', '-DskipTests', 'package')
-                PrepareFile = 'mvn'
                 Requirements = @(
                     [pscustomobject]@{ Label = 'java'; Present = [bool](Get-Command java -ErrorAction SilentlyContinue) },
                     [pscustomobject]@{ Label = 'mvn'; Present = [bool](Get-Command mvn -ErrorAction SilentlyContinue) },
@@ -211,13 +212,13 @@ if (-not $SkipPrepare) {
         Write-Step "preparing $($spec.Name)"
         $out = Join-Path $logDir "$($spec.Name).prepare.out.log"
         $err = Join-Path $logDir "$($spec.Name).prepare.err.log"
-        $exe = if ($spec.PrepareFile) { $spec.PrepareFile } elseif ($spec.Name -eq 'pika') { $pythonExe } else { $spec.Command }
-        if ($spec.Name -eq 'pika') {
-            $code = Invoke-Logged $pythonExe $spec.Prepare $spec.Directory $out $err
+        $exe = switch ($spec.Name) {
+            'pika' { $pythonExe }
+            'node' { if ($isWindows) { (Get-Command npm.cmd).Source } else { 'npm' } }
+            'java' { if ($isWindows) { (Get-Command mvn.cmd).Source } else { 'mvn' } }
+            'go' { 'go' }
         }
-        else {
-            $code = Invoke-Logged $exe $spec.Prepare $spec.Directory $out $err
-        }
+        $code = Invoke-Logged $exe $spec.Prepare $spec.Directory $out $err
 
         if ($code -ne 0) {
             Show-LogTail "prepare $($spec.Name)" @($out, $err)

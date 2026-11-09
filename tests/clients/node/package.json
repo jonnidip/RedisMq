@@ -1,0 +1,13 @@
+{
+  "name": "redismq-node-conformance",
+  "private": true,
+  "version": "1.0.0",
+  "description": "amqplib conformance suite for RedisMQ",
+  "main": "conformance.js",
+  "scripts": {
+    "test": "node conformance.js"
+  },
+  "dependencies": {
+    "amqplib": "2.3.1"
+  }
+}
