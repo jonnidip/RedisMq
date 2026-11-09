@@ -56,6 +56,9 @@ The runner installs dependencies (`pip install -r`, `npm ci`, `mvn package`,
 port for each client. It fails if a selected client's toolchain is missing; pass
 `-SkipMissing` to run only the clients that are installed.
 
+CI runs the same script as a `conformance` matrix job with one leg per client and
+uploads `tests/clients/.logs/**` on failure.
+
 Diagnostic flags:
 
 | Flag | Effect |

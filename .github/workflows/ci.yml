@@ -24,6 +24,59 @@ jobs:
       - name: Test
         run: dotnet test RedisMQ.sln --no-restore --no-build
 
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [pika, node, java, go]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Python
+        if: matrix.client == 'pika'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node
+        if: matrix.client == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java
+        if: matrix.client == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Setup Go
+        if: matrix.client == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Run client conformance
+        run: pwsh tests/clients/run.ps1 -Client ${{ matrix.client }}
+
+      - name: Upload broker log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ matrix.client }}-logs
+          path: tests/clients/.logs/**
+          if-no-files-found: ignore
+
   pack:
     runs-on: ubuntu-latest
     steps:

@@ -93,6 +93,47 @@ TLS clients must attach the `SslOption` to the explicit endpoint:
 The self-signed test certificate requires
 `AcceptablePolicyErrors = RemoteCertificateNameMismatch | RemoteCertificateChainErrors`.
 
+## Multi-client conformance
+
+A second gate drives the published sample host over real sockets with four independent
+AMQP 0-9-1 client libraries: Python **Pika 1.4.4**, Node **amqplib 2.3.1**, the
+**RabbitMQ Java client 5.25.0**, and Go **amqp091-go v1.16.0**. The suites are
+client-only; one PowerShell runner publishes the host, starts a fresh memory-only broker
+on a free port per client, and fails unless every required scenario prints
+`PASS <id>`.
+
+| Scenario id | What it proves |
+|-------------|----------------|
+| `connect` | PLAIN auth, vhost and channel open, clean close |
+| `roundtrip` | Declare, bind, publish, `basic.get`, byte-identical body, ack |
+| `properties` | Content type, correlation id, message id, timestamp, and string/bool/number headers survive value-level round trips |
+| `qos` | Prefetch admits exactly N unacked deliveries and resumes after acks |
+| `nack-requeue` | `basic.nack(requeue=true)` redelivers the body with the redelivered flag |
+| `ack` | Acked messages leave the queue |
+| `basic-get-empty` | `basic.get` on an empty queue returns get-empty without closing the channel |
+| `confirms` | A successful publish receives `basic.ack` in confirm mode |
+| `round-robin` | Two consumers on one queue each receive every message exactly once |
+
+[`tests/clients/scenarios.json`](../tests/clients/scenarios.json) maps every id to the
+C# test that pins the same semantics; `confirms` maps to
+`RedisMQ.Broker.Tests/ConfirmPipelineTests.cs`. The C# conformance suite remains **19
+tests** and is still the semantic reference; this gate adds real third-party client
+behavior on top.
+
+Run it locally:
+
+```powershell
+pwsh tests/clients/run.ps1 -Client all
+```
+
+Prerequisites and per-client details are in
+[`tests/clients/README.md`](../tests/clients/README.md). CI has a `conformance` matrix
+job with one leg per client.
+
+Out of scope for this gate: TLS (covered by `TlsFlowTests` and per-language trust
+stores) and Redis-engine behavior (covered by `RedisMQ.Redis.Tests`). These suites run
+memory-only (`InMemoryEngine`).
+
 ## Beyond the conformance suite
 
 Observability added **no wire surface**: no new frames, methods or content-property

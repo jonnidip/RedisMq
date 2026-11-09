@@ -5,7 +5,7 @@
 | [`README.md`](../README.md) | Project overview, quick start, durability contract, architecture summary |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Internal architecture, layers, lifecycle, confirms, durability mirroring, DLX/TTL, permissions, TLS |
 | [`PROTOCOL.md`](PROTOCOL.md) | AMQP 0-9-1 wire dialect, method set, queue arguments, confirms, error codes, deviations |
-| [`CONFORMANCE.md`](CONFORMANCE.md) | RabbitMQ.Client 7.x conformance suite guide and complementary coverage |
+| [`CONFORMANCE.md`](CONFORMANCE.md) | C# and multi-client (Pika, amqplib, Java, Go) conformance guide and complementary coverage |
 | [`API.md`](API.md) | API reference for `RedisMQ.Broker` and `RedisMQ.Redis` |
 | [`DEVELOPMENT.md`](DEVELOPMENT.md) | Build/test workflow, Redis reset, SDD task flow, conventions, remaining work |
 
@@ -61,10 +61,7 @@ tests/RedisMQ.Redis.Tests/   # Redis mirror/replay/dedupe tests (60)
 ## What remains for production v1
 
 - Connection/channel profiles and tuning beyond RabbitMQ defaults.
-- Observability: metrics, structured logging, health endpoints.
 - Performance: pipelining, mirror batching, benchmarks.
-- Broader client compatibility (Pika and others).
-- Packaging: NuGet, container image, configuration binding.
 - Operational hardening: certificate hot-reload, Redis failure recovery policy,
   runtime user/vhost/permission management.
 

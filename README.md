@@ -467,6 +467,9 @@ round-trip the bytes back.
 See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for scenario-level detail and the
 broker/Redis suite coverage that complements conformance.
 
+A second gate runs Pika, amqplib, the RabbitMQ Java client and amqp091-go over real
+sockets; see [docs/CONFORMANCE.md](docs/CONFORMANCE.md#multi-client-conformance).
+
 ---
 
 ## API Reference

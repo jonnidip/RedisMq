@@ -62,9 +62,27 @@ those are not analyzer warnings and do not count.)
 | Real-client conformance | `RedisMQ.Conformance` | 19 passed |
 | Redis mirror/replay | `RedisMQ.Redis.Tests` | 67 passed (or skipped without Redis) |
 | Hosting/configuration | `RedisMQ.Hosting.Tests` | 11 passed |
+| Multi-client conformance | `tests/clients/run.ps1` | 9/9 per client |
 
 Run the broker and conformance suites twice after touching TLS or confirm timing to
 catch handshake and backpressure flakes.
+
+### Client conformance
+
+`tests/clients/run.ps1` publishes `samples/RedisMQ.Host` and runs the Pika, Node
+(amqplib), Java (RabbitMQ Java client) and Go (amqp091-go) suites against a fresh
+memory-only broker per client:
+
+```powershell
+pwsh tests/clients/run.ps1 -Client all
+pwsh tests/clients/run.ps1 -Client pika   # one client while iterating
+```
+
+Prerequisites are Python 3, Node 22 + npm, Java 21 + Maven, and Go 1.23+, plus the
+.NET 10 SDK. The runner installs dependencies unless `-SkipPrepare` is passed and fails
+on a missing toolchain unless `-SkipMissing` is passed. Details, pinned library
+versions and the scenario manifest live in
+[`tests/clients/README.md`](../tests/clients/README.md).
 
 ## Redis for tests
 
@@ -223,6 +241,5 @@ documented in [PACKAGING.md](PACKAGING.md).
 
 - Connection/channel profiles and tuning beyond RabbitMQ defaults.
 - Throughput work: pipelining, mirror batching, benchmarks.
-- Client compatibility beyond RabbitMQ.Client 7.x (Pika and others).
 - Operational hardening: certificate hot-reload, Redis failure recovery policy,
   runtime user/vhost/permission management.
