@@ -17,7 +17,9 @@ public sealed class BrokerDiagnosticsTests
         using var meter = new MeterCollector();
         diag.Count(diag.ReaperSweeps, new TagList());
 
-        MeasurementRecord record = Assert.Single(meter.For("redismq.reaper.sweeps"));
+        MeasurementRecord record = Assert.Single(
+            meter.For("redismq.reaper.sweeps"),
+            r => r.Tags["broker.instance"] is "inst1");
         Assert.Equal(1, record.LongValue);
         Assert.Equal("inst1", record.Tags["broker.instance"]);
     }
@@ -70,9 +72,13 @@ public sealed class BrokerDiagnosticsTests
         first.Count(first.ReaperSweeps, new TagList());
         second.Count(second.ReaperSweeps, new TagList());
 
-        Assert.Equal(2, meter.For("redismq.reaper.sweeps").Count);
-        Assert.Contains(meter.For("redismq.reaper.sweeps"), r => r.Tags["broker.instance"] is "a");
-        Assert.Contains(meter.For("redismq.reaper.sweeps"), r => r.Tags["broker.instance"] is "b");
+        // The listener is process-wide, so other tests' sweeps can arrive concurrently;
+        // attribute to this test's instances instead of counting every record.
+        List<MeasurementRecord> own = [.. meter.For("redismq.reaper.sweeps")
+            .Where(r => r.Tags["broker.instance"] is "a" or "b")];
+        Assert.Equal(2, own.Count);
+        Assert.Contains(own, r => r.Tags["broker.instance"] is "a");
+        Assert.Contains(own, r => r.Tags["broker.instance"] is "b");
     }
 
     [Fact]
