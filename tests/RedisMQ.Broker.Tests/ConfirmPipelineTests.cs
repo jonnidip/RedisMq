@@ -15,7 +15,7 @@ namespace RedisMQ.Broker.Tests;
 // M4 Task 6: publisher confirms become honest and ordered. In confirm mode the
 // channel hands one PendingConfirm per publish (routed, unroutable, mandatory) to
 // the connection's single confirm loop; the loop awaits every durability receipt
-// before it emits confirm.ack/nack, and a full confirm queue blocks the frame pump
+// before it emits basic.ack/nack (publisher confirms), and a full confirm queue blocks the frame pump
 // instead of inventing an answer. The harness is the per-file raw-client copy the
 // M0 tests use.
 public sealed class ConfirmPipelineTests
@@ -40,7 +40,7 @@ public sealed class ConfirmPipelineTests
 
             receipt.SetResult(true);
 
-            AmqpMethod ack = await client.ReadMethodOnChannelAsync(1, 85, 50);
+            AmqpMethod ack = await client.ReadMethodOnChannelAsync(1, 60, 80);
             Assert.Equal(1L, ack.Get("delivery-tag"));
             Assert.False(ack.Get("multiple") is true);
         }
@@ -64,7 +64,7 @@ public sealed class ConfirmPipelineTests
 
             await PublishAsync(client, 1, "", "q");
 
-            AmqpMethod nack = await client.ReadMethodOnChannelAsync(1, 85, 51);
+            AmqpMethod nack = await client.ReadMethodOnChannelAsync(1, 60, 120);
             Assert.Equal(1L, nack.Get("delivery-tag"));
             Assert.False(nack.Get("multiple") is true);
             Assert.False(nack.Get("requeue") is true);
@@ -98,8 +98,8 @@ public sealed class ConfirmPipelineTests
 
             receipts[0].SetResult(true);
 
-            AmqpMethod first = await client.ReadMethodOnChannelAsync(1, 85, 50);
-            AmqpMethod second = await client.ReadMethodOnChannelAsync(1, 85, 50);
+            AmqpMethod first = await client.ReadMethodOnChannelAsync(1, 60, 80);
+            AmqpMethod second = await client.ReadMethodOnChannelAsync(1, 60, 80);
             Assert.Equal(1L, first.Get("delivery-tag"));
             Assert.Equal(2L, second.Get("delivery-tag"));
         }
@@ -131,8 +131,8 @@ public sealed class ConfirmPipelineTests
             await receipts.WaitForAsync(1);
             receipts[0].SetResult(true);
 
-            AmqpMethod first = await client.ReadMethodOnChannelAsync(1, 85, 50);
-            AmqpMethod second = await client.ReadMethodOnChannelAsync(1, 85, 50);
+            AmqpMethod first = await client.ReadMethodOnChannelAsync(1, 60, 80);
+            AmqpMethod second = await client.ReadMethodOnChannelAsync(1, 60, 80);
             Assert.Equal(1L, first.Get("delivery-tag"));
             Assert.Equal(2L, second.Get("delivery-tag"));
         }
@@ -161,7 +161,7 @@ public sealed class ConfirmPipelineTests
             Assert.Equal("returned", Encoding.UTF8.GetString(body));
             Assert.Equal(60, header.ClassId);
 
-            AmqpMethod ack = await client.ReadMethodOnChannelAsync(1, 85, 50);
+            AmqpMethod ack = await client.ReadMethodOnChannelAsync(1, 60, 80);
             Assert.Equal(1L, ack.Get("delivery-tag"));
         }
         finally
@@ -234,8 +234,8 @@ public sealed class ConfirmPipelineTests
             receipts[0].SetResult(true);
 
             AmqpMethod ackOne = await client.ReadMethodOnChannelAsync(1, 0, 0);
-            Assert.Equal(85, ackOne.ClassId);
-            Assert.Equal(50, ackOne.MethodId);
+            Assert.Equal(60, ackOne.ClassId);
+            Assert.Equal(80, ackOne.MethodId);
             Assert.Equal(1L, ackOne.Get("delivery-tag"));
 
             // The unblocked pump continues with publish 2's confirm and the queued
@@ -244,7 +244,7 @@ public sealed class ConfirmPipelineTests
             AmqpMethod third = await client.ReadMethodOnChannelAsync(1, 0, 0);
             AmqpMethod[] tail = [second, third];
             Assert.Contains(tail, method =>
-                method.ClassId == 85 && method.MethodId == 50 && (long)method.Get("delivery-tag")! == 2L);
+                method.ClassId == 60 && method.MethodId == 80 && (long)method.Get("delivery-tag")! == 2L);
             Assert.Contains(tail, method => method.ClassId == 50 && method.MethodId == 11);
         }
         finally

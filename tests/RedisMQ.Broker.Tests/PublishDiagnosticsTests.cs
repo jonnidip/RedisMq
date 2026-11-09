@@ -58,7 +58,7 @@ public sealed class PublishDiagnosticsTests
         await harness.DeclareQueueAsync(1, "q");
 
         await harness.PublishAsync(1, "", "q");
-        _ = await harness.ReadMethodOnChannelAsync(1, 85, 50); // confirm.ack
+        _ = await harness.ReadMethodOnChannelAsync(1, 60, 80); // basic.ack (publisher confirm)
 
         await WaitUntilAsync(
             () => meter.For("redismq.confirms").Count(r => r.Tags["broker.instance"] is "pub2") == 1,
@@ -97,7 +97,7 @@ public sealed class PublishDiagnosticsTests
         await harness.DeclareQueueAsync(1, "q");
 
         await harness.PublishAsync(1, "", "q");
-        _ = await harness.ReadMethodOnChannelAsync(1, 85, 51); // confirm.nack
+        _ = await harness.ReadMethodOnChannelAsync(1, 60, 120); // basic.nack (publisher confirm)
 
         Assert.Equal("refused", Assert.Single(
             meter.For("redismq.publishes"),
@@ -126,7 +126,7 @@ public sealed class PublishDiagnosticsTests
         await harness.DeclareQueueAsync(1, "q");
 
         await harness.PublishAsync(1, "", "q");
-        _ = await harness.ReadMethodOnChannelAsync(1, 85, 51); // confirm.nack (timeout)
+        _ = await harness.ReadMethodOnChannelAsync(1, 60, 120); // basic.nack (publisher confirm) (timeout)
 
         await WaitUntilAsync(
             () => activities.Stopped.Count(a => a.OperationName == "amqp.publish"

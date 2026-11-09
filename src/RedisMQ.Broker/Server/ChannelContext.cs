@@ -1734,16 +1734,19 @@ public sealed class ChannelContext
     internal bool IsOpen => _state == ChannelState.Running;
 
     /// <summary>Schedules the confirm outcome on the channel's writer chain, so an
-    /// async confirm interleaves with deliveries and replies in schedule order.</summary>
+    /// async confirm interleaves with deliveries and replies in schedule order.
+    /// Publisher confirms reuse <c>basic.ack</c>/<c>basic.nack</c> server-to-client,
+    /// exactly as RabbitMQ and the mainstream clients expect; the <c>confirm</c>
+    /// class carries only select/select-ok.</summary>
     internal void ScheduleConfirmResult(long sequence, bool ack)
     {
         AmqpMethod method = ack
-            ? NewMethod("confirm.ack", confirm =>
+            ? NewMethod("basic.ack", confirm =>
             {
                 confirm.Set("delivery-tag", sequence);
                 confirm.Set("multiple", false);
             })
-            : NewMethod("confirm.nack", confirm =>
+            : NewMethod("basic.nack", confirm =>
             {
                 confirm.Set("delivery-tag", sequence);
                 confirm.Set("multiple", false);

@@ -213,7 +213,8 @@ public sealed class M0RegressionTests
 
         // Channel is open with confirms enabled. basic.publish outcomes ride the
         // connection's ordered confirm loop: the loop awaits the engine's durability
-        // receipts and then writes confirm.ack/nack on the channel's writer chain.
+        // receipts and then writes basic.ack/nack (publisher confirms) on the
+        // channel's writer chain.
         // This test pins the confirm.select → confirm.select-ok handshake.
         Assert.True(channel.IsOpen);
     }
