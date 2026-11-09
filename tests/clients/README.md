@@ -33,6 +33,10 @@ broker runs memory-only (`RedisMQ__Redis__ConnectionString=`); no Redis server i
 PowerShell 7 (`pwsh`) is used locally and in CI; Windows PowerShell 5.1 also runs the
 script.
 
+Maven is not available through winget in every environment; use the Apache Maven 3.9.x
+binary zip (or `choco install maven` from an elevated shell) and put its `bin` on `PATH`.
+Go installs from the official zip, or `winget install GoLang.Go` where winget has it.
+
 ## Run
 
 From the repository root:
