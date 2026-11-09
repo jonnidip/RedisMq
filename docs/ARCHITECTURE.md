@@ -317,8 +317,8 @@ receives exactly one ordered outcome.
 2. It hands a `PendingConfirm` to the connection's `EnqueueConfirm`.
 3. The connection's single confirm loop processes entries in sequence order:
    - Await every receipt, bounded by `BrokerServerOptions.ConfirmTimeout`.
-   - All durable or no receipts → `confirm.ack(tag, multiple=false)`.
-   - Any refusal, fault or timeout → `confirm.nack(tag, multiple=false,
+   - All durable or no receipts → `basic.ack(tag, multiple=false)`.
+   - Any refusal, fault or timeout → `basic.nack(tag, multiple=false,
      requeue=false)`.
    - A mandatory-unroutable publish writes its `basic.return` **before** the confirm.
 4. Outcomes are written through the channel's writer chain so they interleave

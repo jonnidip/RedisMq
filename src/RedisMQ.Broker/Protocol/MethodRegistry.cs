@@ -370,15 +370,6 @@ public static class MethodRegistry
             A("nowait", WireType.Bit)
         ),
         M(85, 11, "confirm.select-ok", Direction.ServerToClient, false),
-        M(85, 50, "confirm.ack", Direction.ServerToClient, false,
-            A("delivery-tag", WireType.LongLong),
-            A("multiple", WireType.Bit)
-        ),
-        M(85, 51, "confirm.nack", Direction.ServerToClient, false,
-            A("delivery-tag", WireType.LongLong),
-            A("multiple", WireType.PackedBit),
-            A("requeue", WireType.DependingBit)
-        ),
     ];
 
     private static readonly ContentProperty[] _basicContentProperties =

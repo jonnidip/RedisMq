@@ -124,12 +124,15 @@ close (10,50), close-ok (10,51), blocked (10,60 — no-op), unblocked (10,61 —
 `confirm.select` enables confirm mode for the channel. Every publish after that gets
 exactly one outcome, on the channel's writer chain, in publish-sequence order:
 
-- `confirm.ack(delivery-tag = sequence, multiple = false)` when every target of the
+- `basic.ack(delivery-tag = sequence, multiple = false)` when every target of the
   publish is durable (or the publish was unroutable and therefore had nothing to
   persist).
-- `confirm.nack(delivery-tag = sequence, multiple = false, requeue = false)` when any
+- `basic.nack(delivery-tag = sequence, multiple = false, requeue = false)` when any
   target refused, faulted, or exceeded `ConfirmTimeout`.
 - A mandatory-unroutable publish receives `basic.return` **before** its confirm.
+
+The `confirm` class itself carries only `select` and `select-ok`; the outcomes are
+the standard `basic.ack`/`basic.nack` methods (class 60), as RabbitMQ clients expect.
 
 The confirm sequence is per channel and monotonic. Confirms are never batched with
 `multiple=true`. A full `ConfirmQueueCapacity` blocks the publishing connection until a

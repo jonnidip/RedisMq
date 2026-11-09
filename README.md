@@ -64,7 +64,7 @@ Expected results:
 | `RedisMQ.Conformance` | 19 | 0 | 0 |
 | `RedisMQ.Redis.Tests` | 67 | 0 | 0 |
 | `RedisMQ.Hosting.Tests` | 11 | 0 | 0 |
-| `dotnet build RedisMQ.sln` | — | — | 0 |
+| `dotnet build RedisMQ.sln` | — | 0 | 86 (pre-existing nullable warnings) |
 
 ### Run in Docker
 
@@ -89,7 +89,9 @@ RedisMQ ships as three packages:
 - `RedisMQ.Hosting` — `IConfiguration` binding, DI and hosted lifecycle
 
 ```bash
-dotnet add package RedisMQ.Hosting --prerelease
+# The packages are built locally; nothing is published to nuget.org yet.
+dotnet pack RedisMQ.sln -c Release -o artifacts
+dotnet add package RedisMQ.Hosting --prerelease --source ./artifacts
 ```
 
 ### Minimal in-memory host
@@ -189,12 +191,12 @@ await using var connection = await factory.CreateConnectionAsync(
 
 RedisMQ is deliberately explicit about what a confirm means.
 
-| Engine | `confirm.ack` means |
+| Engine | `basic.ack` means |
 |--------|---------------------|
 | `RedisStreamRouteEngine` (Redis reachable) | Every queue target of the publish accepted its `XADD`. For a fan-out to N queues, **all N** writes must succeed. |
 | `RedisStreamRouteEngine` with a full drainer queue | The publish is refused **before it touches memory**; the confirm is `nack`. |
 | `InMemoryEngine`, or a Redis engine constructed with a null `IDatabase` | Nothing durable happened. Confirms are immediate acks because the engine makes no durability promise. |
-| Any engine, receipt slower than `ConfirmTimeout` | `confirm.nack`; the timed-out `XADD` may still land later. |
+| Any engine, receipt slower than `ConfirmTimeout` | `basic.nack`; the timed-out `XADD` may still land later. |
 
 - Confirms are ordered per publish sequence and sent on the connection's single
   confirm loop. A mandatory-unroutable publish emits `basic.return` **before** its
@@ -637,7 +639,7 @@ Documented and pinned by tests rather than hidden:
   delivery can still repeat.
 - **Unacked replay is `Redelivered=false`.** Messages restored from Redis never had
   a delivery stamped in the stream, so a crash-recovered delivery looks new.
-- **Confirm timeout may still land.** A `confirm.nack` after `ConfirmTimeout` can be
+- **Confirm timeout may still land.** A `basic.nack` after `ConfirmTimeout` can be
   followed by the timed-out `XADD` reaching Redis, so a nacked publish may persist.
 - **Settle/confirm mirroring can duplicate under pressure.** The mirror is
   best-effort by design; memory remains the system of record.

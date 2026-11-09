@@ -58,7 +58,7 @@ public sealed class BrokerServerOptions
     public int ConfirmQueueCapacity { get; set; } = 4096;
 
     /// <summary>How long the confirm loop waits for a publish's durability receipts
-    /// before answering confirm.nack.</summary>
+    /// before answering basic.nack.</summary>
     public TimeSpan ConfirmTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>How often the server sweeps expired messages and idle queues. The

@@ -561,7 +561,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
                 // Drainer is best-effort: memory is the system of record. A
                 // transient Redis failure drops the mirrored write; the in-memory
                 // state is already updated, and a waiting publisher is told the
-                // truth (confirm.nack) rather than a lie.
+                // truth (basic.nack) rather than a lie.
                 succeeded = false;
                 Interlocked.Increment(ref _mirrorFailures);
                 string error = SanitizeMirrorError(ex);

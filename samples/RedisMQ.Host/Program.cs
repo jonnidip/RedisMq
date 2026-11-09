@@ -10,7 +10,7 @@ WebApplication app = builder.Build();
 app.MapGet("/", (IConfiguration configuration) =>
     Results.Text(
         $"RedisMQ broker — AMQP {configuration["RedisMQ:Broker:Port"] ?? "5672"}, " +
-        $"HTTP {configuration["Urls"] ?? "http://+:8080"}"));
+        $"HTTP {configuration["ASPNETCORE_URLS"] ?? "http://localhost:5000"}"));
 
 app.MapGet("/livez", (AmqpBrokerServer server) =>
 {

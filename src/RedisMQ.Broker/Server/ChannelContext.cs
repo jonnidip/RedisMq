@@ -652,7 +652,7 @@ public sealed class ChannelContext
 
             // One ordered outcome for every publish on a confirm-mode channel: the
             // connection's confirm loop awaits the receipts, then writes the return
-            // (if any) followed by confirm.ack/nack for this sequence. Record before the
+            // (if any) followed by basic.ack/nack for this sequence. Record before the
             // hand-off so the span carries the dispatch outcome even if the loop stops it
             // immediately.
             RecordOutcome();
@@ -1664,8 +1664,8 @@ public sealed class ChannelContext
     }
 
     /// <summary>confirm.select: enable publisher confirms on this channel. Replies
-    /// confirm.select-ok; subsequent publishes are confirmed with confirm.ack (or
-    /// confirm.nack on failure) once the message has been handled.</summary>
+    /// confirm.select-ok; subsequent publishes are confirmed with basic.ack (or
+    /// basic.nack on failure) once the message has been handled.</summary>
     private ChannelOutcome OnConfirmSelect(AmqpMethod method)
     {
         _confirmMode = true;

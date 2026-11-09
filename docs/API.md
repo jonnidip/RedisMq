@@ -84,7 +84,7 @@ public sealed class BrokerServerOptions
 | `Users` | PLAIN accounts. Empty by default: nobody can authenticate until a user is configured. |
 | `FrameMax` / `Heartbeat` | Values offered at `connection.tune`. |
 | `ConfirmQueueCapacity` | Admitted-but-unflushed confirms per connection. A full pipeline blocks the frame pump (backpressure), never drops or invents a confirm. |
-| `ConfirmTimeout` | How long the confirm loop waits for a publish's receipts before `confirm.nack`. |
+| `ConfirmTimeout` | How long the confirm loop waits for a publish's receipts before `basic.nack`. |
 | `ReaperInterval` | Sweep interval for message TTL, `x-expires` and `x-delivery-limit` work. `<= 0` disables the reaper. |
 | `Tls` | TLS listener settings; `null` or disabled means no TLS listener. |
 
@@ -213,7 +213,7 @@ Key internals (documented for maintainers):
   pump and queue pumps.
 - One ordered confirm loop per connection. `EnqueueConfirm` blocks the frame pump
   when the bounded pipeline is full; the loop waits on every receipt, then emits
-  `basic.return` (mandatory unroutable) before `confirm.ack`/`confirm.nack`.
+  `basic.return` (mandatory unroutable) before `basic.ack`/`basic.nack`.
 - `HeartbeatWatchdog` kills at 2× negotiated heartbeat; reset on every inbound frame.
 - Connection teardown calls `IRouteEngine.ReconcileConnection(connectionId)`.
 

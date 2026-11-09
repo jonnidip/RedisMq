@@ -877,8 +877,8 @@ public sealed class WireConnection : IAsyncDisposable, IChannelDeliveryHost
     }
 
     /// <summary>Waits for every receipt in the entry, then writes the outcome in publish
-    /// order: the mandatory return first, then confirm.ack (all durable/empty) or
-    /// confirm.nack (any refusal, fault or timeout). Timeout is not cancellation: a
+    /// order: the mandatory return first, then basic.ack (all durable/empty) or
+    /// basic.nack (any refusal, fault or timeout). Timeout is not cancellation: a
     /// timed-out XADD may still land, which is documented at-least-once behavior.
     /// Metrics/span tags are emitted only for a live channel; a retired one is dropped
     /// without inventing an outcome.</summary>

@@ -13,7 +13,7 @@ using RedisMQ.Broker.Memory;
 /// replaced channel number makes the entry stale (sequence numbers are never
 /// reused for another channel).</param>
 /// <param name="ChannelNumber">The wire channel number the outcome is written on.</param>
-/// <param name="Sequence">The publish's confirm sequence (confirm.ack/nack tag).</param>
+/// <param name="Sequence">The publish's confirm sequence (basic.ack/nack tag).</param>
 /// <param name="Receipts">One durability receipt per routed queue; empty for an
 /// unroutable publish. No receipt means "nothing to persist".</param>
 /// <param name="ReturnFirst">The mandatory-unroutable basic.return, written before

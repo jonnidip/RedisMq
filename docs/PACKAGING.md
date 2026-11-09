@@ -13,7 +13,9 @@ run the container image. The runnable reference is
 | `RedisMQ.Hosting` | `IConfiguration` binding, DI registration and the hosted-service lifecycle. | `RedisMQ.Broker`, `RedisMQ.Redis`, Microsoft.Extensions.*. |
 
 ```bash
-dotnet add package RedisMQ.Hosting --prerelease
+# The packages are built locally; nothing is published to nuget.org yet.
+dotnet pack RedisMQ.sln -c Release -o artifacts
+dotnet add package RedisMQ.Hosting --prerelease --source ./artifacts
 ```
 
 Add `RedisMQ.Broker` alone for an embedded in-memory broker, or `RedisMQ.Redis` when the
@@ -161,7 +163,7 @@ A configured connection string selects `RedisStreamRouteEngine` and registers an
   not abort startup; the broker serves memory-only and `/healthz` reports
   `ready: false` (the detail names the sanitized error).
 - The write-ahead log is mirrored by one background drainer, so the protocol thread
-  never blocks on Redis. A full drainer refuses the publish with `confirm.nack` rather
+  never blocks on Redis. A full drainer refuses the publish with `basic.nack` rather
   than dropping it.
 
 Use a fresh Redis store: there is no migration path from earlier milestone formats.
