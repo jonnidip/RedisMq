@@ -56,6 +56,13 @@ if ($KeepBroker -and $clients.Count -ne 1) {
     throw '-KeepBroker requires exactly one -Client value.'
 }
 
+$keepBroker = [bool]$KeepBroker
+$clientEnvNames = @('REDISMQ_HOST', 'REDISMQ_PORT', 'REDISMQ_USER', 'REDISMQ_PASSWORD', 'REDISMQ_VHOST')
+$savedClientEnv = @{}
+foreach ($key in $clientEnvNames) {
+    $savedClientEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+}
+
 function Write-Step([string]$Message) {
     [Console]::Error.WriteLine("==> $Message")
 }
@@ -63,7 +70,14 @@ function Write-Step([string]$Message) {
 function Resolve-Python {
     foreach ($name in @('python', 'py')) {
         $command = Get-Command $name -ErrorAction SilentlyContinue
-        if ($command) { return $command.Source }
+        if (-not $command) { continue }
+        try {
+            & $command.Source --version *> $null
+            if ($LASTEXITCODE -eq 0) { return $command.Source }
+        }
+        catch {
+            # The Microsoft Store alias throws instead of running Python; try the next.
+        }
     }
 
     return $null
@@ -132,6 +146,8 @@ function Get-ClientSpec([string]$Name) {
 }
 
 function Invoke-Logged([string]$Exe, [string[]]$Arguments, [string]$WorkingDirectory, [string]$OutFile, [string]$ErrFile) {
+    # PS 5.1 returns a null ExitCode when -PassThru is combined with redirection,
+    # so -Wait is required to observe the child's exit code here.
     $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory `
         -PassThru -Wait -NoNewWindow -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile
     return $process.ExitCode
@@ -268,7 +284,7 @@ try {
         }
 
         try {
-            $broker = Start-Process -FilePath 'dotnet' -ArgumentList $brokerDll -WorkingDirectory $publishDir `
+            $broker = Start-Process -FilePath 'dotnet' -ArgumentList "`"$brokerDll`"" -WorkingDirectory $publishDir `
                 -PassThru -NoNewWindow -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
         }
         finally {
@@ -332,12 +348,19 @@ catch {
     $exitCode = 1
 }
 finally {
-    if ($broker -and -not $keepBroker -and -not $broker.HasExited) {
-        Stop-Process -Id $broker.Id -Force -ErrorAction SilentlyContinue
+    if ($broker -and -not $keepBroker) {
+        if (-not $broker.HasExited) {
+            Stop-Process -Id $broker.Id -Force -ErrorAction SilentlyContinue
+        }
+        $broker.WaitForExit(5000) | Out-Null
     }
 
     if (-not $keepBroker -and (Test-Path $publishDir)) {
         Remove-Item $publishDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    foreach ($key in $savedClientEnv.Keys) {
+        [Environment]::SetEnvironmentVariable($key, $savedClientEnv[$key], 'Process')
     }
 }
 

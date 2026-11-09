@@ -215,8 +215,9 @@ async function scenarioNackRequeue() {
 
 async function scenarioAck() {
   const connection = requireOk(await connect());
-  const channel = await connection.createChannel();
+  let channel = await connection.createChannel();
   const queue = 'conformance.ack.queue';
+  let probe = null;
   try {
     await channel.assertQueue(queue, { durable: false, autoDelete: false });
     channel.sendToQueue(queue, Buffer.from('ack-1'));
@@ -228,11 +229,18 @@ async function scenarioAck() {
       channel.ack(message);
     }
 
-    await delay(200);
-    ensure((await getMessage(channel, queue)) === null, 'queue not empty after acks');
+    // Close the settling channel: unacked messages requeue on close, so a
+    // broker that ignored the acks cannot hide them in the channel ledger.
+    await channel.close();
+    channel = null;
+    probe = await connection.createChannel();
+    const leftover = await waitFor(() => getMessage(probe, queue), 500);
+    ensure(leftover === null, `queue not empty after acks: ${leftover && leftover.content}`);
   } finally {
-    try { await channel.deleteQueue(queue); } catch (ignored) { /* channel already closed */ }
-    await closeQuietly(channel, connection);
+    if (probe) {
+      try { await probe.deleteQueue(queue); } catch (ignored) { /* channel already closed */ }
+    }
+    await closeQuietly(probe || channel, connection);
   }
 }
 
@@ -281,7 +289,8 @@ async function scenarioRoundRobin() {
   const channelA = await connection.createChannel();
   const channelB = await connection.createChannel();
   const queue = 'conformance.roundrobin.queue';
-  const bodies = [];
+  const bodiesA = [];
+  const bodiesB = [];
   try {
     await channelA.assertQueue(queue, { durable: false, autoDelete: false });
     await channelA.prefetch(1);
@@ -289,13 +298,13 @@ async function scenarioRoundRobin() {
 
     const consumerA = await channelA.consume(queue, (message) => {
       if (message) {
-        bodies.push(message.content.toString());
+        bodiesA.push(message.content.toString());
         channelA.ack(message);
       }
     }, { noAck: false });
     const consumerB = await channelB.consume(queue, (message) => {
       if (message) {
-        bodies.push(message.content.toString());
+        bodiesB.push(message.content.toString());
         channelB.ack(message);
       }
     }, { noAck: false });
@@ -304,11 +313,14 @@ async function scenarioRoundRobin() {
       channelA.sendToQueue(queue, Buffer.from(`rr-${index}`));
     }
 
-    await waitFor(() => bodies.length >= 10);
-    ensure(bodies.length === 10, `expected 10 deliveries, got ${bodies.length}`);
-    const received = [...bodies].sort();
+    await waitFor(() => bodiesA.length + bodiesB.length >= 10);
+    ensure(bodiesA.length + bodiesB.length === 10,
+      `expected 10 deliveries, got ${bodiesA.length + bodiesB.length}`);
+    const received = [...bodiesA, ...bodiesB].sort();
     const expected = Array.from({ length: 10 }, (_, index) => `rr-${index}`).sort();
     ensure(JSON.stringify(received) === JSON.stringify(expected), `delivery set mismatch: ${received}`);
+    ensure(bodiesA.length > 0 && bodiesB.length > 0,
+      `round-robin did not reach both consumers: A=${bodiesA.length} B=${bodiesB.length}`);
 
     await channelA.cancel(consumerA.consumerTag);
     await channelB.cancel(consumerB.consumerTag);
@@ -345,7 +357,7 @@ async function main() {
   return 0;
 }
 
-main().then((code) => process.exit(code), (error) => {
+main().then((code) => { process.exitCode = code; }, (error) => {
   process.stderr.write(`${error.stack || error}\n`);
-  process.exit(1);
+  process.exitCode = 1;
 });

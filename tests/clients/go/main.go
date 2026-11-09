@@ -299,7 +299,7 @@ func ack() error {
 	if err != nil {
 		return err
 	}
-	defer cleanup(conn, channel, queue, "")
+	defer func() { _ = conn.Close() }()
 
 	if _, err := channel.QueueDeclare(queue, false, false, false, false, nil); err != nil {
 		return err
@@ -321,17 +321,31 @@ func ack() error {
 		}
 	}
 
+	// Close the settling channel: unacked messages requeue on close, so a broker
+	// that ignored the acks cannot hide them in the channel's ledger.
+	if err := channel.Close(); err != nil {
+		return err
+	}
+	probe, err := conn.Channel()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = probe.QueueDelete(queue, false, false, false)
+		_ = probe.Close()
+	}()
+
 	deadline := time.Now().Add(wait)
 	for {
-		_, ok, err := channel.Get(queue, false)
+		delivery, ok, err := probe.Get(queue, false)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return nil
+		if ok {
+			return fmt.Errorf("queue not empty after acks: %s", delivery.Body)
 		}
 		if time.Now().After(deadline) {
-			return errors.New("queue not empty after acks")
+			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -421,7 +435,6 @@ func roundRobin() error {
 		return err
 	}
 	defer cleanup(conn, channelA, queue, "")
-	defer channelA.Close()
 
 	channelB, err := conn.Channel()
 	if err != nil {
@@ -448,22 +461,28 @@ func roundRobin() error {
 		return err
 	}
 
-	// Two consumer goroutines append concurrently; guard both the bodies and the
-	// observed consumer tags so the slice is never read or written unsynchronized.
+	// Two consumer goroutines append concurrently; guard the bodies, the counts
+	// and the observed consumer tags so nothing is read or written unsynchronized.
+	// The C# reference puts both consumers on one channel; this suite uses one
+	// channel per consumer so the two goroutines never share a client channel.
 	var mu sync.Mutex
 	bodies := make([]string, 0, 10)
+	countA, countB := 0, 0
 	var tagA, tagB string
-	ackAll := func(deliveries <-chan amqp.Delivery, channel *amqp.Channel, tag *string) {
+	ackAll := func(deliveries <-chan amqp.Delivery, channel *amqp.Channel, tag *string, count *int) {
 		for delivery := range deliveries {
 			mu.Lock()
 			*tag = delivery.ConsumerTag
+			*count = *count + 1
 			bodies = append(bodies, string(delivery.Body))
 			mu.Unlock()
 			_ = channel.Ack(delivery.DeliveryTag, false)
 		}
 	}
-	go ackAll(deliveriesA, channelA, &tagA)
-	go ackAll(deliveriesB, channelB, &tagB)
+	var consumers sync.WaitGroup
+	consumers.Add(2)
+	go func() { defer consumers.Done(); ackAll(deliveriesA, channelA, &tagA, &countA) }()
+	go func() { defer consumers.Done(); ackAll(deliveriesB, channelB, &tagB, &countB) }()
 
 	countBodies := func() int {
 		mu.Lock()
@@ -503,14 +522,20 @@ func roundRobin() error {
 	}
 
 	mu.Lock()
+	receivedA, receivedB := countA, countB
 	cancelA, cancelB := tagA, tagB
 	mu.Unlock()
+	if receivedA == 0 || receivedB == 0 {
+		return fmt.Errorf("round-robin did not reach both consumers: A=%d B=%d", receivedA, receivedB)
+	}
+
 	if cancelA != "" {
 		_ = channelA.Cancel(cancelA, false)
 	}
 	if cancelB != "" {
 		_ = channelB.Cancel(cancelB, false)
 	}
+	consumers.Wait()
 	return nil
 }
 

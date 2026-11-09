@@ -97,8 +97,8 @@ jobs:
       - name: Core has no package references
         run: |
           dotnet list src/RedisMQ.Broker/RedisMQ.Broker.csproj package --include-transitive --format json > core-packages.json
-          if jq -e '[.projects[].frameworks[] | (.topLevelPackages // []) + (.transitivePackages // [])] | flatten | length > 0' core-packages.json; then
-            echo "RedisMQ.Broker gained a package reference"
+          if ! jq -e '[.projects[].frameworks[] | (.topLevelPackages // []) + (.transitivePackages // [])] | flatten | length == 0' core-packages.json; then
+            echo "RedisMQ.Broker gained a package reference (or the package list could not be read)"
             exit 1
           fi
 

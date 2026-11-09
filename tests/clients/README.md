@@ -17,7 +17,7 @@ The nine required scenario ids live in [`scenarios.json`](scenarios.json):
 | `ack` | Acked messages leave the queue |
 | `basic-get-empty` | `basic.get` on an empty queue returns get-empty without closing the channel |
 | `confirms` | Publisher confirms receive one ack for a successful publish |
-| `round-robin` | Two consumers on one queue each receive every message exactly once |
+| `round-robin` | Two consumers on one queue split the messages, collectively receiving each exactly once |
 
 ## Prerequisites
 

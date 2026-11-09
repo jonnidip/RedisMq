@@ -152,7 +152,7 @@ responsibility.
 | `ack` | Acked messages leave the queue; a later `basic.get` is empty |
 | `basic-get-empty` | `basic.get` on an empty queue returns get-empty without closing the channel |
 | `confirms` | Confirm mode receives one `basic.ack` for a successful publish |
-| `round-robin` | Two consumers on one queue receive every message exactly once |
+| `round-robin` | Two consumers on one queue split the messages, collectively receiving each exactly once |
 
 All nine ids are required for every suite. The file also records the strongest C# test
 that covers each id — in `RedisMQ.Conformance` where a real-client test exists, otherwise

@@ -209,6 +209,7 @@ def scenario_ack():
     connection = connect()
     channel = connection.channel()
     queue = "conformance.ack.queue"
+    probe = None
     try:
         channel.queue_declare(queue=queue, durable=False, auto_delete=False)
         channel.basic_publish("", queue, b"ack-1")
@@ -219,10 +220,15 @@ def scenario_ack():
             require(message is not None, "acked message missing")
             channel.basic_ack(message[0].delivery_tag)
 
-        require(wait_for(lambda: get_message(channel, queue) is not None, timeout=0.5) is False,
+        # Close the settling channel: unacked messages requeue on close, so a
+        # broker that ignored the acks cannot hide them in the channel ledger.
+        channel.close()
+        probe = connection.channel()
+        require(wait_for(lambda: get_message(probe, queue) is not None, timeout=0.5) is False,
                 "queue not empty after acks")
     finally:
-        safe(lambda: channel.queue_delete(queue=queue))
+        if probe is not None:
+            safe(lambda: probe.queue_delete(queue=queue))
         safe(connection.close)
 
 
@@ -296,6 +302,11 @@ def scenario_round_robin():
         received = sorted(body for _ch, _tag, body in bodies)
         expected = sorted(f"rr-{index}".encode() for index in range(10))
         require(received == expected, f"delivery set mismatch: {received!r}")
+
+        from_a = sum(1 for ch, _tag, _body in bodies if ch is channel_a)
+        from_b = sum(1 for ch, _tag, _body in bodies if ch is channel_b)
+        require(from_a > 0 and from_b > 0,
+                f"round-robin did not reach both consumers: A={from_a} B={from_b}")
 
         channel_a.basic_cancel(tag_a)
         channel_b.basic_cancel(tag_b)

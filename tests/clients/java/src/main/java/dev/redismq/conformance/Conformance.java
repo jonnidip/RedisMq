@@ -20,11 +20,13 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
-/// RabbitMQ Java client conformance suite for RedisMQ.
-///
-/// Reads the broker coordinates from the environment, runs the nine named
-/// scenarios, and prints "PASS <id>" on success or "FAIL <id>: <reason>" on
-/// failure. Progress goes to stderr so stdout stays a clean pass/fail stream.
+/**
+ * RabbitMQ Java client conformance suite for RedisMQ.
+ *
+ * <p>Reads the broker coordinates from the environment, runs the nine named
+ * scenarios, and prints "PASS &lt;id&gt;" on success or "FAIL &lt;id&gt;: &lt;reason&gt;" on
+ * failure. Progress goes to stderr so stdout stays a clean pass/fail stream.
+ */
 public final class Conformance {
     private static final String HOST = env("REDISMQ_HOST", "127.0.0.1");
     private static final int PORT = Integer.parseInt(env("REDISMQ_PORT", "5672"));
@@ -222,6 +224,7 @@ public final class Conformance {
         String queue = "conformance.ack.queue";
         Connection connection = newConnection();
         Channel channel = connection.createChannel();
+        Channel probe = null;
         try {
             channel.queueDeclare(queue, false, false, false, null);
             channel.basicPublish("", queue, null, "ack-1".getBytes(StandardCharsets.UTF_8));
@@ -233,11 +236,33 @@ public final class Conformance {
                 channel.basicAck(message.getEnvelope().getDeliveryTag(), false);
             }
 
-            GetResponse remaining = waitFor(() -> channel.basicGet(queue, false));
-            require(remaining == null, "queue not empty after acks: " + body(remaining));
+            // Close the settling channel: unacked messages requeue on close, so a
+            // broker that ignored the acks cannot hide them in the channel ledger.
+            channel.close();
+            probe = connection.createChannel();
+            GetResponse leftover = awaitMessageAbsent(probe, queue, 500);
+            require(leftover == null, "queue not empty after acks: " + body(leftover));
         } finally {
-            safe(() -> channel.queueDelete(queue));
+            Channel cleanup = probe;
+            if (cleanup != null) {
+                safe(() -> cleanup.queueDelete(queue));
+            }
             safe(connection::close);
+        }
+    }
+
+    private static GetResponse awaitMessageAbsent(Channel channel, String queue, long timeoutMs)
+            throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        for (;;) {
+            GetResponse response = channel.basicGet(queue, false);
+            if (response != null) {
+                return response;
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                return null;
+            }
+            Thread.sleep(20);
         }
     }
 
@@ -287,23 +312,25 @@ public final class Conformance {
         Connection connection = newConnection();
         Channel channelA = connection.createChannel();
         Channel channelB = connection.createChannel();
-        List<String> bodies = Collections.synchronizedList(new ArrayList<>());
+        List<String> bodiesA = Collections.synchronizedList(new ArrayList<>());
+        List<String> bodiesB = Collections.synchronizedList(new ArrayList<>());
         try {
             channelA.queueDeclare(queue, false, false, false, null);
             channelA.basicQos(1);
             channelB.basicQos(1);
 
             CountDownLatch tenArrived = new CountDownLatch(10);
-            String tagA = consumeAndAck(channelA, queue, bodies, tenArrived);
-            String tagB = consumeAndAck(channelB, queue, bodies, tenArrived);
+            String tagA = consumeAndAck(channelA, queue, bodiesA, tenArrived);
+            String tagB = consumeAndAck(channelB, queue, bodiesB, tenArrived);
 
             for (int index = 0; index < 10; index++) {
                 channelA.basicPublish("", queue, null, ("rr-" + index).getBytes(StandardCharsets.UTF_8));
             }
 
             require(tenArrived.await(WAIT_MS, TimeUnit.MILLISECONDS),
-                    "expected 10 deliveries, got " + bodies.size());
-            List<String> received = new ArrayList<>(bodies);
+                    "expected 10 deliveries, got " + (bodiesA.size() + bodiesB.size()));
+            List<String> received = new ArrayList<>(bodiesA);
+            received.addAll(bodiesB);
             Collections.sort(received);
             List<String> expected = new ArrayList<>();
             for (int index = 0; index < 10; index++) {
@@ -311,6 +338,9 @@ public final class Conformance {
             }
             Collections.sort(expected);
             require(received.equals(expected), "delivery set mismatch: " + received);
+            require(!bodiesA.isEmpty() && !bodiesB.isEmpty(),
+                    "round-robin did not reach both consumers: A=" + bodiesA.size()
+                            + " B=" + bodiesB.size());
 
             channelA.basicCancel(tagA);
             channelB.basicCancel(tagB);
