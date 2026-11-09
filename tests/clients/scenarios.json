@@ -1,0 +1,24 @@
+{
+  "required": [
+    "connect",
+    "roundtrip",
+    "properties",
+    "qos",
+    "nack-requeue",
+    "ack",
+    "basic-get-empty",
+    "confirms",
+    "round-robin"
+  ],
+  "reference": {
+    "connect": "tests/RedisMQ.Conformance/FlowTests.cs: Connect_authenticates_and_opens_a_channel",
+    "roundtrip": "tests/RedisMQ.Conformance/FlowTests.cs: Declare_bind_publish_consume_round_trips_content_and_properties",
+    "properties": "tests/RedisMQ.Conformance/FlowTests.cs: Declare_bind_publish_consume_round_trips_content_and_properties",
+    "qos": "tests/RedisMQ.Conformance/FlowTests.cs: Qos_count_gate_admits_exactly_10_and_more_flow_after_acks",
+    "nack-requeue": "tests/RedisMQ.Conformance/FlowTests.cs: Nack_requeue_redelivers_with_redelivered_flag",
+    "ack": "tests/RedisMQ.Conformance/FlowTests.cs: Declare_bind_publish_consume_round_trips_content_and_properties",
+    "basic-get-empty": "tests/RedisMQ.Conformance/FlowTests.cs: BasicGet_returns_the_head_and_reports_empty_after",
+    "confirms": "tests/RedisMQ.Broker.Tests/ConfirmPipelineTests.cs: Ack_waits_for_the_receipt",
+    "round-robin": "tests/RedisMQ.Conformance/FlowTests.cs: Two_consumers_share_the_queue_round_robin_with_no_message_delivered_twice"
+  }
+}

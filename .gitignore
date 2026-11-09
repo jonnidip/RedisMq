@@ -6,3 +6,9 @@ obj/
 TestResults/
 # Pack output
 artifacts/
+
+# Client conformance artifacts
+tests/clients/.logs/
+tests/clients/pika/__pycache__/
+tests/clients/node/node_modules/
+tests/clients/java/target/
