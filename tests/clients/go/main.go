@@ -15,18 +15,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 var (
-	host   = env("REDISMQ_HOST", "127.0.0.1")
-	port   = env("REDISMQ_PORT", "5672")
-	user   = env("REDISMQ_USER", "guest")
-	pass   = env("REDISMQ_PASSWORD", "guest")
-	vhost  = env("REDISMQ_VHOST", "/")
-	wait   = waitDuration()
+	host  = env("REDISMQ_HOST", "127.0.0.1")
+	port  = env("REDISMQ_PORT", "5672")
+	user  = env("REDISMQ_USER", "guest")
+	pass  = env("REDISMQ_PASSWORD", "guest")
+	vhost = env("REDISMQ_VHOST", "/")
+	wait  = waitDuration()
 )
 
 type scenario func() error
@@ -51,7 +52,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "running %s\n", item.id)
 		if err := item.fn(); err != nil {
 			fmt.Printf("FAIL %s: %s\n", item.id, err)
-			return
+			os.Exit(1)
 		}
 		fmt.Printf("PASS %s\n", item.id)
 	}
@@ -447,15 +448,33 @@ func roundRobin() error {
 		return err
 	}
 
+	// Two consumer goroutines append concurrently; guard both the bodies and the
+	// observed consumer tags so the slice is never read or written unsynchronized.
+	var mu sync.Mutex
 	bodies := make([]string, 0, 10)
-	ackAll := func(deliveries <-chan amqp.Delivery, channel *amqp.Channel) {
+	var tagA, tagB string
+	ackAll := func(deliveries <-chan amqp.Delivery, channel *amqp.Channel, tag *string) {
 		for delivery := range deliveries {
+			mu.Lock()
+			*tag = delivery.ConsumerTag
 			bodies = append(bodies, string(delivery.Body))
+			mu.Unlock()
 			_ = channel.Ack(delivery.DeliveryTag, false)
 		}
 	}
-	go ackAll(deliveriesA, channelA)
-	go ackAll(deliveriesB, channelB)
+	go ackAll(deliveriesA, channelA, &tagA)
+	go ackAll(deliveriesB, channelB, &tagB)
+
+	countBodies := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(bodies)
+	}
+	snapshotBodies := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), bodies...)
+	}
 
 	for index := 0; index < 10; index++ {
 		if err := channelA.PublishWithContext(context.Background(), "", queue, false, false,
@@ -465,14 +484,14 @@ func roundRobin() error {
 	}
 
 	deadline := time.Now().Add(wait)
-	for len(bodies) < 10 && time.Now().Before(deadline) {
+	for countBodies() < 10 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if len(bodies) != 10 {
-		return fmt.Errorf("expected 10 deliveries, got %d", len(bodies))
+	if countBodies() != 10 {
+		return fmt.Errorf("expected 10 deliveries, got %d", countBodies())
 	}
 
-	received := append([]string(nil), bodies...)
+	received := snapshotBodies()
 	sort.Strings(received)
 	expected := make([]string, 0, 10)
 	for index := 0; index < 10; index++ {
@@ -483,8 +502,15 @@ func roundRobin() error {
 		return fmt.Errorf("delivery set mismatch: %v", received)
 	}
 
-	_ = channelA.Cancel("", true)
-	_ = channelB.Cancel("", true)
+	mu.Lock()
+	cancelA, cancelB := tagA, tagB
+	mu.Unlock()
+	if cancelA != "" {
+		_ = channelA.Cancel(cancelA, false)
+	}
+	if cancelB != "" {
+		_ = channelB.Cancel(cancelB, false)
+	}
 	return nil
 }
 

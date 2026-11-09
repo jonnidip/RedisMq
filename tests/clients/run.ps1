@@ -39,7 +39,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+$isWindowsHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $clientsRoot = Join-Path $repoRoot 'tests\clients'
@@ -214,8 +214,8 @@ if (-not $SkipPrepare) {
         $err = Join-Path $logDir "$($spec.Name).prepare.err.log"
         $exe = switch ($spec.Name) {
             'pika' { $pythonExe }
-            'node' { if ($isWindows) { (Get-Command npm.cmd).Source } else { 'npm' } }
-            'java' { if ($isWindows) { (Get-Command mvn.cmd).Source } else { 'mvn' } }
+            'node' { if ($isWindowsHost) { (Get-Command npm.cmd).Source } else { 'npm' } }
+            'java' { if ($isWindowsHost) { (Get-Command mvn.cmd).Source } else { 'mvn' } }
             'go' { 'go' }
         }
         $code = Invoke-Logged $exe $spec.Prepare $spec.Directory $out $err
