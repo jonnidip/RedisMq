@@ -220,11 +220,11 @@ engine. Cleanup deletes each declared queue key and the vhost's topology key. No
 
 ```
 dotnet run -c Release --project benchmarks/RedisMQ.Benchmarks -- \
-  [--scenario all|throughput|scale|large] \
+  [--scenario all|throughput|combined|large] \
   [--redis 127.0.0.1:6379] \
   [--duration 30] [--warmup 5] \
   [--publish-bytes 1024] [--inflight 128] \
-  [--connections 500] [--consumers 1000] [--queues 1000] [--scale-rounds 10] \
+  [--connections 500] [--consumers 1000] [--queues 1000] [--warmup-rounds 10] \
   [--large-bytes 1048576] [--large-count 1000] \
   [--out artifacts/perf.json] [--no-gate]
 ```
@@ -242,8 +242,10 @@ commands. A gate on absolute `mirrorDropped` would therefore be flaky and would 
 shutdown drops. Instead:
 
 - After topology declaration and again after consumer registration, the host polls
-  `GetEngineHealth().DrainerDepth` every 50 ms until it reaches zero or a 30-second
-  deadline passes. This is a deadline wait, not a correctness sleep.
+  `GetEngineHealth().DrainerDepth` every 50 ms until it has been zero continuously for
+  500 ms, or a 30-second deadline passes. A single zero sample is not enough: the drainer
+  removes a batch from the channel before writing it. This is a deadline wait, not a
+  correctness sleep.
 - Before the measurement window, capture `GetEngineHealth()`: mirror failures, mirror
   drops, and the command counters.
 - After publishing and delivery complete, poll the depth to zero again and capture
@@ -291,7 +293,7 @@ topology stays live while the rate is sustained.
   1,000 consumers with 500 connections.
 - Declare 1,000 durable queues, two per connection. Each consumer channel consumes one
   queue with prefetch 16.
-- Warm-up: `--scale-rounds` rounds (default 10), publishing one timestamped message to
+- Warm-up: `--warmup-rounds` rounds (default 10), publishing one timestamped message to
   every queue per round with confirms, then waiting for all deliveries with a deadline.
   Warm-up samples are discarded.
 - Measurement: for `--duration` seconds, the publisher channel keeps `--inflight`
@@ -333,7 +335,7 @@ JSON schema version 1:
   "parameters": { "publishBytes": 1024, "durationSeconds": 30, "connections": 500 },
   "results": [
     {
-      "name": "scale",
+      "name": "combined",
       "passed": true,
       "metrics": {
         "connections": 500, "consumers": 1000, "queues": 1000,
