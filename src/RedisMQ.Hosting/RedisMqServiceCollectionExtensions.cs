@@ -95,6 +95,7 @@ public static class RedisMqServiceCollectionExtensions
             options.Redis.ReplayOnStart,
             options.Redis.DrainerCapacity,
             options.Redis.EnforceEvictionGate,
-            diagnostics);
+            diagnostics,
+            options.Redis.DrainerBatchSize);
     }
 }

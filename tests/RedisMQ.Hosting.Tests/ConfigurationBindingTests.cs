@@ -32,6 +32,7 @@ public sealed class ConfigurationBindingTests
             ["RedisMQ:Redis:ConnectionString"] = "localhost:6379",
             ["RedisMQ:Redis:ReplayOnStart"] = "false",
             ["RedisMQ:Redis:DrainerCapacity"] = "64",
+            ["RedisMQ:Redis:DrainerBatchSize"] = "32",
             ["RedisMQ:Redis:EnforceEvictionGate"] = "false",
         }).Build();
 
@@ -72,6 +73,7 @@ public sealed class ConfigurationBindingTests
         Assert.Equal("localhost:6379", redis.ConnectionString);
         Assert.False(redis.ReplayOnStart);
         Assert.Equal(64, redis.DrainerCapacity);
+        Assert.Equal(32, redis.DrainerBatchSize);
         Assert.False(redis.EnforceEvictionGate);
     }
 }
