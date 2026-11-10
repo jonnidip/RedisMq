@@ -53,11 +53,33 @@ internal static class Program
                     break;
 
                 case "combined":
+                    results.Add(await RunHostedAsync(
+                        options,
+                        (host, ct) => Scenarios.RunCombinedAsync(host, options, ct),
+                        stop.Token));
+                    break;
+
                 case "large":
+                    results.Add(await RunHostedAsync(
+                        options,
+                        (host, ct) => Scenarios.RunLargeAsync(host, options, ct),
+                        stop.Token));
+                    break;
+
                 case "all":
-                    Console.Error.WriteLine(
-                        $"Scenario '{options.Scenario}' is not implemented in this task.");
-                    return 3;
+                    results.Add(await RunHostedAsync(
+                        options,
+                        (host, ct) => Scenarios.RunCombinedAsync(host, options, ct),
+                        stop.Token));
+                    results.Add(await RunHostedAsync(
+                        options,
+                        (host, ct) => Scenarios.RunThroughputAsync(host, options, ct),
+                        stop.Token));
+                    results.Add(await RunHostedAsync(
+                        options,
+                        (host, ct) => Scenarios.RunLargeAsync(host, options, ct),
+                        stop.Token));
+                    break;
 
                 default:
                     Console.Error.WriteLine($"Unknown scenario '{options.Scenario}'.");
