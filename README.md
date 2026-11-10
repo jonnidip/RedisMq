@@ -14,7 +14,9 @@ connection the broker still runs, memory-only, but makes no durability promise.
 This is the **M4 part-1 / v1-completeness** milestone: durable message identity,
 honest confirms, ack/requeue mirroring, dead-lettering, TTL and queue expiry,
 per-vhost permissions with PBKDF2 password hashes, and TLS with optional mutual TLS.
-What remains for a production v1 is listed in [What's next](#whats-next).
+Packaging (`RedisMQ.Hosting`, container image) and the multi-client conformance gate
+have since landed. What remains for a production v1 is listed in
+[What's next](#whats-next).
 
 ---
 
@@ -42,7 +44,7 @@ What remains for a production v1 is listed in [What's next](#whats-next).
 # Build everything
 dotnet build RedisMQ.sln
 
-# Run the full test suite (unit + conformance + Redis)
+# Run the .NET test suite (unit + conformance + Redis)
 dotnet test RedisMQ.sln
 ```
 
@@ -391,7 +393,8 @@ RedisMQ.sln
 │   ├── RedisMQ.Broker.Tests/               # codec/FSM/engine/server/permissions/TLS
 │   ├── RedisMQ.Conformance/                # RabbitMQ.Client 7.x over real sockets
 │   ├── RedisMQ.Hosting.Tests/              # binding, DI lifecycle, log sink
-│   └── RedisMQ.Redis.Tests/                # Redis mirror, replay, eviction gate
+│   ├── RedisMQ.Redis.Tests/                # Redis mirror, replay, eviction gate
+│   └── clients/                            # Pika/Node/Java/Go suites + run.ps1
 ├── docs/                                   # architecture, protocol, API, packaging
 ├── .github/workflows/ci.yml
 ├── Dockerfile
@@ -425,6 +428,16 @@ dotnet exec tests\RedisMQ.Redis.Tests\bin\Debug\net10.0\RedisMQ.Redis.Tests.dll
 
 # Hosting/configuration tests (11 expected)
 dotnet exec tests\RedisMQ.Hosting.Tests\bin\Debug\net10.0\RedisMQ.Hosting.Tests.dll
+```
+
+### Multi-client conformance
+
+The external-client gate starts its own memory-only broker and runs Pika, amqplib,
+the RabbitMQ Java client and amqp091-go in turn:
+
+```bash
+# CI (pwsh); Windows PowerShell 5.1 works too
+pwsh -File tests/clients/run.ps1 -Client all
 ```
 
 ### Filtered runs
@@ -660,11 +673,11 @@ Documented and pinned by tests rather than hidden:
 
 ## What's Next
 
-M4 part 1 completes the functional v1 surface. Remaining for a production v1:
+M4 part 1 completes the functional v1 surface, and packaging plus the multi-client
+conformance gate have since landed. Remaining for a production v1:
 
 - **Connection/channel profiles** and tuning beyond RabbitMQ defaults.
 - **Performance work**: pipelining, batching mirrors, throughput benchmarks.
-- **Pika and other client compatibility** beyond RabbitMQ.Client 7.x.
 - **Operational hardening**: certificate hot-reload, Redis failure recovery policy,
   management surface for users/vhosts/permissions.
 
@@ -672,6 +685,8 @@ M4 part 1 completes the functional v1 surface. Remaining for a production v1:
 
 ## CI
 
-`.github/workflows/ci.yml` runs on `ubuntu-latest` with the .NET 10.0.x SDK and the
-standard `dotnet test` path. The Redis-dependent suite expects a Redis service; see
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for local setup and reset commands.
+`.github/workflows/ci.yml` runs on `ubuntu-latest` with the .NET 10.0.x SDK: the
+`dotnet test` job, then a four-client conformance matrix (Pika, amqplib, RabbitMQ Java
+client, amqp091-go), then the pack/container job. The Redis-dependent suite expects a
+Redis service; see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for local setup and reset
+commands.
