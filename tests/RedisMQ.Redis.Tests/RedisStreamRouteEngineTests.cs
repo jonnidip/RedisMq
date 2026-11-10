@@ -1134,6 +1134,202 @@ public sealed class RedisStreamRouteEngineTests
         Assert.Null(engine2.GetQueue(vhost, "excl-q"));
     }
 
+    [Fact]
+    public async Task Drainer_issues_more_than_one_write_before_completion()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return;
+        }
+
+        string vhost = $"/batch-{Guid.NewGuid():N}";
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 64,
+            enforceEvictionGate: false, drainerBatchSize: 16);
+
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int issued = 0;
+        engine.WriteOverrideForTest = async _ =>
+        {
+            Interlocked.Increment(ref issued);
+            await gate.Task;
+        };
+
+        for (int i = 0; i < 64; i++)
+        {
+            engine.Enqueue(vhost, "q", new ContentProperties(), [(byte)i], "", "q");
+        }
+
+        int observed = 0;
+        try
+        {
+            await WaitUntilAsync(
+                () => Task.FromResult(Volatile.Read(ref issued) > 1),
+                "the drainer to issue more than one write");
+            observed = Volatile.Read(ref issued);
+        }
+        finally
+        {
+            // Open the gate even when the wait times out, so disposal can drain the
+            // blocked write instead of hanging the test.
+            gate.TrySetResult(true);
+        }
+
+        Assert.InRange(observed, 2, 16);
+    }
+
+    [Fact]
+    public async Task Pipelined_batch_preserves_per_queue_stream_order()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return;
+        }
+
+        string vhost = $"/order-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 4096,
+            enforceEvictionGate: false, drainerBatchSize: 256);
+
+        List<EnqueueReceipt> receipts = [];
+        for (int i = 0; i < 2000; i++)
+        {
+            receipts.Add(engine.Enqueue(vhost, "q", new ContentProperties(), BitConverter.GetBytes(i), "", "q"));
+        }
+
+        foreach (EnqueueReceipt receipt in receipts)
+        {
+            Assert.True(await receipt.Durable);
+        }
+
+        StreamEntry[] entries = await db.StreamRangeAsync(queueKey);
+        Assert.Equal(2000, entries.Length);
+        for (int i = 0; i < entries.Length; i++)
+        {
+            Assert.Equal((ulong)(i + 1), DecodeEntry(entries[i]).EnvelopeId);
+        }
+    }
+
+    [Fact]
+    public async Task Pipelined_batch_failure_does_not_fail_neighbours()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return;
+        }
+
+        string vhost = $"/partial-{Guid.NewGuid():N}";
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 64,
+            enforceEvictionGate: false, drainerBatchSize: 16);
+        engine.WriteOverrideForTest = command =>
+            command.Kind == WriteCommandKind.Enqueue && command.EnvelopeId == 2
+                ? Task.FromException(new InvalidOperationException("boom"))
+                : Task.CompletedTask;
+
+        EnqueueReceipt first = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "", "q");
+        EnqueueReceipt second = engine.Enqueue(vhost, "q", new ContentProperties(), [2], "", "q");
+        EnqueueReceipt third = engine.Enqueue(vhost, "q", new ContentProperties(), [3], "", "q");
+
+        Assert.True(await first.Durable);
+        Assert.False(await second.Durable);
+        Assert.True(await third.Durable);
+        Assert.Equal(1, engine.GetEngineHealth().MirrorFailures);
+    }
+
+    [Fact]
+    public async Task Max_length_eviction_under_pipelined_burst_is_mirrored()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return;
+        }
+
+        string vhost = $"/maxlen-batch-{Guid.NewGuid():N}";
+        string queueKey = RedisKeys.QueueKey(vhost, "q");
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 128,
+            enforceEvictionGate: false, drainerBatchSize: 64);
+        engine.DeclareQueue(new QueueInfo(vhost, "q", MaxLength: 2));
+
+        List<EnqueueReceipt> receipts = [];
+        for (int i = 0; i < 50; i++)
+        {
+            receipts.Add(engine.Enqueue(vhost, "q", new ContentProperties(), [(byte)i], "", "q"));
+        }
+
+        foreach (EnqueueReceipt receipt in receipts)
+        {
+            Assert.True(await receipt.Durable);
+        }
+
+        await WaitUntilAsync(
+            async () => await db.StreamLengthAsync(queueKey) == 2,
+            "the evicted entries to be XDELed");
+        StreamEntry[] entries = await db.StreamRangeAsync(queueKey);
+        Assert.Equal([49UL, 50UL], entries.Select(entry => DecodeEntry(entry).EnvelopeId));
+    }
+
+    [Fact]
+    public async Task Shutdown_completes_issued_batch_and_abandons_the_rest()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return;
+        }
+
+        string vhost = $"/shutdown-{Guid.NewGuid():N}";
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int issued = 0;
+        var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 64,
+            enforceEvictionGate: false, drainerBatchSize: 8);
+        engine.WriteOverrideForTest = async _ =>
+        {
+            Interlocked.Increment(ref issued);
+            await gate.Task;
+        };
+
+        List<EnqueueReceipt> receipts = [];
+        for (int i = 0; i < 64; i++)
+        {
+            receipts.Add(engine.Enqueue(vhost, "q", new ContentProperties(), [(byte)i], "", "q"));
+        }
+
+        await WaitUntilAsync(
+            () => Task.FromResult(Volatile.Read(ref issued) >= 1),
+            "the drainer to issue a write");
+        Task dispose = engine.DisposeAsync().AsTask();
+        gate.TrySetResult(true);
+        await dispose.WaitAsync(TimeSpan.FromSeconds(10));
+
+        int durable = 0;
+        foreach (EnqueueReceipt receipt in receipts)
+        {
+            if (await receipt.Durable.AsTask().WaitAsync(TimeSpan.FromSeconds(5)))
+            {
+                durable++;
+            }
+        }
+
+        Assert.InRange(durable, 1, 8);
+    }
+
+    [Fact]
+    public async Task Batch_size_is_clamped_to_drainer_capacity()
+    {
+        await using var engine = new RedisStreamRouteEngine(
+            null!, ["/"], replayOnStart: false, drainerCapacity: 8, drainerBatchSize: 32);
+
+        Assert.Equal(8, engine.DrainerBatchSizeForTest);
+    }
+
     private static async Task WaitUntilAsync(Func<Task<bool>> condition, string description)
     {
         DateTime deadline = DateTime.UtcNow.AddSeconds(5);

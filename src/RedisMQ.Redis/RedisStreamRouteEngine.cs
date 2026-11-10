@@ -27,6 +27,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
     private readonly Channel<WriteCommand>? _channel;
     private readonly Task? _drainerTask;
     private readonly SemaphoreSlim? _drainerSlots;
+    private readonly int _drainerBatchSize;
     private readonly CancellationTokenSource _stopCts = new();
 
     // Mirror health: written by the drainer and the protocol path, read under
@@ -60,7 +61,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
     /// the server's maxmemory-policy is checked at startup; eviction policies that
     /// could discard durable data cause the constructor to throw.
     /// </summary>
-    public RedisStreamRouteEngine(IDatabase? redis, IReadOnlyList<string> vhosts, bool replayOnStart = true, int drainerCapacity = 1024, bool enforceEvictionGate = true, BrokerDiagnostics? diagnostics = null)
+    public RedisStreamRouteEngine(IDatabase? redis, IReadOnlyList<string> vhosts, bool replayOnStart = true, int drainerCapacity = 1024, bool enforceEvictionGate = true, BrokerDiagnostics? diagnostics = null, int drainerBatchSize = 256)
     {
         ArgumentNullException.ThrowIfNull(vhosts);
         if (vhosts.Count == 0)
@@ -69,6 +70,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
         }
         _redis = redis;
         _vhosts = [.. vhosts];
+        _drainerBatchSize = Math.Clamp(drainerBatchSize, 1, Math.Max(1, drainerCapacity));
         _diagnostics = diagnostics ?? new BrokerDiagnostics();
         _memory = new InMemoryEngine(_vhosts, _diagnostics);
 
@@ -140,6 +142,9 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
     /// <summary>Test seam: the drainer's slot semaphore, exposed so a test can
     /// exhaust it deterministically. Null when Redis is absent.</summary>
     internal SemaphoreSlim? DrainerSlotsForTest => _drainerSlots;
+
+    /// <summary>Test seam: the effective drainer batch size after clamping to capacity.</summary>
+    internal int DrainerBatchSizeForTest => _drainerBatchSize;
 
     private Func<WriteCommand, Task>? _writeOverrideForTest;
 
@@ -528,85 +533,142 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
 
     private async Task DrainAsync(CancellationToken ct)
     {
-        await foreach (var command in _channel!.Reader.ReadAllAsync(ct))
+        List<WriteCommand> batch = new(_drainerBatchSize);
+        await foreach (WriteCommand first in _channel!.Reader.ReadAllAsync(ct))
         {
-            // Shutdown stops starting new mirror writes. The reader still yields
-            // commands that were buffered before cancellation, so account each one
-            // here instead of letting the write run after DisposeAsync began.
-            if (ct.IsCancellationRequested)
+            batch.Clear();
+            batch.Add(first);
+            while (batch.Count < _drainerBatchSize
+                   && _channel.Reader.TryRead(out WriteCommand? next)
+                   && next is not null)
             {
-                AbandonWrite(command);
-                continue;
+                batch.Add(next);
             }
 
-            bool succeeded = true;
-            long started = Stopwatch.GetTimestamp();
-            try
+            _diagnostics.Measure(
+                _diagnostics.RedisMirrorBatchSize,
+                batch.Count,
+                new TagList());
+
+            int index = 0;
+            while (index < batch.Count)
             {
-                await WriteCommandToRedisAsync(command);
-                if (_failureEpisode)
+                // Shutdown stops starting new mirror writes. Commands already issued
+                // below still complete; commands still buffered here are abandoned so
+                // no publisher waits on a write the disposed drainer will not run.
+                if (ct.IsCancellationRequested)
                 {
-                    _failureEpisode = false;
-                    if (_diagnostics.IsLogEnabled(BrokerLogLevel.Information))
+                    for (; index < batch.Count; index++)
                     {
-                        _diagnostics.WriteLog(
-                            BrokerLogLevel.Information,
-                            BrokerLogEvent.RedisMirrorRecovered,
-                            "redis mirror recovered");
+                        AbandonWrite(batch[index]);
                     }
+
+                    break;
+                }
+
+                if (IsBarrier(batch[index]))
+                {
+                    await ProcessSingleAsync(batch[index]);
+                    index++;
+                    continue;
+                }
+
+                List<(WriteCommand Command, Task Write, long Started)> pending = [];
+                while (index < batch.Count && !IsBarrier(batch[index]))
+                {
+                    WriteCommand command = batch[index++];
+                    pending.Add((command, WriteCommandToRedisAsync(command), Stopwatch.GetTimestamp()));
+                }
+
+                foreach ((WriteCommand command, Task write, long started) in pending)
+                {
+                    await CompleteAsync(command, write, started);
                 }
             }
-            catch (Exception ex)
+        }
+    }
+
+    /// <summary>Commands whose Redis effect depends on the completion of an earlier
+    /// write in the same batch. Issued and awaited one at a time.</summary>
+    private static bool IsBarrier(WriteCommand command) =>
+        command.Kind is WriteCommandKind.Delta
+            or WriteCommandKind.Remove
+            or WriteCommandKind.DeleteQueue;
+
+    private async Task ProcessSingleAsync(WriteCommand command)
+    {
+        long started = Stopwatch.GetTimestamp();
+        await CompleteAsync(command, WriteCommandToRedisAsync(command), started);
+    }
+
+    private async Task CompleteAsync(WriteCommand command, Task write, long started)
+    {
+        bool succeeded = true;
+        try
+        {
+            await write;
+            if (_failureEpisode)
             {
-                // Drainer is best-effort: memory is the system of record. A
-                // transient Redis failure drops the mirrored write; the in-memory
-                // state is already updated, and a waiting publisher is told the
-                // truth (basic.nack) rather than a lie.
-                succeeded = false;
-                Interlocked.Increment(ref _mirrorFailures);
-                string error = SanitizeMirrorError(ex);
-                lock (_healthLock)
+                _failureEpisode = false;
+                if (_diagnostics.IsLogEnabled(BrokerLogLevel.Information))
                 {
-                    _lastMirrorFailureUtc = DateTimeOffset.UtcNow;
-                    _lastError = error;
-                }
-
-                if (!_failureEpisode)
-                {
-                    _failureEpisode = true;
-                    if (_diagnostics.IsLogEnabled(BrokerLogLevel.Error))
-                    {
-                        _diagnostics.WriteLog(
-                            BrokerLogLevel.Error,
-                            BrokerLogEvent.RedisMirrorFailed,
-                            "redis mirror write failed",
-                            ex,
-                            new KeyValuePair<string, object?>("kind", command.Kind.ToString()),
-                            new KeyValuePair<string, object?>("error", error));
-                    }
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Information,
+                        BrokerLogEvent.RedisMirrorRecovered,
+                        "redis mirror recovered");
                 }
             }
-            finally
+        }
+        catch (Exception ex)
+        {
+            // Drainer is best-effort: memory is the system of record. A
+            // transient Redis failure drops the mirrored write; the in-memory
+            // state is already updated, and a waiting publisher is told the
+            // truth (basic.nack) rather than a lie.
+            succeeded = false;
+            Interlocked.Increment(ref _mirrorFailures);
+            string error = SanitizeMirrorError(ex);
+            lock (_healthLock)
             {
-                if (command.ReservedDrainerSlot)
-                {
-                    _drainerSlots!.Release();
-                }
-
-                _diagnostics.Count(
-                    _diagnostics.RedisMirrorCommands,
-                    new TagList
-                    {
-                        { "kind", command.Kind.ToString() },
-                        { "outcome", succeeded ? "success" : "failure" },
-                    });
-                _diagnostics.Measure(
-                    _diagnostics.RedisMirrorDuration,
-                    Stopwatch.GetElapsedTime(started).TotalSeconds,
-                    new TagList { { "kind", command.Kind.ToString() } });
-
-                command.Completion?.TrySetResult(succeeded);
+                _lastMirrorFailureUtc = DateTimeOffset.UtcNow;
+                _lastError = error;
             }
+
+            if (!_failureEpisode)
+            {
+                _failureEpisode = true;
+                if (_diagnostics.IsLogEnabled(BrokerLogLevel.Error))
+                {
+                    _diagnostics.WriteLog(
+                        BrokerLogLevel.Error,
+                        BrokerLogEvent.RedisMirrorFailed,
+                        "redis mirror write failed",
+                        ex,
+                        new KeyValuePair<string, object?>("kind", command.Kind.ToString()),
+                        new KeyValuePair<string, object?>("error", error));
+                }
+            }
+        }
+        finally
+        {
+            if (command.ReservedDrainerSlot)
+            {
+                _drainerSlots!.Release();
+            }
+
+            _diagnostics.Count(
+                _diagnostics.RedisMirrorCommands,
+                new TagList
+                {
+                    { "kind", command.Kind.ToString() },
+                    { "outcome", succeeded ? "success" : "failure" },
+                });
+            _diagnostics.Measure(
+                _diagnostics.RedisMirrorDuration,
+                Stopwatch.GetElapsedTime(started).TotalSeconds,
+                new TagList { { "kind", command.Kind.ToString() } });
+
+            command.Completion?.TrySetResult(succeeded);
         }
     }
 

@@ -104,6 +104,10 @@ public sealed class BrokerDiagnostics : IDisposable
             "redismq.reaper.duration", "Reaper tick time.");
         RedisMirrorDuration = CreateSeconds(
             "redismq.redis.mirror.duration", "Drainer queue item time.");
+        RedisMirrorBatchSize = Meter.CreateHistogram<long>(
+            "redismq.redis.mirror.batch.size",
+            "{command}",
+            "Commands issued per drainer batch.");
 
         PublishSize = Meter.CreateHistogram<long>(
             "redismq.publish.size",
@@ -182,6 +186,8 @@ public sealed class BrokerDiagnostics : IDisposable
     internal Histogram<double> ReaperDuration { get; }
 
     internal Histogram<double> RedisMirrorDuration { get; }
+
+    internal Histogram<long> RedisMirrorBatchSize { get; }
 
     internal Histogram<long> PublishSize { get; }
 

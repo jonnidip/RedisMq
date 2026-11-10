@@ -173,9 +173,12 @@ public sealed class ObservabilityRedisTests
         using var diag = new BrokerDiagnostics("redis6");
         using var meter = new RedisMeterCollector();
         string vhost = $"/obs-shutdown-{Guid.NewGuid():N}";
+        // Batch size 1 keeps one command in flight so the two behind it stay queued
+        // when disposal cancels the loop; with a larger batch they would all be
+        // issued together and none would be abandoned.
         var engine = new RedisStreamRouteEngine(
             db, [vhost], replayOnStart: false, drainerCapacity: 16,
-            enforceEvictionGate: false, diagnostics: diag);
+            enforceEvictionGate: false, diagnostics: diag, drainerBatchSize: 1);
         var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         engine.WriteOverrideForTest = _ => gate.Task;
 
@@ -201,6 +204,36 @@ public sealed class ObservabilityRedisTests
             meter.For("redismq.redis.mirror.dropped").Count(r =>
                 r.Tags["broker.instance"] is "redis6"
                 && (string?)r.Tags["reason"] == "shutdown"));
+    }
+
+    [Fact]
+    public async Task Drainer_records_batch_size()
+    {
+        IDatabase? db = TryConnectRedis();
+        if (db is null)
+        {
+            return;
+        }
+
+        using var diag = new BrokerDiagnostics("redis-batch");
+        using var meter = new RedisMeterCollector();
+        string vhost = $"/obs-batch-{Guid.NewGuid():N}";
+        await using var engine = new RedisStreamRouteEngine(
+            db, [vhost], replayOnStart: false, drainerCapacity: 64,
+            enforceEvictionGate: false, diagnostics: diag, drainerBatchSize: 16);
+
+        for (int i = 0; i < 32; i++)
+        {
+            EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [(byte)i], "", "q");
+            Assert.True(await receipt.Durable);
+        }
+
+        await WaitUntilAsync(
+            () => meter.For("redismq.redis.mirror.batch.size").Count > 0,
+            "the drainer batch histogram");
+        Assert.All(
+            meter.For("redismq.redis.mirror.batch.size"),
+            measurement => Assert.InRange((long)measurement.Value, 1, 16));
     }
 
     private static IDatabase? TryConnectRedis()
