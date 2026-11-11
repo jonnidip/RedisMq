@@ -161,8 +161,10 @@ Full default envelope, `--scenario all --no-gate`:
 | `large` (1 MB, 8 MB budget) | 1 | 1 | 1 | 193 | 38.4 / 87.9 ms | 13.7 / 62.9 ms | 0 / 0 / 0 |
 
 The combined result is the local proof of the v1 envelope: the topology stays live while
-the rate is sustained, delivery p99 is under 20 ms, and every counter is clean. The
-single-queue canary and the 1 MB p99 are host-bound on Windows for the reasons above.
+the rate is sustained, delivery p99 is under 20 ms, and every counter is clean. Run
+without `--no-gate`, this Windows host exits `1` because the canary and the large p99
+fail; that is the expected local result, not a regression. The single-queue canary and
+the 1 MB p99 are host-bound on Windows for the reasons above.
 The Ubuntu CI runner is the authoritative environment for those two gates, but no green
 CI run has been observed yet: the workflow has not been dispatched from this branch.
 
