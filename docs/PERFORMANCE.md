@@ -61,6 +61,11 @@ One durable queue, one publisher, one consumer. It isolates a single-queue regre
 from topology-scale behaviour. It uses the same 5,000/s and p99 ≤20 ms thresholds at
 1 KB.
 
+A single queue's delivery pump is serial. A 128-deep outstanding window alone implies
+`(128 - 1) / 5,000 s ≈ 25 ms` of queueing at the rate floor, so the canary caps its
+window at `min(--inflight, 16)`. At 5,000/s that is ≈3 ms of queueing, which leaves room
+for the 20 ms gate. The cap is a harness constant; the thresholds are unchanged.
+
 The Broker delivers one message at a time per queue: the per-queue pump claims one
 message and awaits its frame write before the next claim. On a Windows development host
 that caps this canary well below 5,000/s even though the publish/confirm path alone
@@ -108,8 +113,10 @@ Useful overrides:
 --drainer-capacity 1024 --drainer-batch-size 256
 ```
 
-The harness never calls `FLUSHDB`, `SCAN` or any admin command. It uses a
-`/bench-<8 hex>` vhost and deletes only the queue and topology keys it declared.
+The harness never issues a destructive or admin **write** (`FLUSHDB`, `SCAN`, `DEL`,
+`CONFIG SET`). It uses a `/bench-<8 hex>` vhost and deletes only the queue and topology
+keys it declared. The only admin reads are `INFO server` (version capture) and the
+engine's startup `CONFIG GET maxmemory-policy` eviction gate.
 
 ## Reading the report
 
@@ -146,14 +153,20 @@ Full default envelope, `--scenario all --no-gate`:
 
 | Scenario | Connections | Consumers | Queues | Publishes/s | Confirm p50 / p99 | Delivery p50 / p99 | Failures / drops / unconsumed |
 |----------|-------------|-----------|--------|-------------|-------------------|--------------------|-------------------------------|
-| `combined` | 500 | 1,000 | 1,000 | **17,224** | 6.8 / 23.7 ms | 1.4 / **12.9 ms** | 0 / 0 / 0 |
-| `throughput` (canary) | 1 | 1 | 1 | 1,612 | 56.8 / 332.8 ms | 3.6 / 129.8 ms | 0 / 0 / 0 |
-| `large` (1 MB, 8 MB budget) | 1 | 1 | 1 | 179 | 43.3 / 78.4 ms | 22.1 / 72.0 ms | 0 / 0 / 0 |
+| `combined` | 500 | 1,000 | 1,000 | **19,029** | 6.9 / 21.8 ms | 1.5 / **12.8 ms** | 0 / 0 / 0 |
+| `throughput` (canary) | 1 | 1 | 1 | 1,747 | 55.6 / 291.6 ms | 3.8 / 112.3 ms | 0 / 0 / 0 |
+| `large` (1 MB, 8 MB budget) | 1 | 1 | 1 | 193 | 38.4 / 87.9 ms | 13.7 / 62.9 ms | 0 / 0 / 0 |
 
 The combined result is the local proof of the v1 envelope: the topology stays live while
 the rate is sustained, delivery p99 is under 20 ms, and every counter is clean. The
 single-queue canary and the 1 MB p99 are host-bound on Windows for the reasons above;
 they are expected to clear their thresholds on the Ubuntu CI runner.
+
+The canary runs last in `all` and inherits contention from the 500-connection combined
+run. Run alone with `--scenario throughput`, the same 16-deep window measured 4,473/s and
+p99 42.7 ms; the 1 MB scenario alone measured 232/s and p99 44.2 ms. Both remain above
+the 20 ms ceiling on this host, which is why those two gates are CI-class rather than
+local proof.
 
 ## Caveats
 

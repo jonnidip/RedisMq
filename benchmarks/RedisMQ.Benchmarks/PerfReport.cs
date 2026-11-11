@@ -42,7 +42,12 @@ internal static class Gate
                 return;
             }
 
-            double actual = metrics.GetValueOrDefault(metricKey);
+            if (!metrics.TryGetValue(metricKey, out double actual))
+            {
+                failures.Add($"{metricKey} is missing from the metrics");
+                return;
+            }
+
             if (actual < minimum)
             {
                 failures.Add($"{metricKey} {Format(actual)} is below the required {Format(minimum)}");
@@ -56,7 +61,12 @@ internal static class Gate
                 return;
             }
 
-            double actual = metrics.GetValueOrDefault(metricKey);
+            if (!metrics.TryGetValue(metricKey, out double actual))
+            {
+                failures.Add($"{metricKey} is missing from the metrics");
+                return;
+            }
+
             if (actual > maximum)
             {
                 failures.Add($"{metricKey} {Format(actual)} exceeds the allowed {Format(maximum)}");
@@ -67,6 +77,7 @@ internal static class Gate
         {
             if (!metrics.TryGetValue(metricKey, out double actual))
             {
+                failures.Add($"{metricKey} is missing from the metrics");
                 return;
             }
 

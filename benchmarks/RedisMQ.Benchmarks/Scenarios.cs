@@ -14,6 +14,22 @@ internal static class Scenarios
 {
     private sealed record PublishOutcome(long Confirmed, long Failed, double ElapsedSeconds);
 
+    // A single queue's delivery pump is serial: every message in the outstanding window
+    // waits behind the ones before it. At the canary's 5,000/s floor, a 128-deep window
+    // alone implies (128-1)/5000 s ≈ 25 ms of queueing, so the p99<=20 ms gate could never
+    // pass even when the rate does. Cap the window so the latency gate measures delivery.
+    private const int CanaryInFlightCap = 16;
+
+    // Same reasoning for 1 MB bodies: 128 x 1 MB is 128 MB of backlog. Bound outstanding
+    // bytes (and still never exceed --inflight); the large rate is reported, not gated.
+    private const int LargeInFlightBytes = 8 * 1024 * 1024;
+
+    internal static int ThroughputInflightFor(BenchmarkOptions options) =>
+        Math.Min(options.Inflight, CanaryInFlightCap);
+
+    internal static int LargeInflightFor(BenchmarkOptions options) =>
+        Math.Clamp(LargeInFlightBytes / Math.Max(1, options.LargeBytes), 1, options.Inflight);
+
     /// <summary>The single-queue mirror canary: one durable queue, one publisher and
     /// one consumer, bounded confirmed publishes in flight.</summary>
     public static async Task<ScenarioResult> RunThroughputAsync(
@@ -94,6 +110,16 @@ internal static class Scenarios
         };
 
         ScenarioResult result = Gate.Evaluate("throughput", metrics, thresholds);
+        if (measured.Confirmed == 0)
+        {
+            result = Gate.Fail(result, "no publishes were confirmed during the measured window");
+        }
+
+        if (deliveries.Count == 0)
+        {
+            result = Gate.Fail(result, "no delivery samples were recorded during the measured window");
+        }
+
         if (!cleanSetup)
         {
             result = Gate.Fail(
@@ -155,6 +181,7 @@ internal static class Scenarios
             // Two consumers per connection at the defaults: consumer i rides connection
             // i % connections and consumes queue i % queues (1:1 with the defaults, so
             // connection 0 carries the publisher and its two consumers).
+            int consumersRegistered = 0;
             for (int index = 0; index < options.Consumers; index++)
             {
                 IConnection connection = connections[index % connections.Count];
@@ -172,6 +199,7 @@ internal static class Scenarios
                 await consumerChannel.BasicConsumeAsync(
                     queue, autoAck: false, consumerTag: $"bench-{index:0000}",
                     noLocal: false, exclusive: false, arguments: null, consumer, ct);
+                consumersRegistered++;
             }
 
             // Warm-up: one timestamped message to every queue per round, then drain and
@@ -224,7 +252,7 @@ internal static class Scenarios
             var metrics = new Dictionary<string, double>
             {
                 ["connections"] = connections.Count,
-                ["consumers"] = options.Consumers,
+                ["consumers"] = consumersRegistered,
                 ["queues"] = queues.Count,
                 ["publishesPerSecond"] = measured.Confirmed / elapsed,
                 ["deliveriesPerSecond"] = state.MeasuredDelivered / elapsed,
@@ -248,6 +276,16 @@ internal static class Scenarios
             };
 
             ScenarioResult result = Gate.Evaluate("combined", metrics, thresholds);
+            if (measured.Confirmed == 0)
+            {
+                result = Gate.Fail(result, "no publishes were confirmed during the measured window");
+            }
+
+            if (deliveries.Count == 0)
+            {
+                result = Gate.Fail(result, "no delivery samples were recorded during the measured window");
+            }
+
             if (!cleanSetup)
             {
                 result = Gate.Fail(
@@ -308,14 +346,7 @@ internal static class Scenarios
         await publisher.QueueDeclareAsync(
             queue, durable: true, exclusive: false, autoDelete: false, arguments: null, cancellationToken: ct);
 
-        // The single-queue delivery pump writes one message at a time, so N large bodies
-        // in flight are an N-message backlog ahead of the consumer. At 1 MB and the shared
-        // --inflight this is 128 MB, which no p99<=20 ms gate can meet. Bound outstanding
-        // bytes instead (8 MB keeps the backlog well inside a 20 ms budget on localhost
-        // delivery); the rate is reported for this scenario, not gated.
-        const int LargeInFlightBytes = 8 * 1024 * 1024;
-        int largeInflight = Math.Clamp(
-            LargeInFlightBytes / Math.Max(1, options.LargeBytes), 1, options.Inflight);
+        int largeInflight = LargeInflightFor(options);
 
         await using IChannel consumerChannel = await CreateConsumerChannelAsync(connection, 4, ct);
         await consumerChannel.BasicQosAsync(
@@ -373,6 +404,16 @@ internal static class Scenarios
         };
 
         ScenarioResult result = Gate.Evaluate("large", metrics, thresholds);
+        if (measured.Confirmed == 0)
+        {
+            result = Gate.Fail(result, "no publishes were confirmed during the measured window");
+        }
+
+        if (deliveries.Count == 0)
+        {
+            result = Gate.Fail(result, "no delivery samples were recorded during the measured window");
+        }
+
         if (!cleanSetup)
         {
             result = Gate.Fail(
@@ -396,7 +437,13 @@ internal static class Scenarios
         ConcurrentQueue<double>? confirmLatencies,
         CancellationToken ct) =>
         PublishTimedAsync(
-            channel, _ => queue, options.PublishBytes, duration, options.Inflight, confirmLatencies, ct);
+            channel,
+            _ => queue,
+            options.PublishBytes,
+            duration,
+            ThroughputInflightFor(options),
+            confirmLatencies,
+            ct);
 
     private static async Task<PublishOutcome> PublishTimedAsync(
         IChannel channel,
@@ -415,6 +462,7 @@ internal static class Scenarios
 
         while (clock.Elapsed < duration)
         {
+            ct.ThrowIfCancellationRequested();
             while (outstanding.Count < inflight && clock.Elapsed < duration)
             {
                 byte[] body = CreateBody(issued, bodyBytes);
@@ -439,6 +487,7 @@ internal static class Scenarios
             }
         }
 
+        ct.ThrowIfCancellationRequested();
         foreach (Task<bool> task in outstanding)
         {
             if (await task)
@@ -473,6 +522,7 @@ internal static class Scenarios
 
         while (issued < count)
         {
+            ct.ThrowIfCancellationRequested();
             while (outstanding.Count < inflight && issued < count)
             {
                 byte[] body = CreateBody(issued, bodyBytes);
@@ -497,6 +547,7 @@ internal static class Scenarios
             }
         }
 
+        ct.ThrowIfCancellationRequested();
         foreach (Task<bool> task in outstanding)
         {
             if (await task)

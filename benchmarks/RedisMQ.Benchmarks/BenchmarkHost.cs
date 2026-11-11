@@ -23,6 +23,7 @@ internal sealed class BenchmarkHost : IAsyncDisposable
     private readonly IReadOnlyList<IListenerTransport> _listeners;
     private readonly List<string> _queues = [];
     private bool _stopped;
+    private bool _engineDisposed;
     private bool _disposed;
 
     private BenchmarkHost(
@@ -86,7 +87,18 @@ internal sealed class BenchmarkHost : IAsyncDisposable
 
         IReadOnlyList<IListenerTransport> listeners = BrokerListeners.Create(serverOptions);
         var server = new AmqpBrokerServer(serverOptions, engine, listeners);
-        await server.StartAsync();
+        try
+        {
+            await server.StartAsync();
+        }
+        catch
+        {
+            // A failed start must not leak the multiplexer, the engine or its sockets.
+            await StopAndDisposeAsync(server, listeners);
+            await engine.DisposeAsync();
+            redis.Dispose();
+            throw;
+        }
 
         int port = -1;
         foreach (IListenerTransport listener in listeners)
@@ -99,21 +111,44 @@ internal sealed class BenchmarkHost : IAsyncDisposable
 
         if (port <= 0)
         {
-            await server.StopAsync();
-            foreach (IListenerTransport listener in listeners)
-            {
-                if (listener is IAsyncDisposable disposable)
-                {
-                    await disposable.DisposeAsync();
-                }
-            }
-
+            await StopAndDisposeAsync(server, listeners);
             await engine.DisposeAsync();
             redis.Dispose();
             throw new BenchmarkRunException("The plaintext listener did not bind a port.");
         }
 
         return new BenchmarkHost(redis, engine, server, listeners, vhost, port);
+    }
+
+    /// <summary>Best-effort teardown after a failed start: the start failure is the
+    /// error worth surfacing, not a follow-on dispose error.</summary>
+    private static async Task StopAndDisposeAsync(
+        AmqpBrokerServer server,
+        IReadOnlyList<IListenerTransport> listeners)
+    {
+        try
+        {
+            await server.StopAsync();
+        }
+        catch
+        {
+            // The server never reached a running state.
+        }
+
+        foreach (IListenerTransport listener in listeners)
+        {
+            if (listener is IAsyncDisposable disposable)
+            {
+                try
+                {
+                    await disposable.DisposeAsync();
+                }
+                catch
+                {
+                    // The start failure is already propagating.
+                }
+            }
+        }
     }
 
     /// <summary>Records a queue this run declared so <see cref="CleanupAsync"/> can
@@ -156,19 +191,18 @@ internal sealed class BenchmarkHost : IAsyncDisposable
             $"Timed out waiting for the Redis drainer to reach zero depth after {timeout.TotalSeconds:0} s.");
     }
 
-    public async Task<string> GetRedisVersionAsync(CancellationToken ct)
+    /// <summary>Stops the mirror before key cleanup: the engine's disposal awaits the
+    /// drainer, so an issued batch cannot land after <see cref="CleanupAsync"/> and
+    /// recreate a deleted key. Idempotent with <see cref="DisposeAsync"/>.</summary>
+    public async Task DisposeEngineAsync()
     {
-        RedisResult info = await _database.ExecuteAsync("INFO", "server");
-        foreach (string line in info.ToString().Split('\n'))
+        if (_engineDisposed)
         {
-            const string prefix = "redis_version:";
-            if (line.StartsWith(prefix, StringComparison.Ordinal))
-            {
-                return line[prefix.Length..].Trim();
-            }
+            return;
         }
 
-        return "unknown";
+        _engineDisposed = true;
+        await Engine.DisposeAsync();
     }
 
     public async Task StopAsync()
@@ -216,7 +250,7 @@ internal sealed class BenchmarkHost : IAsyncDisposable
 
         _disposed = true;
         await StopAsync();
-        await Engine.DisposeAsync();
+        await DisposeEngineAsync();
         _redis.Dispose();
     }
 }

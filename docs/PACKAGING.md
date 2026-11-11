@@ -129,6 +129,7 @@ Settings live under the `RedisMQ` section. In JSON use `:`, in environment varia
 | `Redis:ConnectionString` | empty = in-memory engine | `RedisMQ__Redis__ConnectionString` |
 | `Redis:ReplayOnStart` | `true` | `RedisMQ__Redis__ReplayOnStart` |
 | `Redis:DrainerCapacity` | `1024` | `RedisMQ__Redis__DrainerCapacity` |
+| `Redis:DrainerBatchSize` | `256` (clamped to `Redis:DrainerCapacity`) | `RedisMQ__Redis__DrainerBatchSize` |
 | `Redis:EnforceEvictionGate` | `true` | `RedisMQ__Redis__EnforceEvictionGate` |
 
 `TimeSpan` values use the invariant `hh:mm:ss` form. `MinTlsVersion` accepts the

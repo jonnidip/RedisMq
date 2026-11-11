@@ -139,6 +139,9 @@ internal static class Program
                 // mirror health, not by hanging teardown.
             }
 
+            // Dispose the engine before deleting keys: DisposeAsync awaits the drainer, so
+            // no issued batch can land after cleanup and resurrect a key we just deleted.
+            await host.DisposeEngineAsync();
             await host.CleanupAsync();
         }
     }
@@ -150,6 +153,8 @@ internal static class Program
             ["durationSeconds"] = options.DurationSeconds,
             ["warmupSeconds"] = options.WarmupSeconds,
             ["inflight"] = options.Inflight,
+            ["throughputInflight"] = Scenarios.ThroughputInflightFor(options),
+            ["largeInflight"] = Scenarios.LargeInflightFor(options),
             ["connections"] = options.Connections,
             ["consumers"] = options.Consumers,
             ["queues"] = options.Queues,
