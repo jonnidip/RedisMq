@@ -1307,12 +1307,13 @@ public sealed class RedisStreamRouteEngineTests
             "the drainer to issue a write");
         Task dispose = engine.DisposeAsync().AsTask();
         gate.TrySetResult(true);
-        await dispose.WaitAsync(TimeSpan.FromSeconds(10));
+        await dispose.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
         int durable = 0;
         foreach (EnqueueReceipt receipt in receipts)
         {
-            if (await receipt.Durable.AsTask().WaitAsync(TimeSpan.FromSeconds(5)))
+            if (await receipt.Durable.AsTask().WaitAsync(
+                TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken))
             {
                 durable++;
             }
