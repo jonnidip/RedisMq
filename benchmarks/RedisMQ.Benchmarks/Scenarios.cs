@@ -308,8 +308,18 @@ internal static class Scenarios
         await publisher.QueueDeclareAsync(
             queue, durable: true, exclusive: false, autoDelete: false, arguments: null, cancellationToken: ct);
 
+        // The single-queue delivery pump writes one message at a time, so N large bodies
+        // in flight are an N-message backlog ahead of the consumer. At 1 MB and the shared
+        // --inflight this is 128 MB, which no p99<=20 ms gate can meet. Bound outstanding
+        // bytes instead (8 MB keeps the backlog well inside a 20 ms budget on localhost
+        // delivery); the rate is reported for this scenario, not gated.
+        const int LargeInFlightBytes = 8 * 1024 * 1024;
+        int largeInflight = Math.Clamp(
+            LargeInFlightBytes / Math.Max(1, options.LargeBytes), 1, options.Inflight);
+
         await using IChannel consumerChannel = await CreateConsumerChannelAsync(connection, 4, ct);
-        await consumerChannel.BasicQosAsync(0, (ushort)Math.Min(options.Inflight, ushort.MaxValue), false, ct);
+        await consumerChannel.BasicQosAsync(
+            0, (ushort)Math.Min(largeInflight, ushort.MaxValue), false, ct);
 
         var state = new DeliveryState();
         var consumer = new AsyncEventingBasicConsumer(consumerChannel);
@@ -332,7 +342,7 @@ internal static class Scenarios
             _ => queue,
             options.LargeBytes,
             options.LargeCount,
-            options.Inflight,
+            largeInflight,
             state.ConfirmLatencies,
             ct);
 
