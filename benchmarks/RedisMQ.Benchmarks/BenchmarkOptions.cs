@@ -37,6 +37,8 @@ internal sealed class BenchmarkOptions
           --drainer-capacity <count>                 Engine drainer capacity (default: 1024)
           --drainer-batch-size <count>               Engine drainer batch size (default: 256)
           --no-gate                                  Report thresholds without failing the exit code
+          --inflight is capped per scenario: the canary uses min(--inflight, 16); the
+          1 MB scenario uses min(--inflight, 8 MB / --large-bytes).
           --selftest                                 Run percentile/gate checks without Redis
           --help                                     Print this help
         """;

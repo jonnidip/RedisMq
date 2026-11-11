@@ -83,23 +83,33 @@ internal sealed class BenchmarkHost : IAsyncDisposable
             Vhosts = [vhost],
             Users = [BrokerUser.FullAccess("guest", "guest", vhost)],
         };
-        serverOptions.Validate();
-
-        IReadOnlyList<IListenerTransport> listeners = BrokerListeners.Create(serverOptions);
-        var server = new AmqpBrokerServer(serverOptions, engine, listeners);
+        IReadOnlyList<IListenerTransport> listeners = [];
+        AmqpBrokerServer? server = null;
         try
         {
+            serverOptions.Validate();
+            listeners = BrokerListeners.Create(serverOptions);
+            server = new AmqpBrokerServer(serverOptions, engine, listeners);
             await server.StartAsync();
         }
         catch
         {
             // A failed start must not leak the multiplexer, the engine or its sockets.
-            await StopAndDisposeAsync(server, listeners);
+            if (server is not null)
+            {
+                await StopAndDisposeAsync(server, listeners);
+            }
+            else
+            {
+                await DisposeListenersAsync(listeners);
+            }
+
             await engine.DisposeAsync();
             redis.Dispose();
             throw;
         }
 
+        AmqpBrokerServer started = server!;
         int port = -1;
         foreach (IListenerTransport listener in listeners)
         {
@@ -111,13 +121,13 @@ internal sealed class BenchmarkHost : IAsyncDisposable
 
         if (port <= 0)
         {
-            await StopAndDisposeAsync(server, listeners);
+            await StopAndDisposeAsync(started, listeners);
             await engine.DisposeAsync();
             redis.Dispose();
             throw new BenchmarkRunException("The plaintext listener did not bind a port.");
         }
 
-        return new BenchmarkHost(redis, engine, server, listeners, vhost, port);
+        return new BenchmarkHost(redis, engine, started, listeners, vhost, port);
     }
 
     /// <summary>Best-effort teardown after a failed start: the start failure is the
@@ -135,6 +145,11 @@ internal sealed class BenchmarkHost : IAsyncDisposable
             // The server never reached a running state.
         }
 
+        await DisposeListenersAsync(listeners);
+    }
+
+    private static async Task DisposeListenersAsync(IReadOnlyList<IListenerTransport> listeners)
+    {
         foreach (IListenerTransport listener in listeners)
         {
             if (listener is IAsyncDisposable disposable)

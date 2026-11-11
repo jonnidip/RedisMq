@@ -67,9 +67,12 @@ window at `min(--inflight, 16)`. At 5,000/s that is ≈3 ms of queueing, which l
 for the 20 ms gate. The cap is a harness constant; the thresholds are unchanged.
 
 The Broker delivers one message at a time per queue: the per-queue pump claims one
-message and awaits its frame write before the next claim. On a Windows development host
-that caps this canary well below 5,000/s even though the publish/confirm path alone
-sustains tens of thousands per second. CI on Ubuntu is the authoritative run; local
+message and awaits its frame write before the next claim. With a 16-deep window the
+canary's rate ceiling is roughly `16 / mean confirm latency`. On the Windows development
+host that measured 4,473/s with p99 42.7 ms — a tail dominated by local scheduling
+spikes, not by the window. The publish/confirm path alone sustains tens of thousands per
+second. The cap therefore trades some rate headroom for latency headroom; 5,000/s at
+16 in flight needs mean delivery ≤3.2 ms. CI on Ubuntu is the authoritative run; local
 Windows users should use `--no-gate` and read the combined scenario.
 
 ### `large` — 1 MB bodies
@@ -159,8 +162,9 @@ Full default envelope, `--scenario all --no-gate`:
 
 The combined result is the local proof of the v1 envelope: the topology stays live while
 the rate is sustained, delivery p99 is under 20 ms, and every counter is clean. The
-single-queue canary and the 1 MB p99 are host-bound on Windows for the reasons above;
-they are expected to clear their thresholds on the Ubuntu CI runner.
+single-queue canary and the 1 MB p99 are host-bound on Windows for the reasons above.
+The Ubuntu CI runner is the authoritative environment for those two gates, but no green
+CI run has been observed yet: the workflow has not been dispatched from this branch.
 
 The canary runs last in `all` and inherits contention from the 500-connection combined
 run. Run alone with `--scenario throughput`, the same 16-deep window measured 4,473/s and
