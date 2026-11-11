@@ -60,7 +60,7 @@ those are not analyzer warnings and do not count.)
 |-------|---------|----------|
 | Codec/FSM/engine/server unit tests | `RedisMQ.Broker.Tests` | 359 passed |
 | Real-client conformance | `RedisMQ.Conformance` | 19 passed |
-| Redis mirror/replay | `RedisMQ.Redis.Tests` | 67 passed (or skipped without Redis) |
+| Redis mirror/replay | `RedisMQ.Redis.Tests` | 74 passed (or skipped without Redis) |
 | Hosting/configuration | `RedisMQ.Hosting.Tests` | 11 passed |
 | Multi-client conformance | `tests/clients/run.ps1` | 9/9 per client |
 
@@ -108,6 +108,22 @@ Key layout:
 
 If a Redis test leaves state behind, clear the store and re-run — replay is expected to
 rebuild topology and ready queues from the streams alone.
+
+### Performance gate
+
+The benchmark harness is a normal console app that drives real AMQP clients against a
+broker backed by a real Redis. It uses a unique vhost per run and never flushes or scans
+the store:
+
+```bash
+docker run --rm -p 6379:6379 redis:7
+dotnet run -c Release --project benchmarks/RedisMQ.Benchmarks -- --scenario all --out artifacts/perf.json
+```
+
+`--no-gate` reports every metric and still writes the JSON while leaving the exit code
+zero. CI's `perf` job runs the gated command against a `redis:7` service. The envelope,
+scenarios, report format and recorded baseline are in
+[PERFORMANCE.md](PERFORMANCE.md).
 
 ## Adding a feature (task flow)
 
@@ -240,6 +256,7 @@ documented in [PACKAGING.md](PACKAGING.md).
 ## Remaining work toward production v1
 
 - Connection/channel profiles and tuning beyond RabbitMQ defaults.
-- Throughput work: pipelining, mirror batching, benchmarks.
+- Performance: the pipelined mirror and v1 envelope gate have landed; see
+  [PERFORMANCE.md](PERFORMANCE.md).
 - Operational hardening: certificate hot-reload, Redis failure recovery policy,
   runtime user/vhost/permission management.

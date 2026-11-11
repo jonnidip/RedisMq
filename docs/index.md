@@ -7,6 +7,7 @@
 | [`PROTOCOL.md`](PROTOCOL.md) | AMQP 0-9-1 wire dialect, method set, queue arguments, confirms, error codes, deviations |
 | [`CONFORMANCE.md`](CONFORMANCE.md) | C# and multi-client (Pika, amqplib, Java, Go) conformance guide and complementary coverage |
 | [`API.md`](API.md) | API reference for `RedisMQ.Broker` and `RedisMQ.Redis` |
+| [`PERFORMANCE.md`](PERFORMANCE.md) | Benchmark scenarios, the v1 envelope gate, JSON report and measured baseline |
 | [`DEVELOPMENT.md`](DEVELOPMENT.md) | Build/test workflow, Redis reset, SDD task flow, conventions, remaining work |
 
 ## Repository layout
@@ -15,9 +16,10 @@
 RedisMQ.sln
 src/RedisMQ.Broker/          # core engine (zero external deps, net10.0)
 src/RedisMQ.Redis/           # Redis Streams write-ahead engine (StackExchange.Redis)
-tests/RedisMQ.Broker.Tests/  # codec/FSM/engine/server/permission/TLS tests (319)
+tests/RedisMQ.Broker.Tests/  # codec/FSM/engine/server/permission/TLS tests (359)
 tests/RedisMQ.Conformance/   # RabbitMQ.Client 7.x conformance over sockets (19)
-tests/RedisMQ.Redis.Tests/   # Redis mirror/replay/dedupe tests (60)
+tests/RedisMQ.Redis.Tests/   # Redis mirror/replay/dedupe tests (74)
+benchmarks/RedisMQ.Benchmarks/ # real-client performance gate and JSON report
 .github/workflows/ci.yml     # ubuntu-latest, dotnet 10.0.x
 ```
 
@@ -25,9 +27,9 @@ tests/RedisMQ.Redis.Tests/   # Redis mirror/replay/dedupe tests (60)
 
 | Suite | Total | Failed | Warnings | Runner |
 |-------|-------|--------|----------|--------|
-| `RedisMQ.Broker.Tests` | 319 | 0 | 0 | direct exec |
+| `RedisMQ.Broker.Tests` | 359 | 0 | 0 | direct exec |
 | `RedisMQ.Conformance` | 19 | 0 | 0 | direct exec |
-| `RedisMQ.Redis.Tests` | 60 | 0 | 0 | direct exec (Redis required) |
+| `RedisMQ.Redis.Tests` | 74 | 0 | 0 | direct exec (Redis required) |
 | `dotnet build RedisMQ.sln` | — | — | 0 | — |
 
 > `dotnet test` (SDK MTP) is unusable on this dev machine (exit-5 bug). Use the direct
@@ -61,7 +63,8 @@ tests/RedisMQ.Redis.Tests/   # Redis mirror/replay/dedupe tests (60)
 ## What remains for production v1
 
 - Connection/channel profiles and tuning beyond RabbitMQ defaults.
-- Performance: pipelining, mirror batching, benchmarks.
+- Performance: the pipelined Redis mirror and the v1 envelope gate have landed; see
+  [`PERFORMANCE.md`](PERFORMANCE.md).
 - Operational hardening: certificate hot-reload, Redis failure recovery policy,
   runtime user/vhost/permission management.
 

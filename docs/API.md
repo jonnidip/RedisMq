@@ -1018,6 +1018,7 @@ Every instrument also carries `broker.instance`. Durations are seconds.
 | `redismq.reaper.failures` | Counter | `{failure}` | — |
 | `redismq.redis.mirror.commands` | Counter | `{command}` | `kind`, `outcome` |
 | `redismq.redis.mirror.duration` | Histogram | `s` | `kind` |
+| `redismq.redis.mirror.batch.size` | Histogram | `{command}` | — |
 | `redismq.redis.mirror.dropped` | Counter | `{command}` | `kind`, `reason` |
 | `redismq.redis.drainer.depth` | ObservableGauge | `{command}` | — |
 | `redismq.redis.drainer.saturated` | Counter | `{publish}` | — |

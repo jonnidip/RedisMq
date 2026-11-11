@@ -33,8 +33,9 @@ have since landed. What remains for a production v1 is listed in
 9. [API Reference](#api-reference)
 10. [Protocol Implementation Notes](#protocol-implementation-notes)
 11. [Accepted Limitations](#accepted-limitations)
-12. [What's Next](#whats-next)
-13. [CI](#ci)
+12. [Performance](#performance)
+13. [What's Next](#whats-next)
+14. [CI](#ci)
 
 ---
 
@@ -64,7 +65,7 @@ Expected results:
 |-------|-------|--------|----------|
 | `RedisMQ.Broker.Tests` | 359 | 0 | 0 |
 | `RedisMQ.Conformance` | 19 | 0 | 0 |
-| `RedisMQ.Redis.Tests` | 67 | 0 | 0 |
+| `RedisMQ.Redis.Tests` | 74 | 0 | 0 |
 | `RedisMQ.Hosting.Tests` | 11 | 0 | 0 |
 | `dotnet build RedisMQ.sln` | — | 0 | 86 (pre-existing nullable warnings) |
 
@@ -423,7 +424,7 @@ dotnet exec tests\RedisMQ.Broker.Tests\bin\Debug\net10.0\RedisMQ.Broker.Tests.dl
 # Conformance suite (19 expected)
 dotnet exec tests\RedisMQ.Conformance\bin\Debug\net10.0\RedisMQ.Conformance.dll
 
-# Redis mirror/replay tests (67 expected; needs Redis on localhost:6379)
+# Redis mirror/replay tests (74 expected; needs Redis on localhost:6379)
 dotnet exec tests\RedisMQ.Redis.Tests\bin\Debug\net10.0\RedisMQ.Redis.Tests.dll
 
 # Hosting/configuration tests (11 expected)
@@ -671,13 +672,35 @@ Documented and pinned by tests rather than hidden:
 
 ---
 
+## Performance
+
+The Redis mirror is pipelined: the single drainer reads a bounded batch, issues the
+Redis writes back-to-back without awaiting each one, then resolves confirms, health and
+metrics in publish order. Deltas, removals and queue deletion stay barriers, so per-queue
+ordering and failure isolation are unchanged.
+
+The v1 envelope is gated by a real-client benchmark against a real Redis: 500 concurrent
+connections, 1,000 consumers and 1,000 queues live while at least 5,000 confirmed
+publishes/s (1 KB bodies) are sustained, with p99 first delivery under 20 ms, zero publish
+failures and zero mirror drop/failure deltas.
+
+```bash
+docker run --rm -p 6379:6379 redis:7
+dotnet run -c Release --project benchmarks/RedisMQ.Benchmarks -- --scenario all --out artifacts/perf.json
+```
+
+CI runs the same command against a Redis 7 service. See
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the scenarios, JSON report and the
+recorded baseline.
+
+---
+
 ## What's Next
 
 M4 part 1 completes the functional v1 surface, and packaging plus the multi-client
 conformance gate have since landed. Remaining for a production v1:
 
 - **Connection/channel profiles** and tuning beyond RabbitMQ defaults.
-- **Performance work**: pipelining, batching mirrors, throughput benchmarks.
 - **Operational hardening**: certificate hot-reload, Redis failure recovery policy,
   management surface for users/vhosts/permissions.
 
@@ -687,6 +710,7 @@ conformance gate have since landed. Remaining for a production v1:
 
 `.github/workflows/ci.yml` runs on `ubuntu-latest` with the .NET 10.0.x SDK: the
 `dotnet test` job, then a four-client conformance matrix (Pika, amqplib, RabbitMQ Java
-client, amqp091-go), then the pack/container job. The Redis-dependent suite expects a
-Redis service; see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for local setup and reset
-commands.
+client, amqp091-go), then the pack/container job. Both `test` and `perf` run against a
+`redis:7` service, so Redis-dependent tests no longer skip in CI; the `perf` job runs the
+envelope gate and uploads `artifacts/perf.json`. See
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for local setup and reset commands.
