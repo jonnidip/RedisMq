@@ -239,10 +239,16 @@ public sealed class WireFlowTests
     }
 
     /// <summary>Reads the delivery triple: the basic.deliver method plus its content
-    /// header and body frames.</summary>
+    /// header and body frames. A deliver can overtook the method the test was awaiting
+    /// and be parked in the client's inbox; check there first.</summary>
     private static async Task<(AmqpMethod Method, ContentHeader Header, byte[] Body)> ReadDeliverAsync(
         SocketWireClient client, ushort channel)
     {
+        if (client.TakeParkedDeliver(channel) is (AmqpMethod parked, ContentHeader parkedHeader, byte[] parkedBody))
+        {
+            return (parked, parkedHeader, parkedBody);
+        }
+
         AmqpMethod method = await client.ReadMethodOnChannelAsync(channel, 60, 60);
         (ContentHeader header, byte[] body) = await client.ReadContentOnChannelAsync(channel);
         return (method, header, body);

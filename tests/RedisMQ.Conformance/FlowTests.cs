@@ -255,12 +255,6 @@ public sealed class FlowTests
         await using IChannel channel = await NewChannelAsync(connection);
 
         await channel.QueueDeclareAsync("rr-q", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
-        for (int i = 0; i < 20; i++)
-        {
-            await channel.BasicPublishAsync("", "rr-q", mandatory: false, new BasicProperties(), BitConverter.GetBytes(i), cancellationToken: TestContext.Current.CancellationToken);
-        }
-
-        _ = await channel.QueueDeclareAsync("rr-q", durable: false, exclusive: false, autoDelete: false, arguments: null, passive: true, cancellationToken: TestContext.Current.CancellationToken);
         await channel.BasicQosAsync(0, 100, false, TestContext.Current.CancellationToken); // wide gate: both consumers eat in parallel
 
         var fromA = new List<int>();
@@ -285,8 +279,19 @@ public sealed class FlowTests
         var consumerB = new AsyncEventingBasicConsumer(channel);
         consumerB.ReceivedAsync += (_, ea) => Handle(fromB, ea);
 
+        // Register both consumers BEFORE publishing: the queue's delivery pump starts
+        // claiming as soon as the first consumer joins, so publishing first would let
+        // the pump starve the late joiner (the cycle only rotates between members that
+        // are already registered when a message is claimed).
         await channel.BasicConsumeAsync("rr-q", false, "c-rr-a", noLocal: false, exclusive: false, arguments: null, consumerA, cancellationToken: TestContext.Current.CancellationToken);
         await channel.BasicConsumeAsync("rr-q", false, "c-rr-b", noLocal: false, exclusive: false, arguments: null, consumerB, cancellationToken: TestContext.Current.CancellationToken);
+
+        for (int i = 0; i < 20; i++)
+        {
+            await channel.BasicPublishAsync("", "rr-q", mandatory: false, new BasicProperties(), BitConverter.GetBytes(i), cancellationToken: TestContext.Current.CancellationToken);
+        }
+
+        _ = await channel.QueueDeclareAsync("rr-q", durable: false, exclusive: false, autoDelete: false, arguments: null, passive: true, cancellationToken: TestContext.Current.CancellationToken); // fence
 
         await allIn.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
         lock (fromA)
