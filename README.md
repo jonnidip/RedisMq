@@ -66,7 +66,7 @@ Expected results:
 | `RedisMQ.Conformance` | 19 | 0 | 0 |
 | `RedisMQ.Redis.Tests` | 67 | 0 | 0 |
 | `RedisMQ.Hosting.Tests` | 11 | 0 | 0 |
-| `dotnet build RedisMQ.sln` | — | 0 | 86 (pre-existing nullable warnings) |
+| `dotnet build RedisMQ.sln` | — | 0 | 69 (pre-existing analyzer warnings) |
 
 ### Run in Docker
 
