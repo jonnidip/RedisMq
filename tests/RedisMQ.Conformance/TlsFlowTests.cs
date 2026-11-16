@@ -21,7 +21,7 @@ public sealed class TlsFlowTests
         Assert.NotNull(host.TlsPort);
 
         await using IConnection connection = await ConnectAsync(host, clientCertificatePath: null);
-        await using IChannel channel = await connection.CreateChannelAsync();
+        await using IChannel channel = await connection.CreateChannelAsync(cancellationToken: TestContext.Current.CancellationToken);
         await PublishAndGetAsync(channel, "tls-q", "over tls"u8.ToArray());
     }
 
@@ -33,7 +33,7 @@ public sealed class TlsFlowTests
 
         await using IConnection connection = await ConnectAsync(
             host, clientCertificatePath: certs.ClientPfxPath);
-        await using IChannel channel = await connection.CreateChannelAsync();
+        await using IChannel channel = await connection.CreateChannelAsync(cancellationToken: TestContext.Current.CancellationToken);
         await PublishAndGetAsync(channel, "mtls-q", "mutual tls"u8.ToArray());
     }
 

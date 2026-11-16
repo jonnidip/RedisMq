@@ -951,7 +951,7 @@ public sealed class RedisStreamRouteEngineTests
         engine.DeclareQueue(new QueueInfo(vhost, "q"));
 
         SemaphoreSlim slots = engine.DrainerSlotsForTest!;
-        Assert.True(slots.Wait(0)); // the idle drainer has not reserved a slot
+        Assert.True(slots.Wait(0, TestContext.Current.CancellationToken)); // the idle drainer has not reserved a slot
         try
         {
             EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1], "fex", "rk");
@@ -982,7 +982,7 @@ public sealed class RedisStreamRouteEngineTests
 
         EnqueueReceipt receipt = engine.Enqueue(vhost, "q", new ContentProperties(), [1, 2, 3], "fex", "rk");
 
-        Assert.True(await receipt.Durable.AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.True(await receipt.Durable.AsTask().WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
         Assert.Equal(1, await db.StreamLengthAsync(RedisKeys.QueueKey(vhost, "q")));
     }
 

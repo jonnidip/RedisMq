@@ -72,7 +72,7 @@ public sealed class TlsTransportTests
         await using var listener = new TlsSocketListener(ServerOptions(certs));
 
         ValueTask<TransportSide?> accepted = listener.AcceptAsync(TestContext.Current.CancellationToken);
-        (TcpClient tcp, SslStream ssl) = await ConnectTlsAsync(listener.AnnouncedPort);
+        (TcpClient tcp, SslStream ssl) = await ConnectTlsAsync(listener.AnnouncedPort, cancellationToken: TestContext.Current.CancellationToken);
         using (tcp)
         using (ssl)
         {
@@ -83,8 +83,8 @@ public sealed class TlsTransportTests
             Assert.Equal(payload, await ReadExactlyAsync(side.Reader, payload.Length));
 
             byte[] reply = [9, 8, 7];
-            await side.Writer.WriteAsync(reply);
-            await side.Writer.FlushAsync();
+            await side.Writer.WriteAsync(reply, TestContext.Current.CancellationToken);
+            await side.Writer.FlushAsync(TestContext.Current.CancellationToken);
             byte[] received = new byte[reply.Length];
             await ssl.ReadExactlyAsync(received, TestContext.Current.CancellationToken);
             Assert.Equal(reply, received);
@@ -108,7 +108,7 @@ public sealed class TlsTransportTests
         }
 
         ValueTask<TransportSide?> accepted = listener.AcceptAsync(TestContext.Current.CancellationToken);
-        (TcpClient tcp, SslStream ssl) = await ConnectTlsAsync(listener.AnnouncedPort);
+        (TcpClient tcp, SslStream ssl) = await ConnectTlsAsync(listener.AnnouncedPort, cancellationToken: TestContext.Current.CancellationToken);
         using (tcp)
         using (ssl)
         {
@@ -140,7 +140,7 @@ public sealed class TlsTransportTests
                 using (ssl)
                 {
                     await ssl.WriteAsync(new byte[] { 0 }, refusal.Token);
-                    await ssl.ReadAsync(new byte[1], refusal.Token);
+                    await ssl.ReadExactlyAsync(new byte[1], refusal.Token);
                 }
             }
             catch (Exception exception) when (
@@ -152,7 +152,7 @@ public sealed class TlsTransportTests
         }
 
         (TcpClient goodTcp, SslStream goodSsl) = await ConnectTlsAsync(
-            listener.AnnouncedPort, certs.ClientCertificate);
+            listener.AnnouncedPort, certs.ClientCertificate, TestContext.Current.CancellationToken);
         using (goodTcp)
         using (goodSsl)
         {
@@ -171,7 +171,7 @@ public sealed class TlsTransportTests
 
         ValueTask<TransportSide?> accepted = listener.AcceptAsync(TestContext.Current.CancellationToken);
         (TcpClient tcp, SslStream ssl) = await ConnectTlsAsync(
-            listener.AnnouncedPort, certs.ClientCertificate);
+            listener.AnnouncedPort, certs.ClientCertificate, TestContext.Current.CancellationToken);
         using (tcp)
         using (ssl)
         {
@@ -198,7 +198,7 @@ public sealed class TlsTransportTests
             IPAddress.Loopback, listener.AnnouncedPort, TestContext.Current.CancellationToken);
         await Task.Delay(50, TestContext.Current.CancellationToken);
 
-        (TcpClient tcp, SslStream ssl) = await ConnectTlsAsync(listener.AnnouncedPort);
+        (TcpClient tcp, SslStream ssl) = await ConnectTlsAsync(listener.AnnouncedPort, cancellationToken: TestContext.Current.CancellationToken);
         using (tcp)
         using (ssl)
         {

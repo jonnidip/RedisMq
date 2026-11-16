@@ -45,12 +45,12 @@ public sealed class M0RegressionTests
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
 
-        await channel.ExchangeDeclareAsync("fex", ExchangeType.Direct, durable: false, autoDelete: false);
-        await channel.QueueDeclareAsync("fq", durable: false, exclusive: false, autoDelete: false);
-        await channel.QueueBindAsync("fq", "fex", "fk");
+        await channel.ExchangeDeclareAsync("fex", ExchangeType.Direct, durable: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.QueueDeclareAsync("fq", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.QueueBindAsync("fq", "fex", "fk", cancellationToken: TestContext.Current.CancellationToken);
 
         var payload = "hello regression"u8.ToArray();
-        await channel.BasicPublishAsync("fex", "fk", mandatory: false, new BasicProperties(), payload);
+        await channel.BasicPublishAsync("fex", "fk", mandatory: false, new BasicProperties(), payload, cancellationToken: TestContext.Current.CancellationToken);
 
         var consumer = new AsyncEventingBasicConsumer(channel);
         var received = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -59,9 +59,9 @@ public sealed class M0RegressionTests
             received.TrySetResult(ea.Body.ToArray());
             await Task.CompletedTask;
         };
-        await channel.BasicConsumeAsync("fq", true, "c-reg", noLocal: false, exclusive: false, arguments: null, consumer);
+        await channel.BasicConsumeAsync("fq", true, "c-reg", noLocal: false, exclusive: false, arguments: null, consumer, cancellationToken: TestContext.Current.CancellationToken);
 
-        byte[] body = await received.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        byte[] body = await received.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.Equal(payload, body);
     }
 
@@ -73,13 +73,13 @@ public sealed class M0RegressionTests
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
 
-        await channel.QueueDeclareAsync("gate-q", durable: false, exclusive: false, autoDelete: false);
+        await channel.QueueDeclareAsync("gate-q", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
         for (int i = 0; i < 20; i++)
         {
-            await channel.BasicPublishAsync("", "gate-q", mandatory: false, new BasicProperties(), new byte[] { (byte)i });
+            await channel.BasicPublishAsync("", "gate-q", mandatory: false, new BasicProperties(), new byte[] { (byte)i }, cancellationToken: TestContext.Current.CancellationToken);
         }
 
-        await channel.BasicQosAsync(0, 10, false);
+        await channel.BasicQosAsync(0, 10, false, cancellationToken: TestContext.Current.CancellationToken);
 
         var consumer = new AsyncEventingBasicConsumer(channel);
         var seen = new List<ulong>();
@@ -95,18 +95,18 @@ public sealed class M0RegressionTests
             }
             await Task.CompletedTask; // no ack yet — gate stays closed at 10
         };
-        await channel.BasicConsumeAsync("gate-q", false, "c-gate", noLocal: false, exclusive: false, arguments: null, consumer);
+        await channel.BasicConsumeAsync("gate-q", false, "c-gate", noLocal: false, exclusive: false, arguments: null, consumer, cancellationToken: TestContext.Current.CancellationToken);
 
-        await ten.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await ten.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.Equal(10, seen.Count);
 
         // Ack exactly half the slots (5 of 10): exactly 5 more flow.
         foreach (ulong tag in seen.Take(5).ToList())
         {
-            await channel.BasicAckAsync(tag, multiple: false);
+            await channel.BasicAckAsync(tag, multiple: false, cancellationToken: TestContext.Current.CancellationToken);
         }
 
-        await fifteen.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await fifteen.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.Equal(15, seen.Count);
     }
 
@@ -118,9 +118,9 @@ public sealed class M0RegressionTests
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
 
-        await channel.QueueDeclareAsync("nack-q", durable: false, exclusive: false, autoDelete: false);
-        await channel.BasicPublishAsync("", "nack-q", mandatory: false, new BasicProperties(), "n1"u8.ToArray());
-        await channel.BasicQosAsync(0, 1, false);
+        await channel.QueueDeclareAsync("nack-q", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.BasicPublishAsync("", "nack-q", mandatory: false, new BasicProperties(), "n1"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
+        await channel.BasicQosAsync(0, 1, false, cancellationToken: TestContext.Current.CancellationToken);
 
         var consumer = new AsyncEventingBasicConsumer(channel);
         var first = new TaskCompletionSource<BasicDeliverEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -132,17 +132,17 @@ public sealed class M0RegressionTests
             {
                 hadFirst = true;
                 first.TrySetResult(ea);
-                await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true, cancellationToken: TestContext.Current.CancellationToken);
                 return;
             }
             second.TrySetResult(ea);
-            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+            await channel.BasicAckAsync(ea.DeliveryTag, multiple: false, cancellationToken: TestContext.Current.CancellationToken);
         };
-        await channel.BasicConsumeAsync("nack-q", false, "c-nack", noLocal: false, exclusive: false, arguments: null, consumer);
+        await channel.BasicConsumeAsync("nack-q", false, "c-nack", noLocal: false, exclusive: false, arguments: null, consumer, cancellationToken: TestContext.Current.CancellationToken);
 
-        BasicDeliverEventArgs firstArgs = await first.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        BasicDeliverEventArgs firstArgs = await first.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.False(firstArgs.Redelivered);
-        BasicDeliverEventArgs secondArgs = await second.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        BasicDeliverEventArgs secondArgs = await second.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.True(secondArgs.Redelivered);
         Assert.Equal("n1", Encoding.UTF8.GetString(secondArgs.Body.Span));
     }
@@ -155,16 +155,16 @@ public sealed class M0RegressionTests
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
 
-        await channel.QueueDeclareAsync("get-q", durable: false, exclusive: false, autoDelete: false);
-        await channel.BasicPublishAsync("", "get-q", mandatory: false, new BasicProperties { ContentType = "text/plain" }, "g1"u8.ToArray());
+        await channel.QueueDeclareAsync("get-q", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.BasicPublishAsync("", "get-q", mandatory: false, new BasicProperties { ContentType = "text/plain" }, "g1"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
 
-        BasicGetResult? result = await channel.BasicGetAsync("get-q", autoAck: false);
+        BasicGetResult? result = await channel.BasicGetAsync("get-q", autoAck: false, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(result);
         Assert.Equal("g1", Encoding.UTF8.GetString(result.Body.ToArray()));
         Assert.False(result.Redelivered);
-        await channel.BasicAckAsync(result.DeliveryTag, multiple: false);
+        await channel.BasicAckAsync(result.DeliveryTag, multiple: false, cancellationToken: TestContext.Current.CancellationToken);
 
-        Assert.Null(await channel.BasicGetAsync("get-q", autoAck: false));
+        Assert.Null(await channel.BasicGetAsync("get-q", autoAck: false, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -175,11 +175,11 @@ public sealed class M0RegressionTests
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
 
-        await channel.QueueDeclareAsync("any-q", durable: false, exclusive: false, autoDelete: false);
-        await channel.BasicPublishAsync("nope", "anything", mandatory: false, new BasicProperties(), "x"u8.ToArray());
+        await channel.QueueDeclareAsync("any-q", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.BasicPublishAsync("nope", "anything", mandatory: false, new BasicProperties(), "x"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
 
         OperationInterruptedException ex = await Assert.ThrowsAsync<OperationInterruptedException>(async () =>
-            await channel.QueueDeclareAsync("any-q", durable: false, exclusive: false, autoDelete: false));
+            await channel.QueueDeclareAsync("any-q", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken));
         Assert.Equal(404, ex.ShutdownReason!.ReplyCode);
         Assert.Equal(60, ex.ShutdownReason.ClassId);
         Assert.Equal(40, ex.ShutdownReason.MethodId);
@@ -194,7 +194,7 @@ public sealed class M0RegressionTests
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
 
-        await connection.CloseAsync();
+        await connection.CloseAsync(cancellationToken: TestContext.Current.CancellationToken);
         Assert.False(connection.IsOpen);
         Assert.True(channel.IsClosed);
     }
@@ -229,35 +229,35 @@ public sealed class M0RegressionTests
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
 
-        await channel.ExchangeDeclareAsync("m3-topic", ExchangeType.Topic, durable: false, autoDelete: false);
-        await channel.QueueDeclareAsync("m3-topic-a", durable: false, exclusive: false, autoDelete: false);
-        await channel.QueueDeclareAsync("m3-topic-b", durable: false, exclusive: false, autoDelete: false);
-        await channel.QueueBindAsync("m3-topic-a", "m3-topic", "a.#");
-        await channel.QueueBindAsync("m3-topic-b", "m3-topic", "*.b");
+        await channel.ExchangeDeclareAsync("m3-topic", ExchangeType.Topic, durable: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.QueueDeclareAsync("m3-topic-a", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.QueueDeclareAsync("m3-topic-b", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.QueueBindAsync("m3-topic-a", "m3-topic", "a.#", cancellationToken: TestContext.Current.CancellationToken);
+        await channel.QueueBindAsync("m3-topic-b", "m3-topic", "*.b", cancellationToken: TestContext.Current.CancellationToken);
 
         // The exchange type survives the wire round trip: the engine dispatches on it.
         Assert.Equal("topic", engine.GetExchange("/", "m3-topic")!.Type);
 
         // "a.b": # matches one word and * matches one word, so both bindings fire.
-        await channel.BasicPublishAsync("m3-topic", "a.b", mandatory: false, new BasicProperties(), "ab"u8.ToArray());
-        BasicGetResult? both = await channel.BasicGetAsync("m3-topic-a", autoAck: true);
+        await channel.BasicPublishAsync("m3-topic", "a.b", mandatory: false, new BasicProperties(), "ab"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
+        BasicGetResult? both = await channel.BasicGetAsync("m3-topic-a", autoAck: true, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(both);
         Assert.Equal("ab", Encoding.UTF8.GetString(both.Body.ToArray()));
-        BasicGetResult? star = await channel.BasicGetAsync("m3-topic-b", autoAck: true);
+        BasicGetResult? star = await channel.BasicGetAsync("m3-topic-b", autoAck: true, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(star);
         Assert.Equal("ab", Encoding.UTF8.GetString(star.Body.ToArray()));
 
         // "a": a.# matches (the # may match zero words); *.b needs the dot word.
-        await channel.BasicPublishAsync("m3-topic", "a", mandatory: false, new BasicProperties(), "a"u8.ToArray());
-        BasicGetResult? hashZero = await channel.BasicGetAsync("m3-topic-a", autoAck: true);
+        await channel.BasicPublishAsync("m3-topic", "a", mandatory: false, new BasicProperties(), "a"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
+        BasicGetResult? hashZero = await channel.BasicGetAsync("m3-topic-a", autoAck: true, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(hashZero);
         Assert.Equal("a", Encoding.UTF8.GetString(hashZero.Body.ToArray()));
-        Assert.Null(await channel.BasicGetAsync("m3-topic-b", autoAck: true));
+        Assert.Null(await channel.BasicGetAsync("m3-topic-b", autoAck: true, cancellationToken: TestContext.Current.CancellationToken));
 
         // "x.c": neither pattern matches.
-        await channel.BasicPublishAsync("m3-topic", "x.c", mandatory: false, new BasicProperties(), "xc"u8.ToArray());
-        Assert.Null(await channel.BasicGetAsync("m3-topic-a", autoAck: true));
-        Assert.Null(await channel.BasicGetAsync("m3-topic-b", autoAck: true));
+        await channel.BasicPublishAsync("m3-topic", "x.c", mandatory: false, new BasicProperties(), "xc"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Null(await channel.BasicGetAsync("m3-topic-a", autoAck: true, cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Null(await channel.BasicGetAsync("m3-topic-b", autoAck: true, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -268,30 +268,30 @@ public sealed class M0RegressionTests
         await using var connection = await ConnectAsync(host);
         await using var channel = await NewChannelAsync(connection);
 
-        await channel.ExchangeDeclareAsync("m3-headers", ExchangeType.Headers, durable: false, autoDelete: false);
-        await channel.QueueDeclareAsync("m3-headers-q", durable: false, exclusive: false, autoDelete: false);
+        await channel.ExchangeDeclareAsync("m3-headers", ExchangeType.Headers, durable: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
+        await channel.QueueDeclareAsync("m3-headers-q", durable: false, exclusive: false, autoDelete: false, cancellationToken: TestContext.Current.CancellationToken);
         await channel.QueueBindAsync("m3-headers-q", "m3-headers", routingKey: "", arguments: new Dictionary<string, object?>
         {
             ["x-match"] = "all",
             ["color"] = "red",
-        });
+        }, cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal("headers", engine.GetExchange("/", "m3-headers")!.Type);
 
         // Matching header set routes (the routing key is irrelevant for headers).
         var matching = new BasicProperties { Headers = new Dictionary<string, object?> { ["color"] = "red" } };
-        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, matching, "red"u8.ToArray());
-        BasicGetResult? hit = await channel.BasicGetAsync("m3-headers-q", autoAck: true);
+        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, matching, "red"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
+        BasicGetResult? hit = await channel.BasicGetAsync("m3-headers-q", autoAck: true, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(hit);
         Assert.Equal("red", Encoding.UTF8.GetString(hit.Body.ToArray()));
 
         // Wrong value and missing header both miss.
         var wrongValue = new BasicProperties { Headers = new Dictionary<string, object?> { ["color"] = "blue" } };
-        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, wrongValue, "blue"u8.ToArray());
-        Assert.Null(await channel.BasicGetAsync("m3-headers-q", autoAck: true));
+        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, wrongValue, "blue"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Null(await channel.BasicGetAsync("m3-headers-q", autoAck: true, cancellationToken: TestContext.Current.CancellationToken));
 
-        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, new BasicProperties(), "none"u8.ToArray());
-        Assert.Null(await channel.BasicGetAsync("m3-headers-q", autoAck: true));
+        await channel.BasicPublishAsync("m3-headers", "ignored", mandatory: false, new BasicProperties(), "none"u8.ToArray(), cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Null(await channel.BasicGetAsync("m3-headers-q", autoAck: true, cancellationToken: TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -307,22 +307,23 @@ public sealed class M0RegressionTests
             durable: false,
             exclusive: false,
             autoDelete: false,
-            arguments: new Dictionary<string, object?> { ["x-max-length"] = 2 });
+            arguments: new Dictionary<string, object?> { ["x-max-length"] = 2 },
+            cancellationToken: TestContext.Current.CancellationToken);
 
         Assert.Equal(2, engine.GetQueue("/", "m3-bounded")!.MaxLength);
 
         foreach (string body in new[] { "one", "two", "three" })
         {
-            await channel.BasicPublishAsync("", "m3-bounded", mandatory: false, new BasicProperties(), Encoding.UTF8.GetBytes(body));
+            await channel.BasicPublishAsync("", "m3-bounded", mandatory: false, new BasicProperties(), Encoding.UTF8.GetBytes(body), cancellationToken: TestContext.Current.CancellationToken);
         }
 
         // Drop-oldest: the first message is gone, the last two remain in order.
-        BasicGetResult? second = await channel.BasicGetAsync("m3-bounded", autoAck: true);
+        BasicGetResult? second = await channel.BasicGetAsync("m3-bounded", autoAck: true, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(second);
         Assert.Equal("two", Encoding.UTF8.GetString(second.Body.ToArray()));
-        BasicGetResult? third = await channel.BasicGetAsync("m3-bounded", autoAck: true);
+        BasicGetResult? third = await channel.BasicGetAsync("m3-bounded", autoAck: true, cancellationToken: TestContext.Current.CancellationToken);
         Assert.NotNull(third);
         Assert.Equal("three", Encoding.UTF8.GetString(third.Body.ToArray()));
-        Assert.Null(await channel.BasicGetAsync("m3-bounded", autoAck: true));
+        Assert.Null(await channel.BasicGetAsync("m3-bounded", autoAck: true, cancellationToken: TestContext.Current.CancellationToken));
     }
 }

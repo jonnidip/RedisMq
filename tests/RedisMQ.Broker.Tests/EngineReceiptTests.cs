@@ -7,7 +7,7 @@ namespace RedisMQ.Broker.Tests;
 public sealed class EngineReceiptTests
 {
     [Fact]
-    public void Enqueue_returns_monotonic_envelope_ids_and_a_completed_true_receipt()
+    public async Task Enqueue_returns_monotonic_envelope_ids_and_a_completed_true_receipt()
     {
         var engine = new InMemoryEngine(["/"]);
         engine.DeclareQueue(new QueueInfo("/", "q"));
@@ -17,8 +17,7 @@ public sealed class EngineReceiptTests
 
         Assert.Equal(1UL, first.EnvelopeId);
         Assert.Equal(2UL, second.EnvelopeId);
-        Assert.True(first.Durable.IsCompletedSuccessfully);
-        Assert.True(first.Durable.Result);
+        Assert.True(await first.Durable);
         Assert.Empty(first.DroppedEnvelopeIds);
     }
 
