@@ -804,7 +804,7 @@ public sealed class RedisStreamRouteEngine : IRouteEngine, IEngineDiagnostics, I
         var result = _redis.Execute("CONFIG", "GET", "maxmemory-policy");
         if (result.Length >= 2)
         {
-            var policyValue = (string)result[1];
+            var policyValue = (string)result[1]!;
             if (!string.Equals("noeviction", policyValue, StringComparison.OrdinalIgnoreCase))
             {
                 throw new BrokerConfigurationException(

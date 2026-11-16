@@ -223,13 +223,13 @@ public sealed class WriteCommandTests
     public void Remove_round_trips_envelope_ids()
     {
         WriteCommand remove = WriteCommand.Remove("/", "q", 3, 4, 5);
-        Assert.Equal([3UL, 4UL, 5UL], remove.EnvelopeIds);
+        Assert.Equal([3UL, 4UL, 5UL], remove.EnvelopeIds!);
 
         var fields = remove.ToStreamFields();
         Assert.Contains(("envelope-ids", "3,4,5"), fields);
 
         WriteCommand decoded = WriteCommand.FromStreamFields(WriteCommandKind.Remove, fields);
-        Assert.Equal([3UL, 4UL, 5UL], decoded.EnvelopeIds);
+        Assert.Equal([3UL, 4UL, 5UL], decoded.EnvelopeIds!);
         Assert.Equal("q", decoded.Queue);
     }
 
@@ -237,13 +237,13 @@ public sealed class WriteCommandTests
     public void RemoveStreamIds_round_trips_stream_ids()
     {
         WriteCommand remove = WriteCommand.RemoveStreamIds("/", "q", "1-0", "2-9");
-        Assert.Equal(["1-0", "2-9"], remove.StreamIds);
+        Assert.Equal(["1-0", "2-9"], remove.StreamIds!);
 
         var fields = remove.ToStreamFields();
         Assert.Contains(("stream-ids", "1-0,2-9"), fields);
 
         WriteCommand decoded = WriteCommand.FromStreamFields(WriteCommandKind.RemoveStreamIds, fields);
-        Assert.Equal(["1-0", "2-9"], decoded.StreamIds);
+        Assert.Equal(["1-0", "2-9"], decoded.StreamIds!);
     }
 
     [Fact]

@@ -1135,7 +1135,7 @@ public sealed class ChannelContext
             AmqpConstants.PreconditionFailed,
             $"PRECONDITION_FAILED - invalid arg '{key}' for queue '{queue}' in vhost '{_vhost}'");
 
-    private ChannelOutcome InequivalentQueue(AmqpMethod method, string name, string key, object received, object current) =>
+    private ChannelOutcome InequivalentQueue(AmqpMethod method, string name, string key, object? received, object? current) =>
         Soft(
             method,
             AmqpConstants.PreconditionFailed,

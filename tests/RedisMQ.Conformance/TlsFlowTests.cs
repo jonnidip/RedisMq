@@ -78,7 +78,7 @@ public sealed class TlsFlowTests
             ServerName = "localhost",
             AcceptablePolicyErrors =
                 SslPolicyErrors.RemoteCertificateNameMismatch | SslPolicyErrors.RemoteCertificateChainErrors,
-            CertPath = clientCertificatePath,
+            CertPath = clientCertificatePath!,
             CertPassphrase = clientCertificatePath is null ? null : TestCertificates.Password,
         };
 

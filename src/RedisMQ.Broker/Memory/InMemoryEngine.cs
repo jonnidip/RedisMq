@@ -384,7 +384,8 @@ public sealed class InMemoryEngine : IRouteEngine, IEngineDiagnostics, IDisposab
         // Extract x-match from binding args
         bool matchAll = bindingArgs.TryGetValue("x-match", out var xMatchVal)
             && xMatchVal.TypeLetter == 'S'
-            && (string)xMatchVal.Raw == "any";
+            && xMatchVal.Raw is string xMatchRaw
+            && xMatchRaw == "any";
 
         if (matchAll)
         {
